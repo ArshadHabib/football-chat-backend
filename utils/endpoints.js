@@ -1,4 +1,5 @@
-const FIRST_SERVER_BASE_URL = "http://localhost:5007";
+// const FIRST_SERVER_BASE_URL = "http://localhost:5007";
+const FIRST_SERVER_BASE_URL = "https://api.halastream.com";
 
 const ENDPOINTS = {
   auth: {

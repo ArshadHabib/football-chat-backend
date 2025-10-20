@@ -1,0 +1,114 @@
+const {
+  getUsersPerRoom,
+  deleteAllRooms,
+  deleteRoom,
+  createRoom,
+} = require("@project/socket/roomManager");
+const {
+  createChatRoomService,
+  deleteChatRoomService,
+  retrieveRoomMessagesService,
+  deleteAllDBChatRoomService,
+} = require("./service");
+const { sendResponse, sendError } = require("@project/utils");
+const { createSocketRoomsForMatchService } = require("./socket_service");
+const { sendLatestMatches } = require("@project/socket/adminEventService");
+
+async function getUsersPerRoomController(req, res) {
+  try {
+    const usersPerRoom = await getUsersPerRoom();
+    return sendResponse(
+      res,
+      usersPerRoom,
+      "Users per room retrieved successfully!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error retrieving users per room",
+      500
+    );
+  }
+}
+
+async function getRoomMessagesController(req, res) {
+  try {
+    const { roomId } = req.query;
+    const messages = await retrieveRoomMessagesService(roomId);
+    return sendResponse(
+      res,
+      messages,
+      "Room messages retrieved successfully!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error retrieving room messages",
+      500
+    );
+  }
+}
+
+async function deleteAllSocketRoomsController(req, res) {
+  const { matches } = req.body;
+  try {
+    await deleteAllDBChatRoomService();
+    await deleteAllRooms();
+    if (matches.length) {
+      await createSocketRoomsForMatchService(matches);
+    }
+    return sendResponse(res, null, "Socket Rooms deleted successfully!", 200);
+  } catch (error) {
+    return sendError(res, error?.message || "Error deleting socket rooms", 500);
+  }
+}
+
+async function deleteSingleSocketRoomController(req, res) {
+  const { roomId } = req.body;
+  try {
+    await deleteRoom(roomId);
+    return sendResponse(res, null, "Socket Room deleted successfully!", 200);
+  } catch (error) {
+    return sendError(res, error?.message || "Error deleting socket room", 500);
+  }
+}
+
+async function createSingleSocketRoomController(req, res) {
+  const { roomId } = req.body;
+  try {
+    await createRoom(roomId);
+    return sendResponse(res, null, "Socket Room created successfully!", 200);
+  } catch (error) {
+    return sendError(res, error?.message || "Error creating socket room", 500);
+  }
+}
+
+async function sendLatestUpdatesToAdminController(req, res) {
+  const { matches } = req.body;
+  try {
+    sendLatestMatches(matches);
+    return sendResponse(
+      res,
+      null,
+      "Latest Matches sent to Admin successfully!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in sending latest matches to admin: ",
+      500
+    );
+  }
+}
+
+module.exports = {
+  getUsersPerRoomController,
+  getRoomMessagesController,
+  deleteAllSocketRoomsController,
+  deleteSingleSocketRoomController,
+  createSingleSocketRoomController,
+  sendLatestUpdatesToAdminController,
+};

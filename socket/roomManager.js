@@ -144,7 +144,7 @@ function roomExists(roomId) {
   return rooms.has(roomId);
 }
 
-async function getUsersPerRoom() {
+function getUsersPerRoom() {
   const usersPerRoom = {};
 
   rooms.forEach((userSet, roomId) => {

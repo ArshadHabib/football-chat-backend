@@ -1,5 +1,4 @@
-// const FIRST_SERVER_BASE_URL = "http://localhost:5007";
-const FIRST_SERVER_BASE_URL = "https://api.halastream.com";
+const FIRST_SERVER_BASE_URL = process.env.BACKEND_API;
 
 const ENDPOINTS = {
   auth: {

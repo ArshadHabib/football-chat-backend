@@ -25,7 +25,7 @@ const io = socketIo(server, {
 });
 setupSocketHandlers(io);
 
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: "50mb" }));
 
 app.use(
   "/api/next",

@@ -1,10 +1,11 @@
 const { emitToAdmins, emitToAdmin } = require("./roomManager");
 
 // Send latest matches to all admins
-const sendLatestMatches = (matchesData) => {
+const sendLatestMatches = (matchesData, lastUpdatedAdminId) => {
   return emitToAdmins("latest_matches", {
     title: "Latest Matches Update",
     data: matchesData,
+    lastUpdatedAdminId,
     count: matchesData?.length || 0,
     priority: "high",
   });

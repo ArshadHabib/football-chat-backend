@@ -86,9 +86,9 @@ async function createSingleSocketRoomController(req, res) {
 }
 
 async function sendLatestUpdatesToAdminController(req, res) {
-  const { matches } = req.body;
+  const { matches, lastUpdatedAdminId } = req.body;
   try {
-    sendLatestMatches(matches);
+    sendLatestMatches(matches, lastUpdatedAdminId);
     return sendResponse(
       res,
       null,

@@ -22,24 +22,36 @@ jobs:
           port: 22
           script: |
             set -e  # Exit immediately if any command fails
-            cd /var/www/football-chat-backend
-            echo "Starting deployment..."
-            git reset --hard
-            git pull
 
-            if git diff --name-only HEAD~1 HEAD | grep -q package.json; then
-              echo "package.json changed - running npm install..."
+            echo "🔄 Starting deployment..."
+            cd /var/www/football-chat-backend
+
+            echo "Fetching latest code..."
+            git fetch origin master
+            # Get list of changed files before applying the pull
+            CHANGED_FILES=$(git diff --name-only HEAD origin/master)
+
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+
+            echo "Updating local repository..."
+            git reset --hard
+            git pull origin master
+
+            # Check if package.json changed
+            if echo "$CHANGED_FILES" | grep -q 'package.json'; then
+              echo "📦 Detected package.json change - running npm install..."
               npm install
             else
-              echo "No changes in package.json - skipping npm install"
+              echo "✅ No package.json changes - skipping npm install"
             fi
 
-            # Check if changes are ONLY in the 'files' directory
-            if git diff --name-only HEAD~1 HEAD | grep -qv '^files/'; then
-              echo "Changes detected outside 'files' folder - restarting server..."
+            # Check if any file outside 'files/' directory changed
+            if echo "$CHANGED_FILES" | grep -qv '^files/'; then
+              echo "🚀 Changes detected outside 'files/' folder - restarting server..."
               pm2 restart 0
             else
-              echo "Only changes in 'files' folder - skipping server restart"
+              echo "🟢 Only changes in 'files/' folder - skipping server restart"
             fi
 
-            echo "Deployment completed successfully!"
+            echo "✅ Deployment completed successfully!"

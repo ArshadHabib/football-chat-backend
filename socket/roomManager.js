@@ -77,13 +77,14 @@ async function deleteAllRooms() {
   };
 }
 
-function joinRoom(roomId, socket, senderName) {
+function joinRoom(roomId, socket, senderName, websiteName) {
   if (!rooms.has(roomId)) {
     return { success: false, message: "Room does not exist" };
   }
 
   const userSet = rooms.get(roomId);
   socket.senderName = senderName;
+  socket.websiteName = websiteName;
   userSet.add(socket);
   socket.roomId = roomId;
   socket.join(roomId);
@@ -154,12 +155,28 @@ function getUsersPerRoom() {
   return usersPerRoom;
 }
 
+function getUsersPerWebsite() {
+  const usersPerWebsite = {};
+
+  rooms.forEach((userSet, roomId) => {
+    userSet.forEach((socket) => {
+      const websiteName = socket.websiteName;
+      if (websiteName) {
+        usersPerWebsite[websiteName] = (usersPerWebsite[websiteName] || 0) + 1;
+      }
+    });
+  });
+
+  return usersPerWebsite;
+}
+
 // Admin management functions
 function registerAdmin(socket) {
   adminSockets.add(socket);
   console.log("Admin registered:", socket.id);
   // Send current state to new admin
   socket.emit("admin_room_update", {
+    usersPerWebsite: getUsersPerWebsite(),
     usersPerRoom: getUsersPerRoom(),
     totalUsers: getTotalUsers(),
     totalRooms: rooms.size,
@@ -174,6 +191,7 @@ function removeAdmin(socket) {
 function notifyAdminRoomUpdate() {
   const roomData = {
     usersPerRoom: getUsersPerRoom(),
+    usersPerWebsite: getUsersPerWebsite(),
     totalUsers: getTotalUsers(),
     totalRooms: rooms.size,
     timestamp: new Date().toISOString(),
@@ -244,4 +262,5 @@ module.exports = {
   emitToAdmins,
   emitToAdmin,
   deleteAllRooms,
+  getUsersPerWebsite,
 };

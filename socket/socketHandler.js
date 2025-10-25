@@ -145,8 +145,8 @@ function setupSocketHandlers(io) {
 
     // Handle user joining room
     socket.on("join_room", (data) => {
-      const { senderName, roomId } = data;
-      const result = joinRoom(roomId, socket, senderName);
+      const { senderName, roomId, websiteName } = data;
+      const result = joinRoom(roomId, socket, senderName, websiteName);
       console.log("Users Count:", getTotalUsers());
 
       if (result.success) {

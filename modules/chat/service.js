@@ -51,18 +51,18 @@ async function deleteAllDBChatRoomService() {
 async function saveChatMessageService(roomId, messageData) {
   try {
     // Find the chat room and push the new message
-    await ChatRoomModel.findOneAndUpdate(
-      { roomId },
-      {
-        $push: {
-          messages: {
-            ...messageData,
-            timestamp: new Date(),
-          },
-        },
-      }
-    );
-    console.log(`Message saved successfully in room: ${roomId}`);
+    // await ChatRoomModel.findOneAndUpdate(
+    //   { roomId },
+    //   {
+    //     $push: {
+    //       messages: {
+    //         ...messageData,
+    //         timestamp: new Date(),
+    //       },
+    //     },
+    //   }
+    // );
+    // console.log(`Message saved successfully in room: ${roomId}`);
     return true;
   } catch (error) {
     console.error(`Error saving message in room ${roomId}:`, error.message);

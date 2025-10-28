@@ -1,3 +1,4 @@
+//socket/adminEventService.js
 const { emitToAdmins, emitToAdmin } = require("./roomManager");
 
 // Send latest matches to all admins

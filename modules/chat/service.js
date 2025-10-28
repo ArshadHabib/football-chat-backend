@@ -4,7 +4,7 @@ async function createChatRoomService(roomId) {
   try {
     const existingRoom = await ChatRoomModel.findOne({ roomId });
     if (existingRoom) {
-      console.error(`Chat room with roomId '${roomId}' already exists`);
+      console.error(`DB Chat room with roomId '${roomId}' already exists`);
       return null;
     }
     const newChatRoom = new ChatRoomModel({
@@ -23,7 +23,7 @@ async function deleteChatRoomService(roomId) {
   try {
     const deletedRoom = await ChatRoomModel.findOneAndDelete({ roomId });
     if (!deletedRoom) {
-      console.error(`Chat room with roomId '${roomId}' not found`);
+      console.error(`DB Chat room with roomId '${roomId}' not found`);
       return null;
     }
     console.log(`DB Chat room deleted successfully with roomId: ${roomId}`);
@@ -88,7 +88,7 @@ async function retrieveRoomMessagesService(roomId, options = {}) {
     );
 
     if (!chatRoom) {
-      console.error(`Chat room with roomId '${roomId}' not found`);
+      console.error(`DB Chat room with roomId '${roomId}' not found`);
       return null;
     }
 

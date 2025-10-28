@@ -170,6 +170,13 @@ function getUsersPerWebsite() {
   return usersPerWebsite;
 }
 
+function updateViewsVisibility(data) {
+  const userSet = rooms.get(data?.roomId);
+  userSet?.forEach((socket) => {
+    socket.emit("update_views_visibility", data?.data);
+  });
+}
+
 // Admin management functions
 function registerAdmin(socket) {
   adminSockets.add(socket);
@@ -263,4 +270,5 @@ module.exports = {
   emitToAdmin,
   deleteAllRooms,
   getUsersPerWebsite,
+  updateViewsVisibility,
 };

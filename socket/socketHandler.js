@@ -199,6 +199,19 @@ function setupSocketHandlers(io) {
       }
     });
 
+    // Handle views visibility update to room
+    socket.on("update_views_visibility", (data) => {
+      if (!socket.isAdmin) {
+        socket.emit("error", { message: "Admin access required" });
+        return;
+      }
+
+      const { roomId, showViews } = data;
+      if (roomExists(roomId)) {
+        io.to(roomId).emit("update_views_visibility", { showViews });
+      }
+    });
+
     // Handle user disconnection
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);

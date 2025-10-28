@@ -3,6 +3,7 @@ const {
   deleteAllRooms,
   deleteRoom,
   createRoom,
+  updateViewsVisibility,
 } = require("@project/socket/roomManager");
 const {
   createChatRoomService,
@@ -104,6 +105,20 @@ async function sendLatestUpdatesToAdminController(req, res) {
   }
 }
 
+async function updateShowViewsVisibilityToUsersController(req, res) {
+  const { streamId, showViews } = req.body;
+  try {
+    updateViewsVisibility({ roomId: streamId, data: { showViews } });
+    return sendResponse(res, null, "Success in sending Views Visibility!", 200);
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Errorin in sending Views Visibility: ",
+      500
+    );
+  }
+}
+
 module.exports = {
   getUsersPerRoomController,
   getRoomMessagesController,
@@ -111,4 +126,5 @@ module.exports = {
   deleteSingleSocketRoomController,
   createSingleSocketRoomController,
   sendLatestUpdatesToAdminController,
+  updateShowViewsVisibilityToUsersController,
 };

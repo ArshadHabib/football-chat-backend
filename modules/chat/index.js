@@ -12,6 +12,7 @@ const {
   deleteSingleSocketRoomController,
   createSingleSocketRoomController,
   sendLatestUpdatesToAdminController,
+  updateShowViewsVisibilityToUsersController,
 } = require("./controller");
 
 router.get(
@@ -41,6 +42,11 @@ router.post(
   "/send-latest-matches-to-admin",
   isAdminKeyCorrect,
   sendLatestUpdatesToAdminController
+);
+router.post(
+  "/update-show-views-visibility-to-users",
+  isAdminKeyCorrect,
+  updateShowViewsVisibilityToUsersController
 );
 
 module.exports = router;

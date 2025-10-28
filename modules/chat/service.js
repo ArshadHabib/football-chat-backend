@@ -1,21 +1,102 @@
+const mongoose = require("mongoose");
 const ChatRoomModel = require("./model");
+const MessageModel = require("./messageModel");
+
+// Batch message saving
+const messageBatch = new Map();
+const BATCH_FLUSH_INTERVAL = 1000;
+const MAX_BATCH_SIZE = 50;
+
+async function flushMessageBatch() {
+  if (messageBatch.size === 0) return;
+
+  const allMessages = [];
+  const roomUpdates = [];
+
+  // Collect data
+  messageBatch.forEach((messages, roomId) => {
+    if (messages.length > 0) {
+      allMessages.push(...messages);
+      roomUpdates.push({ roomId, count: messages.length });
+    }
+  });
+
+  try {
+    // Insert all messages
+    if (allMessages.length > 0) {
+      await MessageModel.insertMany(allMessages, { ordered: false });
+    }
+
+    // Update rooms
+    for (const { roomId, count } of roomUpdates) {
+      await ChatRoomModel.findOneAndUpdate(
+        { roomId },
+        {
+          lastActivity: new Date(),
+          $inc: { messageCount: count },
+        },
+        { upsert: true }
+      );
+    }
+
+    console.log(
+      `Flushed ${allMessages.length} messages to ${roomUpdates.length} rooms`
+    );
+  } catch (error) {
+    console.error("Batch flush error:", error);
+  }
+
+  messageBatch.clear();
+}
+
+setInterval(flushMessageBatch, BATCH_FLUSH_INTERVAL);
+
+async function saveChatMessageService(roomId, messageData) {
+  const message = {
+    _id: new mongoose.Types.ObjectId(),
+    roomId,
+    ...messageData,
+    timestamp: new Date(),
+  };
+
+  if (!messageBatch.has(roomId)) {
+    messageBatch.set(roomId, []);
+  }
+
+  const batch = messageBatch.get(roomId);
+  batch.push(message);
+
+  if (batch.length >= MAX_BATCH_SIZE) {
+    await flushMessageBatch();
+  }
+
+  return true;
+}
 
 async function createChatRoomService(roomId) {
   try {
-    const existingRoom = await ChatRoomModel.findOne({ roomId });
-    if (existingRoom) {
-      console.error(`Chat room with roomId '${roomId}' already exists`);
-      return null;
-    }
-    const newChatRoom = new ChatRoomModel({
-      roomId: roomId,
-      messages: [],
-    });
-    await newChatRoom.save();
-    console.log(`DB Chat room created successfully with roomId: ${roomId}`);
+    // Use upsert to create if doesn't exist, or update if exists
+    const result = await ChatRoomModel.findOneAndUpdate(
+      { roomId },
+      {
+        $setOnInsert: { roomId },
+        $set: { lastActivity: new Date() },
+        // Don't reset messageCount if room already exists
+      },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+
+    console.log(
+      `Chat room created/verified successfully with roomId: ${roomId}`
+    );
     return true;
   } catch (error) {
-    return null;
+    console.error(`Error creating chat room ${roomId}:`, error.message);
+    return false;
   }
 }
 
@@ -23,7 +104,7 @@ async function deleteChatRoomService(roomId) {
   try {
     const deletedRoom = await ChatRoomModel.findOneAndDelete({ roomId });
     if (!deletedRoom) {
-      console.error(`Chat room with roomId '${roomId}' not found`);
+      console.error(`DB Chat room with roomId '${roomId}' not found`);
       return null;
     }
     console.log(`DB Chat room deleted successfully with roomId: ${roomId}`);
@@ -35,85 +116,117 @@ async function deleteChatRoomService(roomId) {
 
 async function deleteAllDBChatRoomService() {
   try {
-    const deletedRooms = await ChatRoomModel.deleteMany({});
-    if (deletedRooms?.deletedCount === 0) {
-      console.error("DB No chat rooms found to delete");
-      return null;
-    }
-    console.log(`DB All chat rooms deleted successfully`);
-    return true;
-  } catch (error) {
-    console.error("DB Error deleting chat rooms:", error);
-    return null;
-  }
-}
+    // Delete all rooms and all messages in parallel
+    const [roomResult, messageResult] = await Promise.all([
+      ChatRoomModel.deleteMany({}),
+      MessageModel.deleteMany({}),
+    ]);
 
-async function saveChatMessageService(roomId, messageData) {
-  try {
-    // Find the chat room and push the new message
-    // await ChatRoomModel.findOneAndUpdate(
-    //   { roomId },
-    //   {
-    //     $push: {
-    //       messages: {
-    //         ...messageData,
-    //         timestamp: new Date(),
-    //       },
-    //     },
-    //   }
-    // );
-    // console.log(`Message saved successfully in room: ${roomId}`);
+    if (roomResult.deletedCount === 0 && messageResult.deletedCount === 0) {
+      console.log("No chat rooms or messages found to delete");
+      return {
+        success: true,
+        message: "No data to delete",
+        roomsDeleted: 0,
+        messagesDeleted: 0,
+      };
+    }
+
+    console.log(
+      `All chat rooms and messages deleted successfully. Rooms: ${roomResult.deletedCount}, Messages: ${messageResult.deletedCount}`
+    );
     return true;
   } catch (error) {
-    console.error(`Error saving message in room ${roomId}:`, error.message);
-    return null;
+    console.error("Error deleting all chat rooms and messages:", error.message);
+    return false;
   }
 }
 
 async function retrieveRoomMessagesService(roomId, options = {}) {
   try {
     const {
-      limit = 50,
+      limit = 200,
       skip = 0,
-      sort = { timestamp: -1 }, // Default: latest messages first
+      before = new Date(), // For pagination
     } = options;
 
-    const chatRoom = await ChatRoomModel.findOne(
-      { roomId }
-      //   {
-      //     messages: {
-      //       $slice: [skip, limit], // Pagination: skip and limit
-      //     },
-      //   }
-    );
-
-    if (!chatRoom) {
-      console.error(`Chat room with roomId '${roomId}' not found`);
-      return null;
-    }
-
-    // Sort the messages if needed (since $slice doesn't maintain sort order with pagination)
-    let messages = chatRoom?.messages?.length ? chatRoom?.messages : [];
+    const messages = await MessageModel.find({
+      roomId,
+      timestamp: { $lt: before },
+    })
+      .sort({ timestamp: -1 })
+      .limit(limit)
+      .skip(skip)
+      .lean(); // Faster read-only
 
     console.log(`Retrieved ${messages.length} messages from room: ${roomId}`);
-    return messages;
+    return messages.reverse(); // Return in chronological order
   } catch (error) {
     console.error(
       `Error retrieving messages from room ${roomId}:`,
       error.message
     );
-    return null;
+    return [];
   }
 }
 
 async function deleteAllChatMessagesService() {
   try {
-    await ChatRoomModel.deleteMany({});
-    console.log(`DB Chat collection wiped successfully.`);
+    // Delete all messages from Message collection
+    const messageResult = await MessageModel.deleteMany({});
+
+    // Reset all chat rooms (messageCount = 0, lastActivity = now)
+    const roomResult = await ChatRoomModel.updateMany(
+      {},
+      {
+        $set: {
+          messageCount: 0,
+          lastActivity: new Date(),
+        },
+      }
+    );
+
+    console.log(
+      `All chat messages deleted successfully. Messages: ${messageResult.deletedCount}, Rooms reset: ${roomResult.modifiedCount}`
+    );
     return true;
   } catch (error) {
-    console.error("Error wiping chat collection:", error.message);
-    return null;
+    console.error("Error deleting all chat messages:", error.message);
+    return false;
+  }
+}
+
+// Get room stats
+async function getRoomStats(roomId) {
+  const [messageCount, lastActivity] = await Promise.all([
+    MessageModel.countDocuments({ roomId }),
+    MessageModel.findOne({ roomId })
+      .sort({ timestamp: -1 })
+      .select("timestamp"),
+  ]);
+
+  return {
+    messageCount,
+    lastActivity: lastActivity?.timestamp || null,
+  };
+}
+
+// Single room deletion (if needed elsewhere)
+async function deleteChatRoomService(roomId) {
+  try {
+    // Delete room and its messages in parallel
+    const [roomResult, messageResult] = await Promise.all([
+      ChatRoomModel.deleteOne({ roomId }),
+      MessageModel.deleteMany({ roomId }),
+    ]);
+
+    console.log(
+      `Chat room and messages deleted: ${roomId}. Messages: ${messageResult.deletedCount}`
+    );
+    return true;
+  } catch (error) {
+    console.error(`Error deleting chat room ${roomId}:`, error.message);
+    return false;
   }
 }
 
@@ -124,4 +237,5 @@ module.exports = {
   retrieveRoomMessagesService,
   deleteAllChatMessagesService,
   deleteAllDBChatRoomService,
+  getRoomStats,
 };

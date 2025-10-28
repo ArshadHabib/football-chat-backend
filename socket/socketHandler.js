@@ -1,4 +1,4 @@
-//socket/socketHandler.js
+// socket/socketHandler.js
 const { saveChatMessageService } = require("@project/modules/chat/service");
 const {
   joinRoom,
@@ -9,10 +9,14 @@ const {
   registerAdmin,
   getUsersPerRoom,
   removeAdmin,
+  setIO,
 } = require("./roomManager");
 const { authenticateToken } = require("@project/middleware");
 
 function setupSocketHandlers(io) {
+  // Make io available to roomManager
+  setIO(io);
+
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
@@ -27,11 +31,9 @@ function setupSocketHandlers(io) {
         return;
       }
 
-      // Verify admin token (you should use a more secure method in production)
       try {
         const decodedToken = await authenticateToken(token);
 
-        // Check if user has admin role
         if (decodedToken?.userRoleFromToken === "admin") {
           registerAdmin(socket);
           socket.isAdmin = true;
@@ -43,15 +45,12 @@ function setupSocketHandlers(io) {
           socket.emit("admin_authenticated", {
             success: true,
             message: "Admin authentication successful",
-            user: {
-              userId: decodedToken.userIdFromToken,
-              role: decodedToken.userRoleFromToken,
-            },
+            user: socket.adminUser,
           });
           console.log(
             "Admin authenticated:",
             socket.id,
-            decodedToken.userIdFromToken
+            socket.adminUser.userId
           );
         } else {
           socket.emit("admin_authenticated", {
@@ -103,7 +102,6 @@ function setupSocketHandlers(io) {
 
       const { roomId, messageContent } = data;
 
-      // Check if admin has joined this room
       if (!socket.rooms.has(roomId)) {
         socket.emit("error", {
           message: "You must join the room first before sending messages",
@@ -111,36 +109,32 @@ function setupSocketHandlers(io) {
         return;
       }
 
-      // Check if room exists
       if (!roomExists(roomId)) {
         socket.emit("error", { message: "Room does not exist" });
         return;
       }
 
-      // Broadcast message to the room with admin identification
-      io.to(roomId).emit("room_message", {
-        senderName: "Admin", // or use socket.adminUser.name if available
+      // Use room broadcast instead of looping
+      const messageData = {
+        senderName: "Admin",
         messageContent: messageContent,
         roomId: roomId,
-        isAdmin: true, // Flag to identify admin messages
+        isAdmin: true,
         timestamp: new Date().toISOString(),
-      });
+      };
 
-      // Also send to admin monitoring feed
-      // io.to(roomId).sockets.forEach((s) => {
-      //   if (s.isAdmin && s.rooms.has(roomId)) {
-      //     s.emit("admin_room_message", {
-      //       senderName: "Admin",
-      //       messageContent: message,
-      //       roomId: roomId,
-      //       isAdmin: true,
-      //       timestamp: new Date().toISOString(),
-      //     });
-      //   }
-      // });
+      io.to(roomId).emit("room_message", messageData);
+
+      // Save message asynchronously
+      saveChatMessageService(roomId, {
+        senderName: "Admin",
+        senderId: socket.id,
+        messageContent: messageContent,
+        messageType: "room_message",
+      }).catch(console.error);
 
       console.log(
-        `Admin ${socket.adminUser.userId} sent message to room ${roomId}: ${messageContent}`
+        `Admin ${socket.adminUser.userId} sent message to room ${roomId}`
       );
     });
 
@@ -148,17 +142,14 @@ function setupSocketHandlers(io) {
     socket.on("join_room", (data) => {
       const { senderName, roomId, websiteName } = data;
       const result = joinRoom(roomId, socket, senderName, websiteName);
-      console.log("Users Count:", getTotalUsers());
 
       if (result.success) {
-        // Notify the user who joined
         socket.emit("join_result", result);
 
         // Notify others in the room
         socket.to(roomId).emit("user_joined", {
           senderName,
           roomId,
-          // users: result.users,
           usersCount: result.usersCount || 0,
         });
       } else {
@@ -167,36 +158,30 @@ function setupSocketHandlers(io) {
     });
 
     // Handle messages to room
-    socket.on("room_message", (data) => {
-      const { roomId, messageContent } = data;
+    socket.on("room_message", async (data) => {
+      const { roomId, messageContent, senderName } = data;
 
       if (roomExists(roomId)) {
-        socket.to(roomId).emit("room_message", {
-          senderName: socket.senderName,
+        const messageData = {
+          senderName: senderName,
           messageContent: messageContent,
           roomId,
-        });
-        saveChatMessageService(roomId, {
-          senderName: socket.senderName,
-          senderId: socket.id,
-          messageContent: messageContent,
-          messageType: "room_message",
-        });
-        // Also send message to admins monitoring this room
-        if (socket.isAdmin) {
-          // Don't echo admin's own messages back
-          return;
+        };
+
+        // Emit to room (excluding sender)
+        socket.to(roomId).emit("room_message", messageData);
+
+        // Save message asynchronously
+        try {
+          await saveChatMessageService(roomId, {
+            senderName: senderName,
+            senderId: socket.id,
+            messageContent: messageContent,
+            messageType: "room_message",
+          });
+        } catch (error) {
+          console.error("Failed to save message:", error);
         }
-        // io?.to(roomId)?.sockets?.forEach((s) => {
-        //   if (s?.isAdmin && s?.rooms?.has(roomId)) {
-        //     s.emit("admin_room_message", {
-        //       senderName: socket.senderName,
-        //       messageContent: messageContent,
-        //       roomId,
-        //       timestamp: new Date().toISOString(),
-        //     });
-        //   }
-        // });
       }
     });
 
@@ -217,24 +202,19 @@ function setupSocketHandlers(io) {
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
 
-      // Remove admin if this was an admin socket
       if (socket.isAdmin) {
         removeAdmin(socket);
       }
 
-      if (socket.roomId) {
-        const result = leaveRoom(socket);
-        console.log("Users Count:", getTotalUsers());
+      const result = leaveRoom(socket.id);
 
-        if (result) {
-          // Notify others in the room
-          socket.to(result.roomId).emit("user_left", {
-            senderName: socket.senderName,
-            roomId: result.roomId,
-            // users: result.users,
-            usersCount: result.usersCount || 0,
-          });
-        }
+      if (result) {
+        // Notify others in the room
+        socket.to(result.roomId).emit("user_left", {
+          senderName: socket.senderName,
+          roomId: result.roomId,
+          usersCount: result.usersCount || 0,
+        });
       }
     });
 
@@ -247,11 +227,8 @@ function setupSocketHandlers(io) {
 
       const { dataType, parameters } = data;
 
-      // You can handle different data requests here
       switch (dataType) {
         case "latest_matches":
-          // Trigger your matches service and emit back
-          // This is just an example - you'll call your actual service
           socket.emit("admin_custom_event", {
             eventType: "latest_matches_response",
             data: { message: "Fetching latest matches..." },

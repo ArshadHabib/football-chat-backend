@@ -1,5 +1,42 @@
-//socket/adminEventService.js
+// socket/adminEventService.js
 const { emitToAdmins, emitToAdmin } = require("./roomManager");
+
+// Batch processing for multiple events
+const eventQueue = [];
+const BATCH_PROCESSING_INTERVAL = 100; // 100ms
+let batchTimeout = null;
+
+function processEventBatch() {
+  if (eventQueue.length === 0) {
+    batchTimeout = null;
+    return;
+  }
+
+  const batch = eventQueue.splice(0, 50); // Process max 50 events at a time
+  let sentCount = 0;
+
+  batch.forEach(({ event, data }) => {
+    const result = emitToAdmins(event.type, data);
+    if (result > 0) sentCount++;
+  });
+
+  console.log(`Processed ${batch.length} events, sent ${sentCount}`);
+
+  // Schedule next batch if there are more events
+  if (eventQueue.length > 0) {
+    batchTimeout = setTimeout(processEventBatch, BATCH_PROCESSING_INTERVAL);
+  } else {
+    batchTimeout = null;
+  }
+}
+
+function queueEvent(event, data) {
+  eventQueue.push({ event, data });
+
+  if (!batchTimeout) {
+    batchTimeout = setTimeout(processEventBatch, BATCH_PROCESSING_INTERVAL);
+  }
+}
 
 // Send latest matches to all admins
 const sendLatestMatches = (matchesData, lastUpdatedAdminId) => {
@@ -46,7 +83,15 @@ const sendToAdmin = (socketId, eventName, data) => {
   return emitToAdmin(socketId, eventName, data);
 };
 
-// Send match events (specific to your use case)
+// Batch send multiple events (optimized)
+const sendBatchEvents = (events) => {
+  events.forEach((event) => {
+    queueEvent(event, event.data);
+  });
+  return events.length;
+};
+
+// Rest of the functions remain the same but can use batching...
 const sendMatchEvents = (eventsData) => {
   return emitToAdmins("match_events", {
     title: "Match Events Update",
@@ -55,7 +100,6 @@ const sendMatchEvents = (eventsData) => {
   });
 };
 
-// Send real-time analytics
 const sendAnalytics = (analyticsData) => {
   return emitToAdmins("analytics_update", {
     title: "Analytics Update",
@@ -64,7 +108,6 @@ const sendAnalytics = (analyticsData) => {
   });
 };
 
-// Send server health status
 const sendServerHealth = (healthData) => {
   return emitToAdmins("server_health", {
     title: "Server Health Status",
@@ -73,26 +116,13 @@ const sendServerHealth = (healthData) => {
   });
 };
 
-// Batch send multiple events
-const sendBatchEvents = (events) => {
-  let sentCount = 0;
-  events.forEach((event) => {
-    const result = emitToAdmins(event.type, event.data);
-    if (result > 0) sentCount++;
-  });
-  return sentCount;
-};
-
-// Get connected admin count (if you expose this from roomManager)
 const getConnectedAdminCount = () => {
-  // Note: You'll need to expose this from roomManager or use a different approach
   console.log(
     "Note: getConnectedAdminCount requires implementation in roomManager"
   );
   return 0;
 };
 
-// Utility function to format match data for admin
 const formatMatchData = (matches) => {
   return {
     matches: Array.isArray(matches) ? matches : [matches],
@@ -101,7 +131,6 @@ const formatMatchData = (matches) => {
   };
 };
 
-// Compose multiple notification types
 const composeMatchNotification = (match, eventType) => {
   const baseData = formatMatchData(match);
 

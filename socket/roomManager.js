@@ -1,12 +1,19 @@
-//socket/roomManager.js
+// socket/roomManager.js
 const {
   createChatRoomService,
   deleteChatRoomService,
 } = require("@project/modules/chat/service");
 
-// Room management functions
-const rooms = new Map();
+// Use more efficient data structures
+const rooms = new Map(); // roomId -> Set of socketIds
+const socketData = new Map(); // socketId -> { roomId, senderName, websiteName, isAdmin, etc. }
 const adminSockets = new Set();
+const websiteCounts = new Map(); // websiteName -> count
+
+// Cache for admin room updates to avoid recalculating
+let cachedRoomData = null;
+let lastRoomUpdate = 0;
+const ROOM_UPDATE_DEBOUNCE = 1000; // 1 second
 
 async function createRoom(roomId) {
   if (rooms.has(roomId)) {
@@ -16,7 +23,7 @@ async function createRoom(roomId) {
   rooms.set(roomId, new Set());
   console.log(`Room created: ${roomId}`);
   createChatRoomService(roomId);
-  notifyAdminRoomUpdate();
+  invalidateRoomCache();
   return { success: true, roomId };
 }
 
@@ -25,18 +32,23 @@ async function deleteRoom(roomId) {
     return { success: false, message: "Room does not exist" };
   }
 
-  // Notify all users in the room before deleting
-  console.log(`Room deleted: ${roomId}`);
-  const userSet = rooms.get(roomId);
-  userSet.forEach((socket) => {
-    socket.emit("room_deleted", { roomId });
-    socket.leave(roomId);
-    socket.roomId = null;
+  const socketIds = rooms.get(roomId);
+
+  // Batch operations instead of individual emits
+  const socketPromises = Array.from(socketIds).map((socketId) => {
+    const socket = getSocketById(socketId);
+    if (socket) {
+      socket.emit("room_deleted", { roomId });
+      socket.leave(roomId);
+      updateSocketData(socketId, { roomId: null });
+    }
   });
+
+  await Promise.all(socketPromises);
 
   rooms.delete(roomId);
   deleteChatRoomService(roomId);
-  notifyAdminRoomUpdate();
+  invalidateRoomCache();
   return { success: true, roomId };
 }
 
@@ -46,35 +58,19 @@ async function deleteAllRooms() {
     return { success: true, message: "No rooms to delete", deletedCount: 0 };
   }
 
-  const deletedRooms = [];
-  const roomCount = rooms.size;
+  const roomIds = Array.from(rooms.keys());
+  const deletedCount = roomIds.length;
 
-  // Iterate through all rooms and delete them
-  rooms.forEach((userSet, roomId) => {
-    // Notify all users in the room before deleting
-    userSet.forEach((socket) => {
-      socket.emit("room_deleted", { roomId });
-      socket.leave(roomId);
-      socket.roomId = null;
-    });
+  // Batch delete operations
+  const deletePromises = roomIds.map((roomId) => deleteRoom(roomId));
+  await Promise.all(deletePromises);
 
-    // Delete from database service
-    deleteChatRoomService(roomId);
-
-    deletedRooms.push(roomId);
-  });
-
-  // Clear all rooms from the Map
-  rooms.clear();
-
-  console.log(`All ${roomCount} rooms deleted: ${deletedRooms.join(", ")}`);
-  notifyAdminRoomUpdate();
-
+  console.log(`All ${deletedCount} rooms deleted`);
   return {
     success: true,
-    message: `All ${roomCount} rooms deleted successfully`,
-    deletedCount: roomCount,
-    deletedRooms: deletedRooms,
+    message: `All ${deletedCount} rooms deleted successfully`,
+    deletedCount,
+    deletedRooms: roomIds,
   };
 }
 
@@ -83,63 +79,82 @@ function joinRoom(roomId, socket, senderName, websiteName) {
     return { success: false, message: "Room does not exist" };
   }
 
-  const userSet = rooms.get(roomId);
-  socket.senderName = senderName;
-  socket.websiteName = websiteName;
-  userSet.add(socket);
-  socket.roomId = roomId;
+  const socketIds = rooms.get(roomId);
+  const socketId = socket.id;
+
+  // Update socket data
+  updateSocketData(socketId, {
+    roomId,
+    senderName,
+    websiteName,
+    socket, // store reference if needed
+  });
+
+  socketIds.add(socketId);
   socket.join(roomId);
 
-  // return {
-  //   success: true,
-  //   roomId,
-  //   users: Array.from(userSet).map((s) => s.senderName),
-  // };
-  notifyAdminRoomUpdate();
+  // Update website counts efficiently
+  if (websiteName) {
+    websiteCounts.set(websiteName, (websiteCounts.get(websiteName) || 0) + 1);
+  }
+
+  invalidateRoomCache();
   return {
     success: true,
     roomId,
-    usersCount: userSet?.size || 0,
+    usersCount: socketIds.size,
   };
 }
 
-function leaveRoom(socket) {
-  const roomId = socket.roomId;
-  if (!roomId || !rooms.has(roomId)) {
-    return;
+function leaveRoom(socketId) {
+  const data = socketData.get(socketId);
+  if (!data || !data.roomId) return null;
+
+  const roomId = data.roomId;
+  if (!rooms.has(roomId)) return null;
+
+  const socketIds = rooms.get(roomId);
+  socketIds.delete(socketId);
+
+  // Update website counts
+  if (data.websiteName) {
+    const count = websiteCounts.get(data.websiteName) || 1;
+    if (count <= 1) {
+      websiteCounts.delete(data.websiteName);
+    } else {
+      websiteCounts.set(data.websiteName, count - 1);
+    }
   }
 
-  const userSet = rooms.get(roomId);
-  userSet.delete(socket);
+  // Clean up socket data
+  socketData.delete(socketId);
+  invalidateRoomCache();
 
-  // Clean up empty rooms
-  //   if (userSet.size === 0) {
-  //     rooms.delete(roomId);
-  //   }
-
-  socket.leave(roomId);
-  socket.roomId = null;
-  notifyAdminRoomUpdate();
-
-  // return { roomId, users: Array.from(userSet).map((s) => s.senderName) };
-  return { roomId, usersCount: userSet?.size || 0 };
+  return { roomId, usersCount: socketIds.size };
 }
 
 function getTotalUsers() {
-  let totalUsers = 0;
-  rooms?.forEach((userSet) => {
-    totalUsers += userSet?.size || 0;
-  });
-  return totalUsers;
+  let total = 0;
+  for (const socketIds of rooms.values()) {
+    total += socketIds.size;
+  }
+  return total;
 }
 
 function getUsersInRoom(roomId) {
-  if (!rooms.has(roomId)) {
-    return [];
+  if (!rooms.has(roomId)) return [];
+
+  const socketIds = rooms.get(roomId);
+  const users = [];
+
+  for (const socketId of socketIds) {
+    const data = socketData.get(socketId);
+    if (data && data.senderName) {
+      users.push(data.senderName);
+    }
   }
 
-  const userSet = rooms.get(roomId);
-  return Array.from(userSet).map((socket) => socket.senderName);
+  return users;
 }
 
 function roomExists(roomId) {
@@ -148,76 +163,81 @@ function roomExists(roomId) {
 
 function getUsersPerRoom() {
   const usersPerRoom = {};
-
-  rooms.forEach((userSet, roomId) => {
-    usersPerRoom[roomId] = userSet.size || 0;
-  });
-
+  for (const [roomId, socketIds] of rooms) {
+    usersPerRoom[roomId] = socketIds.size;
+  }
   return usersPerRoom;
 }
 
 function getUsersPerWebsite() {
-  const usersPerWebsite = {};
-
-  rooms.forEach((userSet, roomId) => {
-    userSet.forEach((socket) => {
-      const websiteName = socket.websiteName;
-      if (websiteName) {
-        usersPerWebsite[websiteName] = (usersPerWebsite[websiteName] || 0) + 1;
-      }
-    });
-  });
-
-  return usersPerWebsite;
+  return Object.fromEntries(websiteCounts);
 }
 
 function updateViewsVisibility(data) {
-  const userSet = rooms.get(data?.roomId);
-  userSet?.forEach((socket) => {
-    socket.emit("update_views_visibility", data?.data);
-  });
+  const socketIds = rooms.get(data?.roomId);
+  if (!socketIds) return;
+
+  // Batch emit to room
+  const io = getIO(); // You'll need to make io available
+  if (io) {
+    io.to(data.roomId).emit("update_views_visibility", data?.data);
+  }
 }
 
 // Admin management functions
 function registerAdmin(socket) {
-  adminSockets.add(socket);
-  console.log("Admin registered:", socket.id);
-  // Send current state to new admin
-  socket.emit("admin_room_update", {
-    usersPerWebsite: getUsersPerWebsite(),
-    usersPerRoom: getUsersPerRoom(),
-    totalUsers: getTotalUsers(),
-    totalRooms: rooms.size,
-  });
+  adminSockets.add(socket.id);
+  updateSocketData(socket.id, { isAdmin: true });
+
+  // Send cached room data if available
+  if (cachedRoomData) {
+    socket.emit("admin_room_update", cachedRoomData);
+  } else {
+    socket.emit("admin_room_update", getRoomData());
+  }
 }
 
 function removeAdmin(socket) {
-  adminSockets.delete(socket);
-  console.log("Admin removed:", socket.id);
+  adminSockets.delete(socket.id);
 }
 
 function notifyAdminRoomUpdate() {
-  const roomData = {
+  const now = Date.now();
+  if (now - lastRoomUpdate < ROOM_UPDATE_DEBOUNCE) {
+    return; // Debounce updates
+  }
+
+  lastRoomUpdate = now;
+  cachedRoomData = getRoomData();
+
+  // Batch emit to all admins
+  const io = getIO();
+  if (io && adminSockets.size > 0) {
+    const adminRoom = "admin_room"; // Consider using a room for admins
+    io.to(Array.from(adminSockets)).emit("admin_room_update", cachedRoomData);
+  }
+}
+
+function getRoomData() {
+  return {
     usersPerRoom: getUsersPerRoom(),
     usersPerWebsite: getUsersPerWebsite(),
     totalUsers: getTotalUsers(),
     totalRooms: rooms.size,
     timestamp: new Date().toISOString(),
   };
+}
 
-  // Send update to all connected admins
-  adminSockets.forEach((adminSocket) => {
-    if (adminSocket.connected) {
-      adminSocket.emit("admin_room_update", roomData);
-    }
-  });
+function invalidateRoomCache() {
+  cachedRoomData = null;
 }
 
 function isAdmin(socket) {
-  return adminSockets.has(socket);
+  const data = socketData.get(socket.id);
+  return !!(data && data.isAdmin);
 }
 
-// Function to send custom data to all connected admins
+// Efficient admin emissions using rooms
 function emitToAdmins(eventName, data) {
   const eventData = {
     ...data,
@@ -225,33 +245,49 @@ function emitToAdmins(eventName, data) {
     eventType: eventName,
   };
 
-  let sentCount = 0;
-  adminSockets.forEach((adminSocket) => {
-    if (adminSocket.connected) {
-      adminSocket.emit("admin_custom_event", eventData);
-      sentCount++;
-    }
-  });
+  const io = getIO();
+  if (!io || adminSockets.size === 0) return 0;
 
-  console.log(`[Admin Event] "${eventName}" sent to ${sentCount} admin(s)`);
-  return sentCount;
+  io.to(Array.from(adminSockets)).emit("admin_custom_event", eventData);
+  console.log(
+    `[Admin Event] "${eventName}" sent to ${adminSockets.size} admin(s)`
+  );
+  return adminSockets.size;
 }
 
-// Function to send data to specific admin by socket ID
 function emitToAdmin(socketId, eventName, data) {
-  let sent = false;
-  adminSockets.forEach((adminSocket) => {
-    if (adminSocket.id === socketId && adminSocket.connected) {
-      adminSocket.emit("admin_custom_event", {
-        ...data,
-        timestamp: new Date().toISOString(),
-        eventType: eventName,
-      });
-      sent = true;
-      console.log(`[Admin Event] "${eventName}" sent to admin ${socketId}`);
-    }
+  const io = getIO();
+  if (!io || !adminSockets.has(socketId)) return false;
+
+  io.to(socketId).emit("admin_custom_event", {
+    ...data,
+    timestamp: new Date().toISOString(),
+    eventType: eventName,
   });
-  return sent;
+
+  console.log(`[Admin Event] "${eventName}" sent to admin ${socketId}`);
+  return true;
+}
+
+// Utility functions
+function getSocketById(socketId) {
+  // You'll need to make socket instances available here
+  // This depends on your Socket.IO setup
+  const io = getIO();
+  return io?.sockets?.sockets?.get(socketId);
+}
+
+function updateSocketData(socketId, updates) {
+  const existing = socketData.get(socketId) || {};
+  socketData.set(socketId, { ...existing, ...updates });
+}
+
+function setIO(ioInstance) {
+  global.socketIO = ioInstance;
+}
+
+function getIO() {
+  return global.socketIO;
 }
 
 module.exports = {
@@ -272,4 +308,5 @@ module.exports = {
   deleteAllRooms,
   getUsersPerWebsite,
   updateViewsVisibility,
+  setIO, // Call this in your main socket setup
 };

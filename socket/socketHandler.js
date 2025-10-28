@@ -9,16 +9,23 @@ const {
   registerAdmin,
   getUsersPerRoom,
   removeAdmin,
+  notifyAdminRoomUpdate,
   setIO,
 } = require("./roomManager");
 const { authenticateToken } = require("@project/middleware");
 
 function setupSocketHandlers(io) {
-  // Make io available to roomManager
   setIO(io);
 
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
+
+    // Connection limits
+    if (io.engine.clientsCount > 10000) {
+      socket.emit("error", { message: "Server at capacity" });
+      socket.disconnect();
+      return;
+    }
 
     socket.on("admin_authenticate", async (data) => {
       const token = data?.token?.split(" ")?.[1];
@@ -47,11 +54,6 @@ function setupSocketHandlers(io) {
             message: "Admin authentication successful",
             user: socket.adminUser,
           });
-          console.log(
-            "Admin authenticated:",
-            socket.id,
-            socket.adminUser.userId
-          );
         } else {
           socket.emit("admin_authenticated", {
             success: false,
@@ -67,7 +69,6 @@ function setupSocketHandlers(io) {
       }
     });
 
-    // Handle admin joining a room (for monitoring)
     socket.on("admin_join_room", (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
@@ -78,22 +79,18 @@ function setupSocketHandlers(io) {
       socket.join(roomId);
       socket.emit("admin_room_joined", {
         roomId,
-        users: getUsersInRoom(roomId),
+        users: getUsersInRoom(roomId), // Now returns empty array
         usersCount: getUsersPerRoom()[roomId] || 0,
       });
-      console.log(`Admin ${socket.id} joined room: ${roomId}`);
     });
 
-    // Handle admin leaving a room
     socket.on("admin_leave_room", (data) => {
       if (!socket.isAdmin) return;
-
       const { roomId } = data;
       socket.leave(roomId);
       socket.emit("admin_room_left", { roomId });
     });
 
-    // Handle admin sending message to room
     socket.on("admin_room_message", (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
@@ -114,7 +111,7 @@ function setupSocketHandlers(io) {
         return;
       }
 
-      // Use room broadcast instead of looping
+      // Use senderName from admin data
       const messageData = {
         senderName: "Admin",
         messageContent: messageContent,
@@ -132,13 +129,9 @@ function setupSocketHandlers(io) {
         messageContent: messageContent,
         messageType: "room_message",
       }).catch(console.error);
-
-      console.log(
-        `Admin ${socket.adminUser.userId} sent message to room ${roomId}`
-      );
     });
 
-    // Handle user joining room
+    // User joining room - websiteName still needed for analytics
     socket.on("join_room", (data) => {
       const { senderName, roomId, websiteName } = data;
       const result = joinRoom(roomId, socket, senderName, websiteName);
@@ -146,9 +139,8 @@ function setupSocketHandlers(io) {
       if (result.success) {
         socket.emit("join_result", result);
 
-        // Notify others in the room
         socket.to(roomId).emit("user_joined", {
-          senderName,
+          senderName, // From frontend
           roomId,
           usersCount: result.usersCount || 0,
         });
@@ -157,24 +149,25 @@ function setupSocketHandlers(io) {
       }
     });
 
-    // Handle messages to room
+    // Messages - senderName comes from frontend
     socket.on("room_message", async (data) => {
-      const { roomId, messageContent, senderName } = data;
+      const { roomId, messageContent, senderName } = data; // senderName from frontend
 
       if (roomExists(roomId)) {
         const messageData = {
-          senderName: senderName,
+          senderName: senderName, // Use from frontend
           messageContent: messageContent,
           roomId,
+          timestamp: new Date().toISOString(),
         };
 
-        // Emit to room (excluding sender)
-        socket.to(roomId).emit("room_message", messageData);
+        // Broadcast to room including sender
+        io.to(roomId).emit("room_message", messageData);
 
         // Save message asynchronously
         try {
           await saveChatMessageService(roomId, {
-            senderName: senderName,
+            senderName: senderName, // Use from frontend
             senderId: socket.id,
             messageContent: messageContent,
             messageType: "room_message",
@@ -185,7 +178,6 @@ function setupSocketHandlers(io) {
       }
     });
 
-    // Handle views visibility update to room
     socket.on("update_views_visibility", (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
@@ -198,7 +190,6 @@ function setupSocketHandlers(io) {
       }
     });
 
-    // Handle user disconnection
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
 
@@ -206,19 +197,17 @@ function setupSocketHandlers(io) {
         removeAdmin(socket);
       }
 
-      const result = leaveRoom(socket.id);
+      const result = leaveRoom(socket);
 
       if (result) {
-        // Notify others in the room
         socket.to(result.roomId).emit("user_left", {
-          senderName: socket.senderName,
+          // Note: We don't have senderName here anymore
           roomId: result.roomId,
           usersCount: result.usersCount || 0,
         });
       }
     });
 
-    // Add this new event for admin to request specific data
     socket.on("admin_request_data", (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
@@ -232,6 +221,14 @@ function setupSocketHandlers(io) {
           socket.emit("admin_custom_event", {
             eventType: "latest_matches_response",
             data: { message: "Fetching latest matches..." },
+            timestamp: new Date().toISOString(),
+          });
+          break;
+        case "force_room_update":
+          notifyAdminRoomUpdate();
+          socket.emit("admin_custom_event", {
+            eventType: "room_update_forced",
+            data: { message: "Room update triggered manually" },
             timestamp: new Date().toISOString(),
           });
           break;

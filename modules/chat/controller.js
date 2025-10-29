@@ -14,6 +14,10 @@ const {
 const { sendResponse, sendError } = require("@project/utils");
 const { createSocketRoomsForMatchService } = require("./socket_service");
 const { sendLatestMatches } = require("@project/socket/adminEventService");
+const {
+  setPerformanceMode,
+  getCurrentPerformanceMode,
+} = require("@project/utils/perfomance_config");
 
 async function getUsersPerRoomController(req, res) {
   try {
@@ -113,7 +117,44 @@ async function updateShowViewsVisibilityToUsersController(req, res) {
   } catch (error) {
     return sendError(
       res,
-      error?.message || "Errorin in sending Views Visibility: ",
+      error?.message || "Error in sending Views Visibility: ",
+      500
+    );
+  }
+}
+
+async function changeServerModeController(req, res) {
+  const { mode } = req.body;
+  try {
+    setPerformanceMode(mode);
+    return sendResponse(
+      res,
+      null,
+      "Success in changing performance mode!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in changing performance mode: ",
+      500
+    );
+  }
+}
+
+async function getServerModeController(req, res) {
+  try {
+    const result = await getCurrentPerformanceMode();
+    return sendResponse(
+      res,
+      result,
+      "Success in getting performance mode!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in getting performance mode: ",
       500
     );
   }
@@ -127,4 +168,6 @@ module.exports = {
   createSingleSocketRoomController,
   sendLatestUpdatesToAdminController,
   updateShowViewsVisibilityToUsersController,
+  changeServerModeController,
+  getServerModeController,
 };

@@ -1,9 +1,12 @@
 // socket/adminEventService.js
 const { emitToAdmins, emitToAdmin } = require("./roomManager");
+const {
+  BATCH_PROCESSING_INTERVAL,
+  getCurrentPerformanceMode,
+} = require("@project/utils/perfomance_config");
 
 // Batch processing for multiple events
 const eventQueue = [];
-const BATCH_PROCESSING_INTERVAL = 100; // 100ms
 let batchTimeout = null;
 
 function processEventBatch() {
@@ -24,7 +27,10 @@ function processEventBatch() {
 
   // Schedule next batch if there are more events
   if (eventQueue.length > 0) {
-    batchTimeout = setTimeout(processEventBatch, BATCH_PROCESSING_INTERVAL);
+    batchTimeout = setTimeout(
+      processEventBatch,
+      getCurrentPerformanceMode().settings.batchProcessing
+    );
   } else {
     batchTimeout = null;
   }
@@ -34,7 +40,10 @@ function queueEvent(event, data) {
   eventQueue.push({ event, data });
 
   if (!batchTimeout) {
-    batchTimeout = setTimeout(processEventBatch, BATCH_PROCESSING_INTERVAL);
+    batchTimeout = setTimeout(
+      processEventBatch,
+      getCurrentPerformanceMode().settings.batchProcessing
+    );
   }
 }
 

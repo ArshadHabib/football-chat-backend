@@ -3,10 +3,17 @@ const {
   createChatRoomService,
   deleteChatRoomService,
 } = require("@project/modules/chat/service");
+const {
+  ADMIN_UPDATE_DEBOUNCE,
+  USERS_COUNT_UPDATE_DEBOUNCE,
+  CACHE_TTL,
+  getCurrentPerformanceMode,
+} = require("@project/utils/perfomance_config");
 
 // Minimal data structures
 const rooms = new Map(); // roomId -> Set of socketIds
 const adminSockets = new Set();
+const roomUserCountUpdates = new Map();
 
 // Real-time counters
 const roomCounts = new Map(); // roomId -> user count
@@ -19,27 +26,7 @@ const socketWebsite = new Map(); // socketId -> websiteName
 // Cache and debouncing
 let cachedRoomData = null;
 let adminUpdateTimeout = null;
-const ADMIN_UPDATE_DEBOUNCE = 500;
-const CACHE_TTL = 2000;
-
-// Performance monitoring
-const stats = {
-  operations: 0,
-  cacheHits: 0,
-  lastReset: Date.now(),
-};
-
-function updateStats() {
-  stats.operations++;
-  if (Date.now() - stats.lastReset > 60000) {
-    console.log(
-      `[Stats] Ops: ${stats.operations}, Cache: ${stats.cacheHits}, Users: ${totalUsers}`
-    );
-    stats.operations = 0;
-    stats.cacheHits = 0;
-    stats.lastReset = Date.now();
-  }
-}
+let userCountUpdateTimeout = null;
 
 async function createRoom(roomId) {
   if (rooms.has(roomId)) {
@@ -92,6 +79,7 @@ async function deleteRoom(roomId) {
 
   invalidateCache();
   scheduleAdminRoomUpdate();
+  roomUserCountUpdates.delete(roomId);
   return { success: true, roomId };
 }
 
@@ -157,7 +145,6 @@ function joinRoom(roomId, socket, senderName, websiteName) {
     websiteCounts.set(websiteName, (websiteCounts.get(websiteName) || 0) + 1);
   }
 
-  updateStats();
   invalidateCache();
   scheduleAdminRoomUpdate();
 
@@ -196,7 +183,6 @@ function leaveRoom(socket) {
   socket.leave(roomId);
   socket.roomId = null;
 
-  updateStats();
   invalidateCache();
   scheduleAdminRoomUpdate();
 
@@ -255,7 +241,7 @@ function scheduleAdminRoomUpdate() {
 
   adminUpdateTimeout = setTimeout(() => {
     notifyAdminRoomUpdate();
-  }, ADMIN_UPDATE_DEBOUNCE);
+  }, getCurrentPerformanceMode().settings.adminUpdateDebounce);
 }
 
 function notifyAdminRoomUpdate() {
@@ -276,8 +262,11 @@ function notifyAdminRoomUpdate() {
 function getCachedRoomData() {
   const now = Date.now();
 
-  if (cachedRoomData && now - cachedRoomData.cacheTime < CACHE_TTL) {
-    stats.cacheHits++;
+  if (
+    cachedRoomData &&
+    now - cachedRoomData.cacheTime <
+      getCurrentPerformanceMode().settings.cacheTTL
+  ) {
     return cachedRoomData;
   }
 
@@ -334,6 +323,42 @@ function emitToAdmin(socketId, eventName, data) {
   return sent;
 }
 
+function scheduleUserCountUpdate(roomId, usersCount) {
+  // Store the latest count for this room
+  roomUserCountUpdates.set(roomId, {
+    usersCount,
+    lastUpdate: Date.now(),
+  });
+
+  // Debounce updates
+  if (userCountUpdateTimeout) {
+    clearTimeout(userCountUpdateTimeout);
+  }
+
+  userCountUpdateTimeout = setTimeout(() => {
+    broadcastUserCountUpdates();
+  }, getCurrentPerformanceMode().settings.userCountUpdateDebounce);
+}
+
+function broadcastUserCountUpdates() {
+  const io = getIO();
+  if (!io) return;
+
+  roomUserCountUpdates.forEach((data, roomId) => {
+    // Only broadcast if room still exists and has users
+    if (rooms.has(roomId)) {
+      io.to(roomId).emit("room_user_count_update", {
+        roomId,
+        usersCount: data.usersCount,
+      });
+    }
+  });
+  // console.log(
+  //   `📊 User count updates sent to ${roomUserCountUpdates.size} rooms`
+  // );
+  roomUserCountUpdates.clear();
+}
+
 // Utility functions
 let ioInstance = null;
 
@@ -364,4 +389,5 @@ module.exports = {
   getUsersPerWebsite,
   updateViewsVisibility,
   setIO,
+  scheduleUserCountUpdate,
 };

@@ -1,11 +1,14 @@
 const mongoose = require("mongoose");
 const ChatRoomModel = require("./model");
 const MessageModel = require("./messageModel");
+const {
+  BATCH_FLUSH_INTERVAL,
+  MAX_BATCH_SIZE,
+  getCurrentPerformanceMode,
+} = require("@project/utils/perfomance_config");
 
 // Batch message saving
 const messageBatch = new Map();
-const BATCH_FLUSH_INTERVAL = 1000;
-const MAX_BATCH_SIZE = 50;
 
 async function flushMessageBatch() {
   if (messageBatch.size === 0) return;
@@ -49,7 +52,7 @@ async function flushMessageBatch() {
   messageBatch.clear();
 }
 
-setInterval(flushMessageBatch, BATCH_FLUSH_INTERVAL);
+setInterval(flushMessageBatch, getCurrentPerformanceMode().settings.batchFlush);
 
 async function saveChatMessageService(roomId, messageData) {
   const message = {
@@ -66,7 +69,7 @@ async function saveChatMessageService(roomId, messageData) {
   const batch = messageBatch.get(roomId);
   batch.push(message);
 
-  if (batch.length >= MAX_BATCH_SIZE) {
+  if (batch.length >= getCurrentPerformanceMode().settings.maxBatchSize) {
     await flushMessageBatch();
   }
 

@@ -11,6 +11,7 @@ const {
   removeAdmin,
   notifyAdminRoomUpdate,
   setIO,
+  scheduleUserCountUpdate,
 } = require("./roomManager");
 const { authenticateToken } = require("@project/middleware");
 
@@ -138,12 +139,12 @@ function setupSocketHandlers(io) {
 
       if (result.success) {
         socket.emit("join_result", result);
-
-        socket.to(roomId).emit("user_joined", {
-          senderName, // From frontend
-          roomId,
-          usersCount: result.usersCount || 0,
-        });
+        scheduleUserCountUpdate(roomId, result.usersCount);
+        // socket.to(roomId).emit("user_joined", {
+        //   senderName, // From frontend
+        //   roomId,
+        //   usersCount: result.usersCount || 0,
+        // });
       } else {
         socket.emit("join_result", result);
       }
@@ -200,11 +201,12 @@ function setupSocketHandlers(io) {
       const result = leaveRoom(socket);
 
       if (result) {
-        socket.to(result.roomId).emit("user_left", {
-          // Note: We don't have senderName here anymore
-          roomId: result.roomId,
-          usersCount: result.usersCount || 0,
-        });
+        scheduleUserCountUpdate(result.roomId, result.usersCount);
+        // socket.to(result.roomId).emit("user_left", {
+        //   // Note: We don't have senderName here anymore
+        //   roomId: result.roomId,
+        //   usersCount: result.usersCount || 0,
+        // });
       }
     });
 

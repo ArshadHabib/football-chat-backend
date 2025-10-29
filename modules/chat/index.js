@@ -13,6 +13,8 @@ const {
   createSingleSocketRoomController,
   sendLatestUpdatesToAdminController,
   updateShowViewsVisibilityToUsersController,
+  changeServerModeController,
+  getServerModeController,
 } = require("./controller");
 
 router.get(
@@ -48,5 +50,11 @@ router.post(
   isAdminKeyCorrect,
   updateShowViewsVisibilityToUsersController
 );
+router.post(
+  "/change-server-mode",
+  isAdminKeyCorrect,
+  changeServerModeController
+);
+router.post("/get-server-mode", isAdminKeyCorrect, getServerModeController);
 
 module.exports = router;

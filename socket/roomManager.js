@@ -4,29 +4,62 @@ const {
   deleteChatRoomService,
 } = require("@project/modules/chat/service");
 const {
-  ADMIN_UPDATE_DEBOUNCE,
-  USERS_COUNT_UPDATE_DEBOUNCE,
-  CACHE_TTL,
   getCurrentPerformanceMode,
 } = require("@project/utils/perfomance_config");
 
-// Minimal data structures
-const rooms = new Map(); // roomId -> Set of socketIds
+// === SINGLE SOURCE OF TRUTH ===
+const rooms = new Map(); // roomId -> Set of socketIds (THIS IS THE TRUTH)
 const adminSockets = new Set();
 const roomUserCountUpdates = new Map();
-
-// Real-time counters
-const roomCounts = new Map(); // roomId -> user count
-const websiteCounts = new Map(); // websiteName -> user count
-let totalUsers = 0;
-
-// NEW: Store minimal socket info for website tracking
 const socketWebsite = new Map(); // socketId -> websiteName
+
+// === REMOVED: All manual counters ===
+// ❌ DELETED: const roomCounts = new Map();
+// ❌ DELETED: const websiteCounts = new Map();
+// ❌ DELETED: let totalUsers = 0;
 
 // Cache and debouncing
 let cachedRoomData = null;
 let adminUpdateTimeout = null;
 let userCountUpdateTimeout = null;
+
+// === DERIVED COUNTERS (Computed from rooms Map) ===
+function getTotalUsers() {
+  let total = 0;
+  rooms.forEach((socketIds) => {
+    total += socketIds.size;
+  });
+  return total;
+}
+
+function getUsersPerRoom() {
+  const usersPerRoom = {};
+  rooms.forEach((socketIds, roomId) => {
+    usersPerRoom[roomId] = socketIds.size;
+  });
+  return usersPerRoom;
+}
+
+function getUsersPerWebsite() {
+  const usersPerWebsite = {};
+
+  // Count from actual socket data
+  rooms.forEach((socketIds, roomId) => {
+    socketIds.forEach((socketId) => {
+      const websiteName = socketWebsite.get(socketId);
+      if (websiteName) {
+        usersPerWebsite[websiteName] = (usersPerWebsite[websiteName] || 0) + 1;
+      }
+    });
+  });
+
+  return usersPerWebsite;
+}
+
+function getRoomUserCount(roomId) {
+  const socketIds = rooms.get(roomId);
+  return socketIds ? socketIds.size : 0;
+}
 
 async function createRoom(roomId) {
   if (rooms.has(roomId)) {
@@ -34,7 +67,6 @@ async function createRoom(roomId) {
   }
 
   rooms.set(roomId, new Set());
-  roomCounts.set(roomId, 0);
   console.log(`Room created: ${roomId}`);
 
   createChatRoomService(roomId);
@@ -49,25 +81,11 @@ async function deleteRoom(roomId) {
   }
 
   const socketIds = rooms.get(roomId);
-  const userCount = socketIds.size;
 
-  // Update website counts for all users in this room
+  // Clean up website data for all users in this room
   socketIds.forEach((socketId) => {
-    const websiteName = socketWebsite.get(socketId);
-    if (websiteName) {
-      const count = websiteCounts.get(websiteName) || 0;
-      if (count <= 1) {
-        websiteCounts.delete(websiteName);
-      } else {
-        websiteCounts.set(websiteName, count - 1);
-      }
-      socketWebsite.delete(socketId);
-    }
+    socketWebsite.delete(socketId);
   });
-
-  // Update counters
-  totalUsers -= userCount;
-  roomCounts.delete(roomId);
 
   const io = getIO();
   if (io) {
@@ -92,11 +110,8 @@ async function deleteAllRooms() {
   const roomIds = Array.from(rooms.keys());
   const deletedCount = roomIds.length;
 
-  // Reset all counters and data
-  totalUsers = 0;
+  // Reset all data (no counters to reset)
   rooms.clear();
-  roomCounts.clear();
-  websiteCounts.clear();
   socketWebsite.clear();
 
   const io = getIO();
@@ -130,20 +145,14 @@ function joinRoom(roomId, socket, senderName, websiteName) {
   // Store room ID and website name for this socket
   socket.roomId = roomId;
 
-  // NEW: Store website name for this socket so we can decrement later
+  // Store website name
   if (websiteName) {
     socketWebsite.set(socket.id, websiteName);
   }
 
   socket.join(roomId);
 
-  // Update counters - O(1) operations
-  totalUsers++;
-  roomCounts.set(roomId, socketIds.size);
-
-  if (websiteName) {
-    websiteCounts.set(websiteName, (websiteCounts.get(websiteName) || 0) + 1);
-  }
+  // 🚨 NO MANUAL COUNTER UPDATES - everything derived from rooms Map
 
   invalidateCache();
   scheduleAdminRoomUpdate();
@@ -151,7 +160,7 @@ function joinRoom(roomId, socket, senderName, websiteName) {
   return {
     success: true,
     roomId,
-    usersCount: socketIds.size,
+    usersCount: socketIds.size, // Direct from source of truth
   };
 }
 
@@ -164,34 +173,21 @@ function leaveRoom(socket) {
   const socketIds = rooms.get(roomId);
   socketIds.delete(socket.id);
 
-  // NEW: Get website name for this socket and update website counts
-  const websiteName = socketWebsite.get(socket.id);
-  if (websiteName) {
-    const count = websiteCounts.get(websiteName) || 0;
-    if (count <= 1) {
-      websiteCounts.delete(websiteName);
-    } else {
-      websiteCounts.set(websiteName, count - 1);
-    }
-    socketWebsite.delete(socket.id); // Clean up
-  }
-
-  // Update counters
-  totalUsers = Math.max(0, totalUsers - 1);
-  roomCounts.set(roomId, socketIds.size);
+  // Clean up website data
+  socketWebsite.delete(socket.id);
 
   socket.leave(roomId);
   socket.roomId = null;
 
+  // 🚨 NO MANUAL COUNTER UPDATES
+
   invalidateCache();
   scheduleAdminRoomUpdate();
 
-  return { roomId, usersCount: socketIds.size };
-}
-
-// O(1) operations - no loops!
-function getTotalUsers() {
-  return totalUsers;
+  return {
+    roomId,
+    usersCount: socketIds.size, // Direct from source of truth
+  };
 }
 
 function getUsersInRoom(roomId) {
@@ -201,16 +197,6 @@ function getUsersInRoom(roomId) {
 
 function roomExists(roomId) {
   return rooms.has(roomId);
-}
-
-// O(1) - uses pre-calculated counts
-function getUsersPerRoom() {
-  return Object.fromEntries(roomCounts);
-}
-
-// O(1) - uses pre-calculated counts
-function getUsersPerWebsite() {
-  return Object.fromEntries(websiteCounts);
 }
 
 function updateViewsVisibility(data) {
@@ -325,10 +311,7 @@ function emitToAdmin(socketId, eventName, data) {
 
 function scheduleUserCountUpdate(roomId, usersCount) {
   // Store the latest count for this room
-  roomUserCountUpdates.set(roomId, {
-    usersCount,
-    lastUpdate: Date.now(),
-  });
+  roomUserCountUpdates.set(roomId, usersCount);
 
   // Debounce updates
   if (userCountUpdateTimeout) {
@@ -344,18 +327,16 @@ function broadcastUserCountUpdates() {
   const io = getIO();
   if (!io) return;
 
-  roomUserCountUpdates.forEach((data, roomId) => {
-    // Only broadcast if room still exists and has users
+  roomUserCountUpdates.forEach((usersCount, roomId) => {
+    // Only broadcast if room still exists
     if (rooms.has(roomId)) {
       io.to(roomId).emit("room_user_count_update", {
         roomId,
-        usersCount: data.usersCount,
+        usersCount: usersCount,
       });
     }
   });
-  // console.log(
-  //   `📊 User count updates sent to ${roomUserCountUpdates.size} rooms`
-  // );
+
   roomUserCountUpdates.clear();
 }
 
@@ -369,6 +350,34 @@ function setIO(io) {
 function getIO() {
   return ioInstance;
 }
+
+// Validation function to ensure counts are always correct
+function validateCounts() {
+  const calculatedTotal = getTotalUsers();
+  const roomSum = Object.values(getUsersPerRoom()).reduce(
+    (sum, count) => sum + count,
+    0
+  );
+  const websiteSum = Object.values(getUsersPerWebsite()).reduce(
+    (sum, count) => sum + count,
+    0
+  );
+
+  console.log(`🔍 COUNT VALIDATION:`);
+  console.log(`   totalUsers: ${calculatedTotal}`);
+  console.log(`   Sum of rooms: ${roomSum}`);
+  console.log(`   Sum of websites: ${websiteSum}`);
+
+  // All should be equal - if not, there's a critical bug
+  if (calculatedTotal !== roomSum || calculatedTotal !== websiteSum) {
+    console.log(`🚨 CRITICAL: Count mismatch detected!`);
+  } else {
+    console.log(`✅ All counts are consistent`);
+  }
+}
+
+// Run validation every 2 minutes
+setInterval(validateCounts, 120000);
 
 module.exports = {
   createRoom,

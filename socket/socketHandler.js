@@ -98,7 +98,7 @@ function setupSocketHandlers(io) {
         return;
       }
 
-      const { roomId, messageContent } = data;
+      const { roomId, messageContent, isPinned } = data;
 
       if (!socket.rooms.has(roomId)) {
         socket.emit("error", {
@@ -118,6 +118,7 @@ function setupSocketHandlers(io) {
         messageContent: messageContent,
         roomId: roomId,
         isAdmin: true,
+        isPinned: !!isPinned,
         timestamp: new Date().toISOString(),
       };
 
@@ -129,6 +130,8 @@ function setupSocketHandlers(io) {
         senderId: socket.id,
         messageContent: messageContent,
         messageType: "room_message",
+        isAdmin: true,
+        isPinned: !!isPinned,
       }).catch(console.error);
     });
 

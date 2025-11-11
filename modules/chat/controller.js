@@ -39,8 +39,8 @@ async function getUsersPerRoomController(req, res) {
 
 async function getRoomMessagesController(req, res) {
   try {
-    const { roomId } = req.query;
-    const messages = await retrieveRoomMessagesService(roomId);
+    const { roomId, noLimit } = req.query;
+    const messages = await retrieveRoomMessagesService(roomId, noLimit);
     return sendResponse(
       res,
       messages,

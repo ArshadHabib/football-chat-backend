@@ -145,25 +145,45 @@ async function deleteAllDBChatRoomService() {
   }
 }
 
-async function retrieveRoomMessagesService(roomId, options = {}) {
+async function retrieveRoomMessagesService(roomId, noLimit, options = {}) {
   try {
     const {
       limit = 200,
       skip = 0,
       before = new Date(), // For pagination
     } = options;
+    let messages = [];
+    let pinnedMessage = null;
 
-    const messages = await MessageModel.find({
-      roomId,
-      timestamp: { $lt: before },
-    })
-      .sort({ timestamp: -1 })
-      .limit(limit)
-      .skip(skip)
-      .lean(); // Faster read-only
+    if (noLimit) {
+      messages = await MessageModel.find({
+        roomId,
+      })
+        .sort({ timestamp: -1 })
+        .lean();
+    } else {
+      messages = await MessageModel.find({
+        roomId,
+        timestamp: { $lt: before },
+      })
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .skip(skip)
+        .lean();
+      pinnedMessage = await MessageModel.find({
+        roomId,
+        isPinned: true,
+      })
+        .sort({ timestamp: -1 })
+        .limit(1)
+        .lean();
+    }
 
-    console.log(`Retrieved ${messages.length} messages from room: ${roomId}`);
-    return messages.reverse(); // Return in chronological order
+    console.log(`Retrieved ${messages?.length} messages from room: ${roomId}`);
+    return {
+      messages: messages?.reverse(),
+      pinnedMessage: pinnedMessage ? pinnedMessage[0] : null,
+    };
   } catch (error) {
     console.error(
       `Error retrieving messages from room ${roomId}:`,

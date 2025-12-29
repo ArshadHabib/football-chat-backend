@@ -135,6 +135,61 @@ function setupSocketHandlers(io) {
       }).catch(console.error);
     });
 
+    socket.on("update_user", (data) => {
+      if (!socket.isAdmin) {
+        socket.emit("error", { message: "Admin access required" });
+        return;
+      }
+
+      const { roomId, userData } = data;
+
+      // Validate required fields
+      if (!roomId || !userData || typeof userData !== "object") {
+        socket.emit("error", {
+          message:
+            "Missing or invalid parameters: roomId and userData are required",
+        });
+        return;
+      }
+
+      // Validate userData structure
+      if (typeof userData.name === "undefined" || userData.name === null) {
+        socket.emit("error", {
+          message: "userData must contain at least a 'name' field",
+        });
+        return;
+      }
+
+      // Check if admin is in the room (optional but recommended)
+      if (!socket.rooms.has(roomId)) {
+        socket.emit("warning", {
+          message: "You are not in this room, but broadcasting anyway",
+          roomId,
+        });
+      }
+
+      // Check if room exists
+      if (!roomExists(roomId)) {
+        socket.emit("error", {
+          message: "Room does not exist",
+          roomId,
+        });
+        return;
+      }
+
+      // Prepare the broadcast data
+      const broadcastData = {
+        ...userData,
+        roomId,
+        updatedBy: "admin",
+        timestamp: new Date().toISOString(),
+        eventType: "user_updated",
+      };
+
+      // Broadcast to the specific room
+      io.to(roomId).emit("user_updated", broadcastData);
+    });
+
     // User joining room - websiteName still needed for analytics
     socket.on("join_room", (data) => {
       const { senderName, roomId, websiteName } = data;

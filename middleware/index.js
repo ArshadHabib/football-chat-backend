@@ -100,22 +100,32 @@ const checkRole = (allowedRole) => {
 
 const attachClientIp = (req, res, next) => {
   try {
-    // Express handles proxy correctly because of `trust proxy`
-    let ip =
-      req.ip ||
-      req.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
-      req.headers["x-real-ip"] ||
-      req.socket.remoteAddress;
+    // // Express handles proxy correctly because of `trust proxy`
+    // let ip =
+    //   req.ip ||
+    //   req.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
+    //   req.headers["x-real-ip"] ||
+    //   req.socket.remoteAddress;
 
-    // Normalize IPv6 localhost / mapped IPv4
+    // // Normalize IPv6 localhost / mapped IPv4
+    // if (ip === "::1") ip = "127.0.0.1";
+    // if (ip?.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
+
+    // // Attach safely
+    // req.clientIp = ip;
+    // req.body.clientIp = ip;
+    // console.log("Client IP: ", ip);
+
+    // next();
+    let ip = req.ip;
+
     if (ip === "::1") ip = "127.0.0.1";
     if (ip?.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
 
-    // Attach safely
     req.clientIp = ip;
     req.body.clientIp = ip;
-    console.log("Client IP: ", ip);
 
+    console.log("Client IP:", ip);
     next();
   } catch (error) {
     console.error("IP middleware error:", error);

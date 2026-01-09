@@ -114,6 +114,7 @@ const attachClientIp = (req, res, next) => {
     // Attach safely
     req.clientIp = ip;
     req.body.clientIp = ip;
+    console.log("Client IP: ", ip);
 
     next();
   } catch (error) {

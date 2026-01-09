@@ -119,7 +119,8 @@ const attachClientIp = (req, res, next) => {
     // next();
     let ip = req.ip;
 
-    if (ip === "::1") ip = "127.0.0.1";
+    // if (ip === "::1") ip = "127.0.0.1";
+    if (ip === "::1") ip = "";
     if (ip?.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
 
     req.clientIp = ip;

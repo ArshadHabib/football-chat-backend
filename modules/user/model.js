@@ -17,6 +17,12 @@ const userSchema = new mongoose.Schema(
       required: false,
       default: false,
     },
+    ipAddress: {
+      type: String,
+      required: false,
+      index: true,
+      default: "",
+    },
   },
   { timestamps: true }
 );

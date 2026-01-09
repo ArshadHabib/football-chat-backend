@@ -26,6 +26,7 @@ const io = socketIo(server, {
 });
 setupSocketHandlers(io);
 
+app.set("trust proxy", true);
 app.use(bodyParser.json({ limit: "50mb" }));
 
 app.use(

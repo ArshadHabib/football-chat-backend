@@ -1,8 +1,9 @@
 const User = require("./model");
 
-async function createUser(name) {
+async function createUser(name, clientIp) {
   const user = new User({
     name,
+    ipAddress: clientIp || "",
   });
   await user.save();
   return user;
@@ -10,6 +11,16 @@ async function createUser(name) {
 
 async function findUserByName(name) {
   return await User.findOne({ name });
+}
+
+async function findUserByIp(ipAddress) {
+  if (!ipAddress) return null;
+  return await User.findOne({ ipAddress });
+}
+
+async function findBannedUserByIp(ipAddress) {
+  if (!ipAddress) return null;
+  return await User.findOne({ ipAddress, isBanned: true });
 }
 
 async function findUserById(id) {
@@ -29,4 +40,6 @@ module.exports = {
   findUserByName,
   findUserById,
   updateUser,
+  findUserByIp,
+  findBannedUserByIp,
 };

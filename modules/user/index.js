@@ -1,10 +1,18 @@
 const express = require("express");
 const router = express.Router();
 const authController = require("./controller");
-const { isAdmin, isUserLoggedIn } = require("@project/middleware");
+const {
+  isAdmin,
+  isUserLoggedIn,
+  attachClientIp,
+} = require("@project/middleware");
 
 // User routes
-router.post("/register-user", authController.registerUserController);
+router.post(
+  "/register-user",
+  attachClientIp,
+  authController.registerUserController
+);
 router.patch(
   "/update-user",
   isUserLoggedIn,
@@ -17,5 +25,6 @@ router.post(
   isAdmin,
   authController.getUserController
 );
+router.post("/is-user-banned", authController.isUserBannedController);
 
 module.exports = router;

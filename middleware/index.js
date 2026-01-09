@@ -102,9 +102,9 @@ const attachClientIp = (req, res, next) => {
   try {
     // Express handles proxy correctly because of `trust proxy`
     let ip =
+      req.ip ||
       req.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
       req.headers["x-real-ip"] ||
-      req.ip ||
       req.socket.remoteAddress;
 
     // Normalize IPv6 localhost / mapped IPv4

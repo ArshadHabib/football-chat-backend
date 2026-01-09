@@ -17,6 +17,7 @@ const socketIo = require("socket.io");
 const setupSocketHandlers = require("./socket/socketHandler");
 
 const app = express();
+app.set("trust proxy", 1);
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
@@ -26,7 +27,7 @@ const io = socketIo(server, {
 });
 setupSocketHandlers(io);
 
-app.set("trust proxy", true);
+// app.set("trust proxy", true);
 app.use(bodyParser.json({ limit: "50mb" }));
 
 app.use(

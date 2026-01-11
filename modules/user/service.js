@@ -3,7 +3,7 @@ const User = require("./model");
 async function createUser(name, clientIp) {
   const user = new User({
     name,
-    ipAddress: clientIp || "",
+    ipAddress: clientIp === "127.0.0.1" ? "" : clientIp || "",
   });
   await user.save();
   return user;

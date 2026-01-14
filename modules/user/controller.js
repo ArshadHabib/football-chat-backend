@@ -2,10 +2,10 @@ const userService = require("./service");
 const { sendResponse, sendError, generateToken } = require("@project/utils");
 
 async function registerUserController(req, res) {
-  const { name, clientIp } = req?.body;
+  const { name, clientIp, inComingClientIp } = req?.body;
   try {
     // 1️⃣ Block banned IP immediately
-    const bannedIpUser = await userService.findBannedUserByIp(clientIp);
+    const bannedIpUser = await userService.findBannedUserByIp(inComingClientIp);
     if (bannedIpUser) {
       return sendError(res, "You are banned from creating new users", 403);
     }
@@ -15,7 +15,7 @@ async function registerUserController(req, res) {
     if (existingUser) {
       return sendError(res, "User name already taken!", 400);
     }
-    await userService.createUser(name, clientIp);
+    await userService.createUser(name, inComingClientIp);
 
     sendResponse(res, null, "User created successfully", 201);
   } catch (error) {

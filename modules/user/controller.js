@@ -5,7 +5,9 @@ async function registerUserController(req, res) {
   const { name, clientIp, inComingClientIp } = req?.body;
   try {
     // 1️⃣ Block banned IP immediately
-    const bannedIpUser = await userService.findBannedUserByIp(inComingClientIp);
+    const bannedIpUser = await userService.findBannedUserByIp(
+      inComingClientIp || clientIp
+    );
     if (bannedIpUser) {
       return sendError(res, "You are banned from creating new users", 403);
     }
@@ -15,7 +17,7 @@ async function registerUserController(req, res) {
     if (existingUser) {
       return sendError(res, "User name already taken!", 400);
     }
-    await userService.createUser(name, inComingClientIp);
+    await userService.createUser(name, inComingClientIp || clientIp);
 
     sendResponse(res, null, "User created successfully", 201);
   } catch (error) {

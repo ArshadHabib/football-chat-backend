@@ -10,7 +10,7 @@ const {
 // User routes
 router.post(
   "/register-user",
-  // attachClientIp,
+  attachClientIp,
   authController.registerUserController
 );
 router.patch(

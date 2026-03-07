@@ -6,6 +6,7 @@ const {
   MAX_BATCH_SIZE,
   getCurrentPerformanceMode,
 } = require("@project/utils/perfomance_config");
+const { MAX_ROOM_MESSAGES_LIMIT } = require("@project/utils/const_config");
 
 // Batch message saving
 const messageBatch = new Map();
@@ -160,6 +161,7 @@ async function retrieveRoomMessagesService(roomId, noLimit, options = {}) {
         roomId,
       })
         .sort({ timestamp: -1 })
+        .limit(MAX_ROOM_MESSAGES_LIMIT)
         .lean();
     } else {
       messages = await MessageModel.find({

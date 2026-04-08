@@ -76,17 +76,18 @@ async function deleteRoom(roomId) {
     return { success: false, message: "Room does not exist" };
   }
 
-  const socketIds = rooms.get(roomId) || new Set();
+  const io = getIO();
 
-  // Clean up website data for all local users in this room
+  // Fetch ALL socket IDs in this room across all processes via the Redis adapter
+  // then clean up their website tracking entries in one pipeline
+  const allSocketIds = io ? await io.in(roomId).allSockets() : new Set();
   const pipeline = redis.multi();
-  socketIds.forEach((socketId) => {
-    socketWebsite.delete(socketId);
+  allSocketIds.forEach((socketId) => {
+    socketWebsite.delete(socketId); // clean local cache too
     pipeline.hDel(REDIS_SOCKET_WEBSITE, socketId);
   });
   await pipeline.exec();
 
-  const io = getIO();
   if (io) {
     io.to(roomId).emit("room_deleted", { roomId });
   }

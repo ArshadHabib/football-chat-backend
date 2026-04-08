@@ -6,54 +6,45 @@ const {
 const {
   getCurrentPerformanceMode,
 } = require("@project/utils/perfomance_config");
+const { pubClient: redis } = require("@project/config/redis");
 
-// === SINGLE SOURCE OF TRUTH ===
-const rooms = new Map(); // roomId -> Set of socketIds (THIS IS THE TRUTH)
-const adminSockets = new Set();
+// === LOCAL SOCKET TRACKING (per-process, for socket.join/leave mechanics) ===
+const rooms = new Map(); // roomId -> Set of local socketIds
+const adminSockets = new Set(); // local admin socket objects (for removeAdmin/isAdmin)
 const roomUserCountUpdates = new Map();
-const socketWebsite = new Map(); // socketId -> websiteName
+const socketWebsite = new Map(); // socketId -> websiteName (local cache)
 
-// === REMOVED: All manual counters ===
-// ❌ DELETED: const roomCounts = new Map();
-// ❌ DELETED: const websiteCounts = new Map();
-// ❌ DELETED: let totalUsers = 0;
+// Redis keys
+const REDIS_ROOMS_SET = "__rooms__";
+const REDIS_ROOM_COUNTS = "__room_counts__";
+const REDIS_SOCKET_WEBSITE = "__socket_website__";
 
 // Cache and debouncing
 let cachedRoomData = null;
 let adminUpdateTimeout = null;
 let userCountUpdateTimeout = null;
 
-// === DERIVED COUNTERS (Computed from rooms Map) ===
-function getTotalUsers() {
-  let total = 0;
-  rooms.forEach((socketIds) => {
-    total += socketIds.size;
-  });
-  return total;
+// === DERIVED COUNTERS — all read from Redis (cross-process truth) ===
+
+async function getTotalUsers() {
+  const counts = await redis.hGetAll(REDIS_ROOM_COUNTS);
+  return Object.values(counts).reduce((sum, v) => sum + (parseInt(v) || 0), 0);
 }
 
-function getUsersPerRoom() {
-  const usersPerRoom = {};
-  rooms.forEach((socketIds, roomId) => {
-    usersPerRoom[roomId] = socketIds.size;
-  });
-  return usersPerRoom;
+async function getUsersPerRoom() {
+  const counts = await redis.hGetAll(REDIS_ROOM_COUNTS);
+  return Object.fromEntries(
+    Object.entries(counts).map(([k, v]) => [k, parseInt(v) || 0])
+  );
 }
 
-function getUsersPerWebsite() {
-  const usersPerWebsite = {};
-
-  // Count from actual socket data
-  rooms.forEach((socketIds, roomId) => {
-    socketIds.forEach((socketId) => {
-      const websiteName = socketWebsite.get(socketId);
-      if (websiteName) {
-        usersPerWebsite[websiteName] = (usersPerWebsite[websiteName] || 0) + 1;
-      }
-    });
+async function getUsersPerWebsite() {
+  const websiteMap = await redis.hGetAll(REDIS_SOCKET_WEBSITE);
+  const counts = {};
+  Object.values(websiteMap).forEach((site) => {
+    if (site) counts[site] = (counts[site] || 0) + 1;
   });
-
-  return usersPerWebsite;
+  return counts;
 }
 
 function getRoomUserCount(roomId) {
@@ -62,11 +53,15 @@ function getRoomUserCount(roomId) {
 }
 
 async function createRoom(roomId) {
-  if (rooms.has(roomId)) {
+  const alreadyInRedis = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+  if (alreadyInRedis) {
     return { success: false, message: "Room already exists" };
   }
 
   rooms.set(roomId, new Set());
+  await redis.sAdd(REDIS_ROOMS_SET, roomId);
+  await redis.hSet(REDIS_ROOM_COUNTS, roomId, "0");
+
   console.log(`Room created: ${roomId}`);
 
   createChatRoomService(roomId);
@@ -76,16 +71,20 @@ async function createRoom(roomId) {
 }
 
 async function deleteRoom(roomId) {
-  if (!rooms.has(roomId)) {
+  const existsInRedis = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+  if (!existsInRedis) {
     return { success: false, message: "Room does not exist" };
   }
 
-  const socketIds = rooms.get(roomId);
+  const socketIds = rooms.get(roomId) || new Set();
 
-  // Clean up website data for all users in this room
+  // Clean up website data for all local users in this room
+  const pipeline = redis.multi();
   socketIds.forEach((socketId) => {
     socketWebsite.delete(socketId);
+    pipeline.hDel(REDIS_SOCKET_WEBSITE, socketId);
   });
+  await pipeline.exec();
 
   const io = getIO();
   if (io) {
@@ -93,6 +92,9 @@ async function deleteRoom(roomId) {
   }
 
   rooms.delete(roomId);
+  await redis.sRem(REDIS_ROOMS_SET, roomId);
+  await redis.hDel(REDIS_ROOM_COUNTS, roomId);
+
   deleteChatRoomService(roomId);
 
   invalidateCache();
@@ -102,17 +104,25 @@ async function deleteRoom(roomId) {
 }
 
 async function deleteAllRooms() {
-  if (rooms.size === 0) {
+  const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
+
+  if (roomIds.length === 0) {
     console.log("No Socket Rooms to Delete!");
     return { success: true, message: "No rooms to delete", deletedCount: 0 };
   }
 
-  const roomIds = Array.from(rooms.keys());
   const deletedCount = roomIds.length;
 
-  // Reset all data (no counters to reset)
+  // Reset local state
   rooms.clear();
   socketWebsite.clear();
+
+  // Clean up Redis
+  await Promise.all([
+    redis.del(REDIS_ROOMS_SET),
+    redis.del(REDIS_ROOM_COUNTS),
+    redis.del(REDIS_SOCKET_WEBSITE),
+  ]);
 
   const io = getIO();
   roomIds.forEach((roomId) => {
@@ -134,25 +144,32 @@ async function deleteAllRooms() {
   };
 }
 
-function joinRoom(roomId, socket, senderName, websiteName) {
-  if (!rooms.has(roomId)) {
+async function joinRoom(roomId, socket, senderName, websiteName) {
+  const existsInRedis = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+  if (!existsInRedis) {
     return { success: false, message: "Room does not exist" };
+  }
+
+  // Warm local cache if this process didn't create the room
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, new Set());
   }
 
   const socketIds = rooms.get(roomId);
   socketIds.add(socket.id);
 
-  // Store room ID and website name for this socket
+  // Store room ID for this socket
   socket.roomId = roomId;
 
-  // Store website name
+  // Store website name locally and in Redis
   if (websiteName) {
     socketWebsite.set(socket.id, websiteName);
+    await redis.hSet(REDIS_SOCKET_WEBSITE, socket.id, websiteName);
   }
 
   socket.join(roomId);
 
-  // 🚨 NO MANUAL COUNTER UPDATES - everything derived from rooms Map
+  const count = await redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1);
 
   invalidateCache();
   scheduleAdminRoomUpdate();
@@ -160,33 +177,44 @@ function joinRoom(roomId, socket, senderName, websiteName) {
   return {
     success: true,
     roomId,
-    usersCount: socketIds.size, // Direct from source of truth
+    usersCount: count,
   };
 }
 
-function leaveRoom(socket) {
+async function leaveRoom(socket) {
   const roomId = socket.roomId;
-  if (!roomId || !rooms.has(roomId)) {
-    return null;
+  if (!roomId) return null;
+
+  // Clean up local state
+  if (rooms.has(roomId)) {
+    const socketIds = rooms.get(roomId);
+    socketIds.delete(socket.id);
   }
 
-  const socketIds = rooms.get(roomId);
-  socketIds.delete(socket.id);
-
-  // Clean up website data
+  // Clean up website data locally and in Redis
   socketWebsite.delete(socket.id);
+  await redis.hDel(REDIS_SOCKET_WEBSITE, socket.id);
 
   socket.leave(roomId);
   socket.roomId = null;
 
-  // 🚨 NO MANUAL COUNTER UPDATES
+  // Decrement Redis counter only if room still exists
+  const roomStillExists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+  let count = 0;
+  if (roomStillExists) {
+    count = await redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, -1);
+    if (count < 0) {
+      await redis.hSet(REDIS_ROOM_COUNTS, roomId, "0");
+      count = 0;
+    }
+  }
 
   invalidateCache();
   scheduleAdminRoomUpdate();
 
   return {
     roomId,
-    usersCount: socketIds.size, // Direct from source of truth
+    usersCount: count,
   };
 }
 
@@ -195,8 +223,11 @@ function getUsersInRoom(roomId) {
   return [];
 }
 
-function roomExists(roomId) {
-  return rooms.has(roomId);
+async function roomExists(roomId) {
+  if (rooms.has(roomId)) return true; // fast path: created on this process
+  const exists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+  if (exists) rooms.set(roomId, new Set()); // warm local cache
+  return exists;
 }
 
 function updateViewsVisibility(data) {
@@ -207,17 +238,19 @@ function updateViewsVisibility(data) {
 }
 
 // Admin management
-function registerAdmin(socket) {
+async function registerAdmin(socket) {
   adminSockets.add(socket);
+  socket.join("__admins__"); // works cross-process via Redis adapter
   console.log("Admin registered:", socket.id);
 
   // Send cached data immediately
-  const roomData = getCachedRoomData();
+  const roomData = await getCachedRoomData();
   socket.emit("admin_room_update", roomData);
 }
 
 function removeAdmin(socket) {
   adminSockets.delete(socket);
+  // socket.leave("__admins__") is handled automatically by Socket.io on disconnect
 }
 
 function scheduleAdminRoomUpdate() {
@@ -225,27 +258,25 @@ function scheduleAdminRoomUpdate() {
     clearTimeout(adminUpdateTimeout);
   }
 
-  adminUpdateTimeout = setTimeout(() => {
-    notifyAdminRoomUpdate();
-  }, getCurrentPerformanceMode().settings.adminUpdateDebounce);
+  // Always fire immediately regardless of performance mode — admins get real-time updates
+  adminUpdateTimeout = setTimeout(async () => {
+    await notifyAdminRoomUpdate();
+  }, 0);
 }
 
-function notifyAdminRoomUpdate() {
-  const roomData = getCachedRoomData();
+async function notifyAdminRoomUpdate() {
+  const io = getIO();
+  if (!io) return;
 
-  let sentCount = 0;
-  adminSockets.forEach((adminSocket) => {
-    if (adminSocket.connected) {
-      adminSocket.emit("admin_room_update", roomData);
-      sentCount++;
-    }
-  });
+  const roomData = await getCachedRoomData();
+  // io.to("__admins__") reaches ALL admin sockets across all 6 processes via Redis adapter
+  io.to("__admins__").emit("admin_room_update", roomData);
 
-  console.log(`Admin room update sent to ${sentCount} admin(s)`);
+  console.log(`Admin room update sent to __admins__ room`);
 }
 
 // Smart caching
-function getCachedRoomData() {
+async function getCachedRoomData() {
   const now = Date.now();
 
   if (
@@ -256,11 +287,21 @@ function getCachedRoomData() {
     return cachedRoomData;
   }
 
+  const [usersPerRoom, usersPerWebsite] = await Promise.all([
+    getUsersPerRoom(),
+    getUsersPerWebsite(),
+  ]);
+
+  const totalUsers = Object.values(usersPerRoom).reduce(
+    (sum, v) => sum + v,
+    0
+  );
+
   cachedRoomData = {
-    usersPerRoom: getUsersPerRoom(),
-    usersPerWebsite: getUsersPerWebsite(),
-    totalUsers: getTotalUsers(),
-    totalRooms: rooms.size,
+    usersPerRoom,
+    usersPerWebsite,
+    totalUsers,
+    totalRooms: Object.keys(usersPerRoom).length,
     timestamp: new Date().toISOString(),
     cacheTime: now,
   };
@@ -277,36 +318,33 @@ function isAdmin(socket) {
 }
 
 function emitToAdmins(eventName, data) {
+  const io = getIO();
+  if (!io) return 0;
+
   const eventData = {
     ...data,
     timestamp: new Date().toISOString(),
     eventType: eventName,
   };
 
-  let sentCount = 0;
-  adminSockets.forEach((adminSocket) => {
-    if (adminSocket.connected) {
-      adminSocket.emit("admin_custom_event", eventData);
-      sentCount++;
-    }
-  });
+  // io.to("__admins__") reaches ALL admin sockets across all 6 processes via Redis adapter
+  io.to("__admins__").emit("admin_custom_event", eventData);
 
-  return sentCount;
+  return 1; // dispatched (exact count across cluster is unknown, callers only check > 0)
 }
 
 function emitToAdmin(socketId, eventName, data) {
-  let sent = false;
-  adminSockets.forEach((adminSocket) => {
-    if (adminSocket.id === socketId && adminSocket.connected) {
-      adminSocket.emit("admin_custom_event", {
-        ...data,
-        timestamp: new Date().toISOString(),
-        eventType: eventName,
-      });
-      sent = true;
-    }
+  const io = getIO();
+  if (!io) return false;
+
+  // io.to(socketId) works cross-process with Redis adapter
+  io.to(socketId).emit("admin_custom_event", {
+    ...data,
+    timestamp: new Date().toISOString(),
+    eventType: eventName,
   });
-  return sent;
+
+  return true;
 }
 
 function scheduleUserCountUpdate(roomId, usersCount) {
@@ -318,24 +356,27 @@ function scheduleUserCountUpdate(roomId, usersCount) {
     clearTimeout(userCountUpdateTimeout);
   }
 
-  userCountUpdateTimeout = setTimeout(() => {
-    broadcastUserCountUpdates();
+  userCountUpdateTimeout = setTimeout(async () => {
+    await broadcastUserCountUpdates();
   }, getCurrentPerformanceMode().settings.userCountUpdateDebounce);
 }
 
-function broadcastUserCountUpdates() {
+async function broadcastUserCountUpdates() {
   const io = getIO();
   if (!io) return;
 
-  roomUserCountUpdates.forEach((usersCount, roomId) => {
-    // Only broadcast if room still exists
-    if (rooms.has(roomId)) {
+  for (const [roomId, usersCount] of roomUserCountUpdates) {
+    // Only broadcast if room still exists (check Redis for cross-process rooms)
+    const exists =
+      rooms.has(roomId) ||
+      (await redis.sIsMember(REDIS_ROOMS_SET, roomId));
+    if (exists) {
       io.to(roomId).emit("room_user_count_update", {
         roomId,
-        usersCount: usersCount,
+        usersCount,
       });
     }
-  });
+  }
 
   roomUserCountUpdates.clear();
 }
@@ -352,24 +393,27 @@ function getIO() {
 }
 
 // Validation function to ensure counts are always correct
-function validateCounts() {
-  const calculatedTotal = getTotalUsers();
-  const roomSum = Object.values(getUsersPerRoom()).reduce(
-    (sum, count) => sum + count,
-    0
-  );
-  const websiteSum = Object.values(getUsersPerWebsite()).reduce(
+async function validateCounts() {
+  const usersPerRoom = await getUsersPerRoom();
+  const calculatedTotal = Object.values(usersPerRoom).reduce(
     (sum, count) => sum + count,
     0
   );
 
+  const usersPerWebsite = await getUsersPerWebsite();
+  const websiteSum = Object.values(usersPerWebsite).reduce(
+    (sum, count) => sum + count,
+    0
+  );
+
+  const roomSum = Object.values(usersPerRoom).reduce((sum, count) => sum + count, 0);
   console.log(`🔍 COUNT VALIDATION:`);
   console.log(`   totalUsers: ${calculatedTotal}`);
   console.log(`   Sum of rooms: ${roomSum}`);
   console.log(`   Sum of websites: ${websiteSum}`);
 
   // All should be equal - if not, there's a critical bug
-  if (calculatedTotal !== roomSum || calculatedTotal !== websiteSum) {
+  if (calculatedTotal !== websiteSum) {
     console.log(`🚨 CRITICAL: Count mismatch detected!`);
   } else {
     console.log(`✅ All counts are consistent`);
@@ -377,7 +421,9 @@ function validateCounts() {
 }
 
 // Run validation every 2 minutes
-setInterval(validateCounts, 120000);
+setInterval(async () => {
+  await validateCounts();
+}, 120000);
 
 module.exports = {
   createRoom,

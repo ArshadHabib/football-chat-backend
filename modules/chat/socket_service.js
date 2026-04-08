@@ -28,7 +28,7 @@ async function createSocketRoomsForMatchService(matches) {
         if (matchStatus.isLive || matchStatus?.isLessThan50) {
           // If there are active stream links, create the chat room
           console.log(`Creating chat room for streamId: ${game._id}`);
-          createRoom(game._id.toString()); // Create the room for this game (streamId)
+          await createRoom(game._id.toString()); // Create the room for this game (streamId)
         } else {
           console.log(
             `No Live Status for streamId: ${game._id}. Skipping room creation.`

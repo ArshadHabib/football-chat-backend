@@ -107,23 +107,23 @@ async function deleteRoom(roomId) {
 async function deleteAllRooms() {
   const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
 
+  // Always clear stale socket data regardless of room count.
+  // On server restart, __rooms__ may be empty but __socket_website__ still holds
+  // stale entries from sockets that disconnected without triggering leaveRoom().
+  rooms.clear();
+  socketWebsite.clear();
+  await Promise.all([
+    redis.del(REDIS_ROOMS_SET),
+    redis.del(REDIS_ROOM_COUNTS),
+    redis.del(REDIS_SOCKET_WEBSITE),
+  ]);
+
   if (roomIds.length === 0) {
     console.log("No Socket Rooms to Delete!");
     return { success: true, message: "No rooms to delete", deletedCount: 0 };
   }
 
   const deletedCount = roomIds.length;
-
-  // Reset local state
-  rooms.clear();
-  socketWebsite.clear();
-
-  // Clean up Redis
-  await Promise.all([
-    redis.del(REDIS_ROOMS_SET),
-    redis.del(REDIS_ROOM_COUNTS),
-    redis.del(REDIS_SOCKET_WEBSITE),
-  ]);
 
   const io = getIO();
   roomIds.forEach((roomId) => {

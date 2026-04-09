@@ -157,6 +157,7 @@ async function joinRoom(roomId, socket, senderName, websiteName) {
   }
 
   const socketIds = rooms.get(roomId);
+  const isNewJoin = !socketIds.has(socket.id);
   socketIds.add(socket.id);
 
   // Store room ID for this socket
@@ -170,7 +171,12 @@ async function joinRoom(roomId, socket, senderName, websiteName) {
 
   socket.join(roomId);
 
-  const count = await redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1);
+  let count;
+  if (isNewJoin) {
+    count = await redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1);
+  } else {
+    count = parseInt(await redis.hGet(REDIS_ROOM_COUNTS, roomId)) || 0;
+  }
 
   invalidateCache();
   scheduleAdminRoomUpdate();
@@ -225,9 +231,10 @@ function getUsersInRoom(roomId) {
 }
 
 async function roomExists(roomId) {
-  if (rooms.has(roomId)) return true; // fast path: created on this process
   const exists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
-  if (exists) rooms.set(roomId, new Set()); // warm local cache
+  if (!exists && rooms.has(roomId)) {
+    rooms.delete(roomId); // clean up stale local cache entry
+  }
   return exists;
 }
 

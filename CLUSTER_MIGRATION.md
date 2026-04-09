@@ -152,6 +152,8 @@ The biggest change. All in-memory state that needs to be shared across processes
 | `scheduleAdminRoomUpdate()` | Used `adminUpdateDebounce` from performance mode | Always fires at `0ms` — admins always get instant updates regardless of performance mode |
 | `broadcastUserCountUpdates()` | `rooms.has(roomId)` — local only | Falls back to Redis check for cross-process rooms |
 | `validateCounts()` | Sync, local | Async, reads from Redis |
+| `roomExists()` | Fast-path `rooms.has(roomId)` returned stale `true` after cross-process deletion | Always checks Redis; cleans up stale local entry if Redis says room is gone |
+| `joinRoom()` | `hIncrBy` fired unconditionally, inflating count on duplicate `join_room` events | Guards with `isNewJoin = !socketIds.has(socket.id)`; only increments Redis for genuinely new joins |
 
 ---
 
@@ -184,6 +186,52 @@ await pubClient.publish("__perf_mode__", mode);
 
 #### `modules/chat/socket_service.js`
 Added missing `await` on `createRoom()` call inside `createSocketRoomsForMatchService()`. This was a pre-existing bug — without `await`, room creation errors were silently swallowed.
+
+---
+
+## Post-Migration Bug Fixes
+
+Two bugs discovered via code review after the initial Redis migration:
+
+### 1. `roomExists()` — Stale local fast-path (P1)
+
+**Problem:** The original fast-path `if (rooms.has(roomId)) return true` bypassed Redis entirely. When Process 1 deleted a room, `rooms.delete(roomId)` only cleared the local Map on Process 1. Processes 2–6 still had that `roomId` in their local Maps (warmed when users joined). So on those processes, `roomExists()` returned `true` without ever checking Redis — allowing `room_message` and `admin_room_message` to proceed for a room that no longer existed.
+
+**Fix:** Always check Redis as the source of truth. If Redis says the room is gone but the local Map has a stale entry, clean it up:
+```js
+async function roomExists(roomId) {
+  const exists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+  if (!exists && rooms.has(roomId)) {
+    rooms.delete(roomId); // clean up stale local cache entry
+  }
+  return exists;
+}
+```
+
+---
+
+### 2. `joinRoom()` — Duplicate join count inflation (P1)
+
+**Problem:** `socketIds.add(socket.id)` on a JavaScript `Set` is idempotent — silently ignores duplicates. But `redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1)` always fired unconditionally. So if the same socket sent `join_room` twice (network blip, frontend reconnect logic bug, etc.), the local Set stayed at size 1 but Redis incremented to 2. The count then stuck at 1 after disconnect instead of returning to 0.
+
+**Example:**
+```
+join_room × 2  →  Redis count = 2  (should be 1)
+disconnect     →  Redis count = 1  (should be 0) — stuck forever
+```
+
+**Fix:** Check if the socket is genuinely new before incrementing:
+```js
+const isNewJoin = !socketIds.has(socket.id);
+socketIds.add(socket.id);
+// ...
+let count;
+if (isNewJoin) {
+  count = await redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1);
+} else {
+  count = parseInt(await redis.hGet(REDIS_ROOM_COUNTS, roomId)) || 0;
+}
+```
 
 ---
 

@@ -340,10 +340,287 @@ const socket = io("http://your-server-url", {
 
 ## MongoDB Connection Pool
 
-With `MONGO_POOL_SIZE=5` and 6 processes:
+With `MONGO_POOL_SIZE=5` and 5 processes:
 
 ```
-6 processes × 5 connections = 30 total MongoDB connections
+5 processes × 5 connections = 25 total MongoDB connections
 ```
 
 If your MongoDB instance supports more connections, you can increase `MONGO_POOL_SIZE` in `.env`. Max safe value depends on your MongoDB plan/server.
+
+---
+
+## Production Server Tuning (6 cores / 12GB RAM)
+
+### Capacity Summary
+
+| Component | Allocation |
+|---|---|
+| OS | ~1GB RAM |
+| Redis (localhost) | ~300–500MB RAM |
+| MongoDB (localhost) | ~4–6GB RAM (uses available RAM for cache) |
+| 5 Node.js processes × 800MB | 4GB RAM |
+| **Total** | ~9.5–11.5GB of 12GB |
+
+**Concurrent user ceiling:** 5 processes × 15,000 hard cap = **75,000 concurrent connections**
+Real-world limit is MongoDB write throughput under high message rates before that ceiling is reached.
+
+---
+
+### 1. Ecosystem Config (`ecosystem.config.js`)
+
+Updated from the original — three key changes:
+
+| Setting | Old | New | Reason |
+|---|---|---|---|
+| `instances` | `"max"` (6) | `5` | Leaves 1 core free for Redis + MongoDB on same server |
+| `max_memory_restart` | `512M` | `800M` | More headroom per process (~15k connections before restart) |
+| `node_args` | — | `--max-old-space-size=700` | V8 heap cap below restart threshold so GC runs before PM2 kills the process |
+
+---
+
+### 2. Connection Limit (`socket/socketHandler.js`)
+
+Raised from 10,000 to 15,000 per process:
+
+```js
+// Connection limits — remove this block to let max_memory_restart in ecosystem.config.js act as the only safety net
+if (io.engine.clientsCount > 15000) {
+  socket.emit("error", { message: "Server at capacity" });
+  socket.disconnect();
+  return;
+}
+```
+
+**Why keep this limit:** Fails new connections gracefully with an error message. Without it, the failure mode is a hard PM2 memory restart that drops all existing connections simultaneously.
+
+---
+
+### 3. Nginx Config
+
+Two bugs fixed from original config:
+- `proxy_read_timeout` defaulted to 60s — nginx silently killed idle WebSocket connections after 1 minute
+- `Connection 'upgrade'` was hardcoded — broke regular HTTP API requests
+
+Nginx uses two separate files. Changes go into both.
+
+---
+
+#### File 1: `/etc/nginx/nginx.conf` — global worker and http settings
+
+Add/update the top-level worker settings and the WebSocket upgrade map inside the `http` block.
+
+**Open in editor:**
+```bash
+sudo nano /etc/nginx/nginx.conf
+```
+
+Make sure these values are set:
+```nginx
+user www-data;
+worker_processes auto;                  # uses all 6 cores
+worker_rlimit_nofile 65535;             # file descriptors per nginx worker
+
+events {
+    worker_connections 16384;           # 6 workers × 16384 = ~98k total nginx connections
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    # Add this map inside the http block — enables correct WebSocket + HTTP handling
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    # ... rest of your existing http block (include, gzip, etc.)
+}
+```
+
+---
+
+#### File 2: `/etc/nginx/sites-available/chat.halastream.app` — domain config
+
+**Open in editor:**
+```bash
+sudo nano /etc/nginx/sites-available/chat.halastream.app
+```
+
+Replace the contents with:
+```nginx
+upstream app_chat_backend {
+    server 127.0.0.1:5002;
+    keepalive 512;                      # idle keepalive connections to Node.js (was 64)
+}
+
+server {
+    listen 80;
+    server_name chat.halastream.app;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name chat.halastream.app;
+
+    ssl_certificate     /etc/letsencrypt/live/chat.halastream.app/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/chat.halastream.app/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://app_chat_backend;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;  # uses map from nginx.conf, not hardcoded
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout 3600s;       # 1 hour — prevents nginx killing idle WebSockets
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+
+        proxy_buffering off;            # required for real-time Socket.io events
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+```
+
+---
+
+#### Apply changes:
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+---
+
+### 4. OS File Descriptor Limits
+
+Without this, the OS hard-kills connections at 1,024 file descriptors per process regardless of your Node.js or nginx config.
+
+**Option A — single command (paste and run):**
+```bash
+sudo tee -a /etc/security/limits.conf <<EOF
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
+```
+
+**Option B — open in editor:**
+```bash
+sudo nano /etc/security/limits.conf
+```
+Add at the bottom:
+```
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+```
+
+Reboot or re-login for limits to take effect. Verify after:
+```bash
+ulimit -n
+# Expected: 65535
+```
+
+---
+
+### 5. Kernel TCP Tuning
+
+**Option A — single command (paste and run):**
+```bash
+sudo tee -a /etc/sysctl.conf <<EOF
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.ip_local_port_range = 1024 65535
+EOF
+```
+
+**Option B — open in editor:**
+```bash
+sudo nano /etc/sysctl.conf
+```
+Add at the bottom:
+```
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.ip_local_port_range = 1024 65535
+```
+
+Apply immediately (no reboot needed):
+```bash
+sudo sysctl -p
+```
+
+| Setting | Purpose |
+|---|---|
+| `somaxconn` | Max connection queue depth — prevents dropped connections under burst load |
+| `tcp_max_syn_backlog` | Max half-open connections during TLS/TCP handshake |
+| `tcp_fin_timeout` | Free sockets faster after disconnect (default 60s → 30s) |
+| `tcp_keepalive_time` | Detect dead connections after 5 min instead of 2 hours |
+| `ip_local_port_range` | More outbound ports available for proxied connections |
+
+---
+
+### 6. Full Deployment Checklist
+
+```bash
+# 1. Apply OS limits
+sudo tee -a /etc/security/limits.conf <<EOF
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
+
+# 2. Apply kernel TCP tuning
+sudo tee -a /etc/sysctl.conf <<EOF
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.ip_local_port_range = 1024 65535
+EOF
+sudo sysctl -p
+
+# 3. Update nginx configs
+sudo nano /etc/nginx/nginx.conf                                    # add worker settings + map block
+sudo nano /etc/nginx/sites-available/chat.halastream.app           # replace domain config
+sudo nginx -t                                                       # test config
+sudo systemctl reload nginx
+
+# 4. Start Redis
+sudo systemctl start redis-server
+sudo systemctl enable redis-server
+
+# 5. Start app with PM2
+pm2 start ecosystem.config.js --env production
+pm2 save                              # persist across reboots
+pm2 startup                           # auto-start PM2 on boot (follow the printed command)
+
+# 6. Verify
+pm2 monit                             # watch memory and CPU per process
+redis-cli ping                        # should return PONG
+ulimit -n                             # should return 65535
+```

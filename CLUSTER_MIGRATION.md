@@ -665,12 +665,38 @@ If port 6379 is already in use locally (e.g. local Redis running), use a differe
 ssh -L 6380:127.0.0.1:6379 root@161.97.69.15
 ```
 Then use port `6380` in RedisInsight instead of `6379`.
-3. In RedisInsight click **Add Redis Database** and set:
-   - **Host:** `127.0.0.1`
-   - **Port:** `6379`
-   - **Name:** `chat-backend`
-   - Password: leave empty
-4. Click **Add Redis Database** → open **Browser** tab → search for `__rooms__`, `__room_counts__`, `__socket_website__`
+3. In RedisInsight click **Add Redis Database** and fill in the fields:
+
+   | Field | Value |
+   |---|---|
+   | Host | `127.0.0.1` |
+   | Port | `6379` (or `6380` if using the alternate tunnel) |
+   | Database Alias | `chat-backend` |
+   | Username | leave empty |
+   | Password | leave empty |
+
+4. Click **Add Redis Database** to save.
+5. Click the database to open it → go to the **Browser** tab.
+6. In the search/filter box search for each key:
+   - `__rooms__` — shows all active room IDs (type: Set)
+   - `__room_counts__` — shows user count per room (type: Hash)
+   - `__socket_website__` — shows socketId → website mapping (type: Hash)
+
+**Troubleshooting — if RedisInsight cannot connect:**
+- Make sure the SSH tunnel terminal is still open (do not close it)
+- In a separate terminal on your Mac, test the tunnel:
+  ```bash
+  redis-cli -p 6380 ping
+  # Expected: PONG
+  ```
+- If `PONG` is not returned, Redis may not be running on the server:
+  ```bash
+  # Check status (run on the server)
+  sudo systemctl status redis-server
+
+  # Start if not running
+  sudo systemctl start redis-server
+  ```
 
 > If your SSH user is not `root`, replace `root@161.97.69.15` with your actual username e.g. `ubuntu@161.97.69.15`
 

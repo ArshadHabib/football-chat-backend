@@ -619,7 +619,51 @@ sudo sysctl -p
 
 ---
 
-### 6. Full Deployment Checklist
+### 6. Inspecting Redis State
+
+**Interactive CLI:**
+```bash
+redis-cli
+```
+
+Then run these to inspect live chat data:
+```bash
+# All active rooms
+SMEMBERS __rooms__
+
+# User count per room
+HGETALL __room_counts__
+
+# Socket → website mapping
+HGETALL __socket_website__
+
+# Total number of tracked sockets
+HLEN __socket_website__
+```
+
+**One-liners (no interactive mode):**
+```bash
+redis-cli SMEMBERS __rooms__
+redis-cli HGETALL __room_counts__
+redis-cli HGETALL __socket_website__
+```
+
+**Quick health check:**
+```bash
+redis-cli INFO stats | grep -E "connected_clients|used_memory_human|total_commands_processed"
+```
+
+**GUI — RedisInsight (visual browser):**
+Install RedisInsight on your local machine, then open an SSH tunnel to the server:
+```bash
+# Run on your local machine
+ssh -L 6379:127.0.0.1:6379 user@your-server-ip
+```
+Then connect RedisInsight to `127.0.0.1:6379` — browse all keys, values, and types visually.
+
+---
+
+### 7. Full Deployment Checklist
 
 ```bash
 # 1. Apply OS limits

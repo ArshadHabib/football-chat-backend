@@ -374,10 +374,9 @@ async function broadcastUserCountUpdates() {
   if (!io) return;
 
   for (const [roomId, usersCount] of roomUserCountUpdates) {
-    // Only broadcast if room still exists (check Redis for cross-process rooms)
-    const exists =
-      rooms.has(roomId) ||
-      (await redis.sIsMember(REDIS_ROOMS_SET, roomId));
+    // Only broadcast if room still exists — always check Redis as source of truth
+    const exists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+    if (!exists) rooms.delete(roomId); // clean up stale local entry if room is gone
     if (exists) {
       io.to(roomId).emit("room_user_count_update", {
         roomId,

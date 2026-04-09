@@ -660,6 +660,11 @@ redis-cli INFO stats | grep -E "connected_clients|used_memory_human|total_comman
 ```bash
 ssh -L 6379:127.0.0.1:6379 root@161.97.69.15
 ```
+If port 6379 is already in use locally (e.g. local Redis running), use a different local port:
+```bash
+ssh -L 6380:127.0.0.1:6379 root@161.97.69.15
+```
+Then use port `6380` in RedisInsight instead of `6379`.
 3. In RedisInsight click **Add Redis Database** and set:
    - **Host:** `127.0.0.1`
    - **Port:** `6379`

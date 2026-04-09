@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document covers every change made to enable PM2 cluster mode with 6 worker processes, what new infrastructure is required, and what needs to change on any client connecting to this server.
+This document covers every change made to enable PM2 cluster mode with 5 worker processes, what new infrastructure is required, and what needs to change on any client connecting to this server.
 
 ---
 
@@ -64,7 +64,7 @@ MONGO_MIN_POOL_SIZE=1
 | `MONGO_POOL_SIZE` | Max MongoDB connections per process | `10` |
 | `MONGO_MIN_POOL_SIZE` | Min MongoDB connections per process | `2` |
 
-> **Why pool size matters:** With 6 processes each opening their own connection pool, the total MongoDB connections = `instances × MONGO_POOL_SIZE`. At the default of 10, that's 60 connections. Setting it to 5 keeps total connections at 30, which is safer for most MongoDB deployments.
+> **Why pool size matters:** With 5 processes each opening their own connection pool, the total MongoDB connections = `instances × MONGO_POOL_SIZE`. At the default of 10, that's 50 connections. Setting it to 5 keeps total connections at 25, which is safer for most MongoDB deployments.
 
 ---
 
@@ -138,10 +138,10 @@ The biggest change. All in-memory state that needs to be shared across processes
 |---|---|---|
 | `createRoom()` | Checked local `rooms` Map | Checks Redis Set |
 | `deleteRoom()` | Checked local `rooms` Map | Checks Redis Set, cleans up Redis keys |
-| `deleteAllRooms()` | Used local `rooms.keys()` | Uses `redis.sMembers()` for cross-process room list |
-| `joinRoom()` | Checked local Map, returned local `socketIds.size` | Checks Redis, increments Redis counter, returns Redis count |
+| `deleteAllRooms()` | Used local `rooms.keys()`, returned early if empty leaving stale Redis data | Uses `redis.sMembers()`; always clears all Redis keys before early return |
+| `joinRoom()` | Checked local Map, `hIncrBy` fired unconditionally | Checks Redis, guards with `isNewJoin` to prevent duplicate count inflation |
 | `leaveRoom()` | Checked local Map, returned local `socketIds.size` | Decrements Redis counter (if room still exists), returns Redis count |
-| `roomExists()` | `rooms.has(roomId)` — local only | Redis lookup with local fast-path |
+| `roomExists()` | `rooms.has(roomId)` — stale local fast-path bypassed Redis after cross-process deletion | Always checks Redis; cleans up stale local entry if Redis says room is gone |
 | `getUsersPerRoom()` | Derived from local Map | Reads `__room_counts__` from Redis |
 | `getUsersPerWebsite()` | Derived from local Map + local `socketWebsite` | Reads `__socket_website__` from Redis |
 | `getTotalUsers()` | Derived from local Map | Derived from Redis room counts |
@@ -151,11 +151,8 @@ The biggest change. All in-memory state that needs to be shared across processes
 | `emitToAdmins()` | Iterated `adminSockets` Set — local only | `io.to("__admins__").emit(...)` — reaches all admins on all processes |
 | `emitToAdmin()` | Iterated `adminSockets` to find by ID — local only | `io.to(socketId).emit(...)` — works cross-process with Redis adapter |
 | `scheduleAdminRoomUpdate()` | Used `adminUpdateDebounce` from performance mode | Always fires at `0ms` — admins always get instant updates regardless of performance mode |
-| `broadcastUserCountUpdates()` | `rooms.has(roomId)` — local only | Always checks Redis; cleans up stale local entry if room is gone |
+| `broadcastUserCountUpdates()` | `rooms.has(roomId)` — stale local fast-path | Always checks Redis; cleans up stale local entry if room is gone |
 | `validateCounts()` | Sync, local | Async, reads from Redis |
-| `roomExists()` | `rooms.has(roomId)` fast-path returned stale `true` after cross-process deletion | Always checks Redis; cleans up stale local entry if Redis says room is gone |
-| `joinRoom()` | `hIncrBy` fired unconditionally, inflating count on duplicate `join_room` events | Guards with `isNewJoin = !socketIds.has(socket.id)`; only increments Redis for genuinely new joins |
-| `deleteAllRooms()` | Returned early if `__rooms__` was empty, leaving stale `__socket_website__` data | Always clears all Redis keys before the early return check |
 
 ---
 
@@ -193,7 +190,7 @@ Added missing `await` on `createRoom()` call inside `createSocketRoomsForMatchSe
 
 ## Post-Migration Bug Fixes
 
-Two bugs discovered via code review after the initial Redis migration:
+Five issues discovered via code review after the initial Redis migration:
 
 ### 1. `roomExists()` — Stale local fast-path (P1)
 
@@ -271,6 +268,43 @@ async function deleteAllRooms() {
   // ... rest of function
 }
 ```
+
+---
+
+### 4. `broadcastUserCountUpdates()` — Stale local fast-path
+
+**Problem:** Same class of bug as `roomExists()`. The function checked `rooms.has(roomId)` before consulting Redis. If another process deleted the room, the local Map still had a stale entry, so the function would broadcast a `room_user_count_update` event to a room that no longer existed.
+
+```js
+// Before fix — stale fast-path
+const exists =
+  rooms.has(roomId) ||                          // ← could return true from stale local entry
+  (await redis.sIsMember(REDIS_ROOMS_SET, roomId));
+```
+
+**Fix:** Always check Redis and clean up stale local entries:
+```js
+const exists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+if (!exists) rooms.delete(roomId); // clean up stale local entry
+```
+
+**Impact:** Lower severity than `roomExists()` — broadcasting to a deleted room goes nowhere since all sockets already left. But it left stale entries in the local Map indefinitely and was inconsistent with the fix applied to `roomExists()`.
+
+---
+
+### 5. `modules/chat/service.js` — Removed unused static imports
+
+`BATCH_FLUSH_INTERVAL` and `MAX_BATCH_SIZE` were imported from `perfomance_config` but never used. The code was already reading these values dynamically via `getCurrentPerformanceMode().settings.batchFlush` and `getCurrentPerformanceMode().settings.maxBatchSize`, which correctly respond to live performance mode changes without needing a restart.
+
+```js
+// Before — unused static imports
+const { BATCH_FLUSH_INTERVAL, MAX_BATCH_SIZE, getCurrentPerformanceMode } = require("...");
+
+// After — only the dynamic accessor needed
+const { getCurrentPerformanceMode } = require("...");
+```
+
+**Why dynamic matters:** If you call `POST /change-server-mode` to switch to Peak mode, `getCurrentPerformanceMode().settings.batchFlush` immediately returns the new value on the next flush interval. A static constant imported at startup would never update.
 
 ---
 
@@ -377,18 +411,6 @@ const socket = io("http://your-server-url", {
 
 ---
 
-## MongoDB Connection Pool
-
-With `MONGO_POOL_SIZE=5` and 5 processes:
-
-```
-5 processes × 5 connections = 25 total MongoDB connections
-```
-
-If your MongoDB instance supports more connections, you can increase `MONGO_POOL_SIZE` in `.env`. Max safe value depends on your MongoDB plan/server.
-
----
-
 ## Before vs After — Capacity & Reliability Analysis
 
 ### Concurrent Users
@@ -474,6 +496,29 @@ Updated from the original — three key changes:
 | `instances` | `"max"` (6) | `5` | Leaves 1 core free for Redis + MongoDB on same server |
 | `max_memory_restart` | `512M` | `800M` | More headroom per process (~15k connections before restart) |
 | `node_args` | — | `--max-old-space-size=700` | V8 heap cap below restart threshold so GC runs before PM2 kills the process |
+
+**Why `--max-old-space-size=700` with `max_memory_restart=800M`:**
+
+Without the V8 cap, Node.js doesn't know about PM2's 800MB limit. It keeps allocating memory and only runs garbage collection when it feels like it. This causes a spike pattern:
+
+```
+Memory grows to 780MB
+V8 hasn't run GC yet — still thinks it has room
+Burst of requests pushes memory to 820MB
+PM2 sees 820MB > 800MB → kills process
+All 15,000 connections on that process drop simultaneously
+```
+
+With `--max-old-space-size=700`, V8 knows its heap limit is 700MB. It runs GC aggressively as memory approaches 700MB, freeing unused objects and recovering memory before PM2 ever sees the 800MB threshold:
+
+```
+Memory grows to 680MB
+V8 sees it's approaching its 700MB heap limit
+V8 runs GC → frees unused objects → drops back to ~500MB
+PM2 never sees 800MB → no restart → no dropped connections
+```
+
+The 100MB gap between the V8 cap (700MB) and the PM2 restart threshold (800MB) is the safety buffer that lets GC do its job.
 
 ---
 
@@ -761,7 +806,19 @@ Then use port `6380` in RedisInsight instead of `6379`.
 
 ---
 
-### 7. Full Deployment Checklist
+### 7. MongoDB Connection Pool
+
+With `MONGO_POOL_SIZE=5` and 5 processes:
+
+```
+5 processes × 5 connections = 25 total MongoDB connections
+```
+
+If your MongoDB instance supports more connections, you can increase `MONGO_POOL_SIZE` in `.env`. Max safe value depends on your MongoDB plan/server.
+
+---
+
+### 8. Full Deployment Checklist
 
 ```bash
 # 1. Apply OS limits

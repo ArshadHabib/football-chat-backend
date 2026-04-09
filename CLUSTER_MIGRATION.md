@@ -654,12 +654,20 @@ redis-cli INFO stats | grep -E "connected_clients|used_memory_human|total_comman
 ```
 
 **GUI — RedisInsight (visual browser):**
-Install RedisInsight on your local machine, then open an SSH tunnel to the server:
+
+1. Download and install RedisInsight from [redis.io/redis-enterprise/redis-insight](https://redis.io/redis-enterprise/redis-insight/)
+2. Open an SSH tunnel on your local machine (keep the terminal open):
 ```bash
-# Run on your local machine
-ssh -L 6379:127.0.0.1:6379 user@your-server-ip
+ssh -L 6379:127.0.0.1:6379 root@161.97.69.15
 ```
-Then connect RedisInsight to `127.0.0.1:6379` — browse all keys, values, and types visually.
+3. In RedisInsight click **Add Redis Database** and set:
+   - **Host:** `127.0.0.1`
+   - **Port:** `6379`
+   - **Name:** `chat-backend`
+   - Password: leave empty
+4. Click **Add Redis Database** → open **Browser** tab → search for `__rooms__`, `__room_counts__`, `__socket_website__`
+
+> If your SSH user is not `root`, replace `root@161.97.69.15` with your actual username e.g. `ubuntu@161.97.69.15`
 
 ---
 

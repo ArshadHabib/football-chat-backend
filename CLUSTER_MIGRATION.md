@@ -99,9 +99,10 @@ PM2 configuration:
 {
   name: "chat-backend",
   script: "./server.js",
-  instances: "max",       // uses all available CPU cores
+  instances: 5,                        // 1 core reserved for Redis + MongoDB on same server
   exec_mode: "cluster",
-  max_memory_restart: "512M"
+  max_memory_restart: "800M",          // 5 × 800MB = 4GB for Node.js
+  node_args: "--max-old-space-size=700" // V8 heap cap below restart threshold
 }
 ```
 
@@ -150,10 +151,11 @@ The biggest change. All in-memory state that needs to be shared across processes
 | `emitToAdmins()` | Iterated `adminSockets` Set — local only | `io.to("__admins__").emit(...)` — reaches all admins on all processes |
 | `emitToAdmin()` | Iterated `adminSockets` to find by ID — local only | `io.to(socketId).emit(...)` — works cross-process with Redis adapter |
 | `scheduleAdminRoomUpdate()` | Used `adminUpdateDebounce` from performance mode | Always fires at `0ms` — admins always get instant updates regardless of performance mode |
-| `broadcastUserCountUpdates()` | `rooms.has(roomId)` — local only | Falls back to Redis check for cross-process rooms |
+| `broadcastUserCountUpdates()` | `rooms.has(roomId)` — local only | Always checks Redis; cleans up stale local entry if room is gone |
 | `validateCounts()` | Sync, local | Async, reads from Redis |
-| `roomExists()` | Fast-path `rooms.has(roomId)` returned stale `true` after cross-process deletion | Always checks Redis; cleans up stale local entry if Redis says room is gone |
+| `roomExists()` | `rooms.has(roomId)` fast-path returned stale `true` after cross-process deletion | Always checks Redis; cleans up stale local entry if Redis says room is gone |
 | `joinRoom()` | `hIncrBy` fired unconditionally, inflating count on duplicate `join_room` events | Guards with `isNewJoin = !socketIds.has(socket.id)`; only increments Redis for genuinely new joins |
+| `deleteAllRooms()` | Returned early if `__rooms__` was empty, leaving stale `__socket_website__` data | Always clears all Redis keys before the early return check |
 
 ---
 
@@ -230,6 +232,43 @@ if (isNewJoin) {
   count = await redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1);
 } else {
   count = parseInt(await redis.hGet(REDIS_ROOM_COUNTS, roomId)) || 0;
+}
+```
+
+---
+
+### 3. `deleteAllRooms()` — Stale socket data survives restart (P1)
+
+**Problem:** On server restart, PM2 kills all processes abruptly. `leaveRoom()` never runs for existing connections, so `__socket_website__` retains stale `socketId → websiteName` entries. When the football-backend calls the delete-and-recreate-rooms API after restart, `deleteAllRooms()` checks `redis.sMembers(REDIS_ROOMS_SET)` — which is empty because no users have joined yet — and returns early with "No rooms to delete". The cleanup of `__socket_website__` is never reached, so stale website user counts persist on the admin dashboard.
+
+**Example:**
+```
+Before restart:  __socket_website__ = { "abc123": "score8o8.com" }
+Server restarts: leaveRoom() never called — Redis untouched
+Football-backend calls deleteAllRooms()
+  → __rooms__ is empty → returns early
+  → __socket_website__ still has stale entry
+Admin dashboard: score8o8.com = 1 user  ← wrong, nobody is connected
+```
+
+**Fix:** Move the Redis cleanup before the early return so it always runs regardless of room count:
+```js
+async function deleteAllRooms() {
+  const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
+
+  // Always clear stale socket data regardless of room count
+  rooms.clear();
+  socketWebsite.clear();
+  await Promise.all([
+    redis.del(REDIS_ROOMS_SET),
+    redis.del(REDIS_ROOM_COUNTS),
+    redis.del(REDIS_SOCKET_WEBSITE),
+  ]);
+
+  if (roomIds.length === 0) {
+    return { success: true, message: "No rooms to delete", deletedCount: 0 };
+  }
+  // ... rest of function
 }
 ```
 

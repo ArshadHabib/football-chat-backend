@@ -21,8 +21,8 @@ function setupSocketHandlers(io) {
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
-    // Connection limits
-    if (io.engine.clientsCount > 10000) {
+    // Connection limits — remove this block to let max_memory_restart in ecosystem.config.js act as the only safety net
+    if (io.engine.clientsCount > 15000) {
       socket.emit("error", { message: "Server at capacity" });
       socket.disconnect();
       return;

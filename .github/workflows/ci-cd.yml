@@ -49,7 +49,7 @@ jobs:
             # Check if any file outside 'files/' directory changed
             if echo "$CHANGED_FILES" | grep -qv '^files/'; then
               echo "🚀 Changes detected outside 'files/' folder - restarting server..."
-              pm2 reload chat-backend
+              pm2 reload ecosystem.config.js
             else
               echo "🟢 Only changes in 'files/' folder - skipping server restart"
             fi

@@ -18,6 +18,7 @@ const {
   setPerformanceMode,
   getCurrentPerformanceMode,
 } = require("@project/utils/perfomance_config");
+const { pubClient } = require("@project/config/redis");
 
 async function getUsersPerRoomController(req, res) {
   try {
@@ -127,6 +128,8 @@ async function changeServerModeController(req, res) {
   const { mode } = req.body;
   try {
     setPerformanceMode(mode);
+    // Broadcast to all other processes so they update their mode too
+    await pubClient.publish("__perf_mode__", mode);
     return sendResponse(
       res,
       null,

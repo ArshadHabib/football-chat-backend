@@ -21,8 +21,8 @@ function setupSocketHandlers(io) {
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
-    // Connection limits
-    if (io.engine.clientsCount > 10000) {
+    // Connection limits — remove this block to let max_memory_restart in ecosystem.config.js act as the only safety net
+    if (io.engine.clientsCount > 15000) {
       socket.emit("error", { message: "Server at capacity" });
       socket.disconnect();
       return;
@@ -43,7 +43,7 @@ function setupSocketHandlers(io) {
         const decodedToken = await authenticateToken(token);
 
         if (decodedToken?.userRoleFromToken === "admin") {
-          registerAdmin(socket);
+          await registerAdmin(socket);
           socket.isAdmin = true;
           socket.adminUser = {
             userId: decodedToken.userIdFromToken,
@@ -70,7 +70,7 @@ function setupSocketHandlers(io) {
       }
     });
 
-    socket.on("admin_join_room", (data) => {
+    socket.on("admin_join_room", async (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
         return;
@@ -78,10 +78,11 @@ function setupSocketHandlers(io) {
 
       const { roomId } = data;
       socket.join(roomId);
+      const perRoom = await getUsersPerRoom();
       socket.emit("admin_room_joined", {
         roomId,
-        users: getUsersInRoom(roomId), // Now returns empty array
-        usersCount: getUsersPerRoom()[roomId] || 0,
+        users: getUsersInRoom(roomId), // returns empty array (unchanged)
+        usersCount: perRoom[roomId] || 0,
       });
     });
 
@@ -92,7 +93,7 @@ function setupSocketHandlers(io) {
       socket.emit("admin_room_left", { roomId });
     });
 
-    socket.on("admin_room_message", (data) => {
+    socket.on("admin_room_message", async (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
         return;
@@ -107,7 +108,7 @@ function setupSocketHandlers(io) {
         return;
       }
 
-      if (!roomExists(roomId)) {
+      if (!await roomExists(roomId)) {
         socket.emit("error", { message: "Room does not exist" });
         return;
       }
@@ -135,7 +136,7 @@ function setupSocketHandlers(io) {
       }).catch(console.error);
     });
 
-    socket.on("update_user", (data) => {
+    socket.on("update_user", async (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
         return;
@@ -169,7 +170,7 @@ function setupSocketHandlers(io) {
       }
 
       // Check if room exists
-      if (!roomExists(roomId)) {
+      if (!await roomExists(roomId)) {
         socket.emit("error", {
           message: "Room does not exist",
           roomId,
@@ -191,9 +192,9 @@ function setupSocketHandlers(io) {
     });
 
     // User joining room - websiteName still needed for analytics
-    socket.on("join_room", (data) => {
+    socket.on("join_room", async (data) => {
       const { senderName, roomId, websiteName } = data;
-      const result = joinRoom(roomId, socket, senderName, websiteName);
+      const result = await joinRoom(roomId, socket, senderName, websiteName);
 
       if (result.success) {
         socket.emit("join_result", result);
@@ -212,7 +213,7 @@ function setupSocketHandlers(io) {
     socket.on("room_message", async (data) => {
       const { roomId, messageContent, senderName } = data; // senderName from frontend
 
-      if (roomExists(roomId)) {
+      if (await roomExists(roomId)) {
         const messageData = {
           senderName: senderName, // Use from frontend
           messageContent: messageContent,
@@ -237,26 +238,26 @@ function setupSocketHandlers(io) {
       }
     });
 
-    socket.on("update_views_visibility", (data) => {
+    socket.on("update_views_visibility", async (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
 
       const { roomId, showViews } = data;
-      if (roomExists(roomId)) {
+      if (await roomExists(roomId)) {
         io.to(roomId).emit("update_views_visibility", { showViews });
       }
     });
 
-    socket.on("disconnect", () => {
+    socket.on("disconnect", async () => {
       console.log("User disconnected:", socket.id);
 
       if (socket.isAdmin) {
         removeAdmin(socket);
       }
 
-      const result = leaveRoom(socket);
+      const result = await leaveRoom(socket);
 
       if (result) {
         scheduleUserCountUpdate(result.roomId, result.usersCount);
@@ -268,7 +269,7 @@ function setupSocketHandlers(io) {
       }
     });
 
-    socket.on("admin_request_data", (data) => {
+    socket.on("admin_request_data", async (data) => {
       if (!socket.isAdmin) {
         socket.emit("error", { message: "Admin access required" });
         return;
@@ -285,7 +286,7 @@ function setupSocketHandlers(io) {
           });
           break;
         case "force_room_update":
-          notifyAdminRoomUpdate();
+          await notifyAdminRoomUpdate();
           socket.emit("admin_custom_event", {
             eventType: "room_update_forced",
             data: { message: "Room update triggered manually" },

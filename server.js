@@ -15,11 +15,20 @@ const allowedOrigins = process.env.CORS_ORIGINS.split(",");
 const http = require("http");
 const socketIo = require("socket.io");
 const setupSocketHandlers = require("./socket/socketHandler");
+const { createAdapter } = require("@socket.io/redis-adapter");
+const {
+  pubClient,
+  subClient,
+  perfSubClient,
+  connectRedis,
+} = require("@project/config/redis");
+const { setPerformanceMode } = require("@project/utils/perfomance_config");
 
 const app = express();
 app.set("trust proxy", 1);
 const server = http.createServer(app);
 const io = socketIo(server, {
+  transports: ["websocket"],
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
@@ -36,7 +45,7 @@ app.use(
     origin: "*", // allow any frontend
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-  })
+  }),
 );
 app.use("/api/next/chat", chatRoutes);
 app.use("/api/next/user", userRoutes);
@@ -54,7 +63,7 @@ app.use(
     },
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
-  })
+  }),
 );
 
 app.use("/api/chat/chat", chatRoutes);
@@ -66,6 +75,14 @@ app.get("/", (req, res) => {
 (async () => {
   try {
     await connectDB();
+    await connectRedis();
+    io.adapter(createAdapter(pubClient, subClient));
+
+    // Receive performance mode changes broadcast from other processes
+    perfSubClient.subscribe("__perf_mode__", (mode) => {
+      setPerformanceMode(mode);
+    });
+
     server.listen(PORT, async () => {
       console.log(`Server is running on http://localhost:${PORT}`);
     });

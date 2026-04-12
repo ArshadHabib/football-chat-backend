@@ -32,6 +32,14 @@ function setupSocketHandlers(io) {
       return;
     }
 
+    // Set IP at connection time — ensures rate limiting applies even if join_room is skipped
+    let connIp =
+      socket.handshake.headers["x-real-ip"] ||
+      socket.handshake.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
+      "";
+    if (connIp.startsWith("::ffff:")) connIp = connIp.replace("::ffff:", "");
+    socket.clientIp = connIp;
+
     socket.on("admin_authenticate", async (data) => {
       const token = data?.token?.split(" ")?.[1];
 
@@ -199,18 +207,11 @@ function setupSocketHandlers(io) {
     socket.on("join_room", async (data) => {
       const { senderName, roomId, websiteName } = data;
 
-      // Derive real client IP — same priority order as user registration controller:
-      // 1. inComingClientIp from frontend (ipify.org) — most reliable, not affected by proxies
-      // 2. x-real-ip nginx header
-      // 3. x-forwarded-for nginx header (first entry)
-      // socket.handshake.address is skipped — it's the nginx address in proxied deployments
-      let ip =
-        data.inComingClientIp ||
-        socket.handshake.headers["x-real-ip"] ||
-        socket.handshake.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
-        "";
-      if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
-      socket.clientIp = ip;
+      // Upgrade to inComingClientIp (ipify.org) if provided — more accurate than headers.
+      // Baseline IP from headers is already set at connection time.
+      if (data.inComingClientIp) {
+        socket.clientIp = data.inComingClientIp;
+      }
 
       const result = await joinRoom(roomId, socket, senderName, websiteName);
 

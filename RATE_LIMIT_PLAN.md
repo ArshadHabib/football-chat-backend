@@ -101,27 +101,42 @@ extreme: { ..., rateLimitMax: 5,  rateLimitWindowSeconds: 10 }
 
 Two changes:
 
-**A. Attach IP to socket at `join_room`**
+**A. Set IP at connection time, upgrade at `join_room`**
 
-Mirrors the same priority order as the user registration controller (`inComingClientIp || clientIp`). `socket.handshake.address` is **not used** — in proxied deployments it is the nginx address (`127.0.0.1`), which would collapse all users onto one rate limit key.
+IP is derived from headers immediately at connection time — before any events are received. This ensures rate limiting applies even if a client skips `join_room` entirely and sends `room_message` directly. `socket.handshake.address` is not used — in proxied deployments it is the nginx address (`127.0.0.1`).
 
 ```js
-socket.on("join_room", async (data) => {
-  // Derive real client IP — same priority as registration controller:
-  // 1. inComingClientIp from frontend (ipify.org) — most reliable
-  // 2. x-real-ip nginx header
-  // 3. x-forwarded-for nginx header (first entry)
-  let ip =
-    data.inComingClientIp ||
+io.on("connection", (socket) => {
+  // Runs for every client regardless of what events they send after.
+  // Covers the case where a malicious client skips join_room entirely.
+  let connIp =
     socket.handshake.headers["x-real-ip"] ||
     socket.handshake.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
     "";
-  if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
-  socket.clientIp = ip;
+  if (connIp.startsWith("::ffff:")) connIp = connIp.replace("::ffff:", "");
+  socket.clientIp = connIp;
+  ...
+```
 
+Then in `join_room`, upgrade to `inComingClientIp` (ipify.org) if the frontend provided it — more accurate than headers, and covers users behind CGNAT:
+
+```js
+socket.on("join_room", async (data) => {
+  // Upgrade to ipify.org IP if provided. Headers already set as baseline at connect.
+  if (data.inComingClientIp) {
+    socket.clientIp = data.inComingClientIp;
+  }
   // ... existing joinRoom() logic unchanged
 });
 ```
+
+**Why this order matters:**
+
+| Scenario | IP source used |
+|----------|---------------|
+| Normal client sends `join_room` with `inComingClientIp` | ipify.org — most accurate |
+| Normal client with adblocker (ipify.org blocked) | nginx header set at connect |
+| Malicious client skips `join_room` | nginx header set at connect — still rate limited |
 
 **B. Rate limit check in `room_message`**
 

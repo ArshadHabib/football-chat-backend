@@ -199,10 +199,16 @@ function setupSocketHandlers(io) {
     socket.on("join_room", async (data) => {
       const { senderName, roomId, websiteName } = data;
 
-      // Attach IP from handshake — no DB call needed, used for rate limiting
-      let ip = socket.handshake.address || "";
-
-      if (ip === "::1") ip = "";
+      // Derive real client IP — same priority order as user registration controller:
+      // 1. inComingClientIp from frontend (ipify.org) — most reliable, not affected by proxies
+      // 2. x-real-ip nginx header
+      // 3. x-forwarded-for nginx header (first entry)
+      // socket.handshake.address is skipped — it's the nginx address in proxied deployments
+      let ip =
+        data.inComingClientIp ||
+        socket.handshake.headers["x-real-ip"] ||
+        socket.handshake.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
+        "";
       if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
       socket.clientIp = ip;
 

@@ -103,13 +103,19 @@ Two changes:
 
 **A. Attach IP to socket at `join_room`**
 
-Use `socket.handshake.address` — the raw TCP IP of the WebSocket connection, already available on every socket with no DB call. Normalize it the same way `attachClientIp` middleware does (strip `::ffff:` prefix, treat `::1` as empty).
+Mirrors the same priority order as the user registration controller (`inComingClientIp || clientIp`). `socket.handshake.address` is **not used** — in proxied deployments it is the nginx address (`127.0.0.1`), which would collapse all users onto one rate limit key.
 
 ```js
 socket.on("join_room", async (data) => {
-  // Attach IP from handshake (no DB call needed)
-  let ip = socket.handshake.address || "";
-  if (ip === "::1") ip = "";
+  // Derive real client IP — same priority as registration controller:
+  // 1. inComingClientIp from frontend (ipify.org) — most reliable
+  // 2. x-real-ip nginx header
+  // 3. x-forwarded-for nginx header (first entry)
+  let ip =
+    data.inComingClientIp ||
+    socket.handshake.headers["x-real-ip"] ||
+    socket.handshake.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
+    "";
   if (ip.startsWith("::ffff:")) ip = ip.replace("::ffff:", "");
   socket.clientIp = ip;
 
@@ -165,9 +171,29 @@ socket.on("room_message", async (data) => {
 
 ### 3. `football-next-score8o8/src/components/chatBox/chatBox.tsx`
 
-Add one socket event listener inside the `useEffect` that sets up the socket connection. Everything else (state, UX, existing frontend rate limit) stays identical.
+Two changes:
 
-**What to add** (alongside the other `newSocket.on(...)` listeners):
+**A. Fetch real client IP in the connect handler and send in `join_room`**
+
+Called directly inside `newSocket.on("connect", ...)` — awaited before emitting so every `join_room` (including reconnects) uses a fresh IP. No `useEffect` or ref needed.
+
+```ts
+newSocket.on("connect", async () => {
+  const inComingClientIp = await fetchClientIp();
+  newSocket.emit("join_room", {
+    senderName: nameToUse,
+    roomId,
+    websiteName: SIMPLE_URL,
+    inComingClientIp,
+  });
+});
+```
+
+Import: `import { fetchClientIp } from "src/utils/getClientIp";`
+
+**B. Listen for `server_rate_limit` event**
+
+Alongside the other `newSocket.on(...)` listeners — triggers the same countdown/disabled-input UX as the existing frontend rate limit:
 
 ```ts
 newSocket.on("server_rate_limit", (data: { message: string; retryAfter: number }) => {
@@ -177,7 +203,7 @@ newSocket.on("server_rate_limit", (data: { message: string; retryAfter: number }
 });
 ```
 
-This triggers the exact same UI path as the existing frontend rate limit — input disabled, countdown running, Alert shown. The user sees no difference between a frontend-triggered and backend-triggered rate limit.
+The user sees no difference between a frontend-triggered and backend-triggered rate limit.
 
 ---
 

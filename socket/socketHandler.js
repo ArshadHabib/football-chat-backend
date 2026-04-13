@@ -14,6 +14,10 @@ const {
   scheduleUserCountUpdate,
 } = require("./roomManager");
 const { authenticateToken } = require("@project/middleware");
+const { pubClient: redis } = require("@project/config/redis");
+const { getCurrentPerformanceMode } = require("@project/utils/perfomance_config");
+
+const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
 
 function setupSocketHandlers(io) {
   setIO(io);
@@ -27,6 +31,14 @@ function setupSocketHandlers(io) {
       socket.disconnect();
       return;
     }
+
+    // Set IP at connection time — ensures rate limiting applies even if join_room is skipped
+    let connIp =
+      socket.handshake.headers["x-real-ip"] ||
+      socket.handshake.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
+      "";
+    if (connIp.startsWith("::ffff:")) connIp = connIp.replace("::ffff:", "");
+    socket.clientIp = connIp;
 
     socket.on("admin_authenticate", async (data) => {
       const token = data?.token?.split(" ")?.[1];
@@ -194,6 +206,13 @@ function setupSocketHandlers(io) {
     // User joining room - websiteName still needed for analytics
     socket.on("join_room", async (data) => {
       const { senderName, roomId, websiteName } = data;
+
+      // Upgrade to inComingClientIp (ipify.org) if provided — more accurate than headers.
+      // Baseline IP from headers is already set at connection time.
+      if (data.inComingClientIp) {
+        socket.clientIp = data.inComingClientIp;
+      }
+
       const result = await joinRoom(roomId, socket, senderName, websiteName);
 
       if (result.success) {
@@ -212,6 +231,27 @@ function setupSocketHandlers(io) {
     // Messages - senderName comes from frontend
     socket.on("room_message", async (data) => {
       const { roomId, messageContent, senderName } = data; // senderName from frontend
+
+      // IP rate limit check — single pipeline round trip, shared across all 5 processes via Redis
+      const ip = socket.clientIp;
+      if (ip) {
+        const { rateLimitMax, rateLimitWindowSeconds } = getCurrentPerformanceMode().settings;
+        const key = `${REDIS_RATE_LIMIT_PREFIX}${ip}`;
+
+        const pipeline = redis.multi();
+        pipeline.incr(key);
+        pipeline.expire(key, rateLimitWindowSeconds, "NX"); // NX = only set TTL if key has none yet
+        const [count] = await pipeline.exec();
+
+        if (count > rateLimitMax) {
+          const retryAfter = await redis.ttl(key);
+          socket.emit("server_rate_limit", {
+            message: `Limit reached. Retry in ${retryAfter} seconds`,
+            retryAfter,
+          });
+          return;
+        }
+      }
 
       if (await roomExists(roomId)) {
         const messageData = {

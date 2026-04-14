@@ -19,7 +19,7 @@ const performanceMode = {
       userCountUpdateDebounce: 1000,
       cacheTTL: 2000,
       rateLimitMax: 1,
-      rateLimitWindowSeconds: 3,
+      rateLimitWindowSeconds: 5,
     },
     peak: {
       batchFlush: 3000,
@@ -29,7 +29,7 @@ const performanceMode = {
       userCountUpdateDebounce: 3000,
       cacheTTL: 10000,
       rateLimitMax: 1,
-      rateLimitWindowSeconds: 3,
+      rateLimitWindowSeconds: 5,
     },
     extreme: {
       batchFlush: 5000,
@@ -39,7 +39,7 @@ const performanceMode = {
       userCountUpdateDebounce: 5000,
       cacheTTL: 30000,
       rateLimitMax: 1,
-      rateLimitWindowSeconds: 3,
+      rateLimitWindowSeconds: 5,
     },
   },
 };

@@ -190,7 +190,7 @@ Added missing `await` on `createRoom()` call inside `createSocketRoomsForMatchSe
 
 ## Post-Migration Bug Fixes
 
-Five issues discovered via code review after the initial Redis migration:
+Six issues discovered via code review and production observation after the initial Redis migration:
 
 ### 1. `roomExists()` — Stale local fast-path (P1)
 
@@ -292,7 +292,83 @@ if (!exists) rooms.delete(roomId); // clean up stale local entry
 
 ---
 
-### 5. `modules/chat/service.js` — Removed unused static imports
+### 5. Stale `__socket_website__` AND `__room_counts__` from instance crashes (P1)
+
+**Root cause:** When a PM2 process dies abruptly (memory limit hit, crash, force restart), all sockets on that instance disconnect without `leaveRoom()` ever running. Two Redis structures get corrupted:
+
+| Redis Key | What gets stale | Visible symptom |
+|---|---|---|
+| `__socket_website__` | Orphaned `socketId → website` entries | Inflated website user counts on admin dashboard |
+| `__room_counts__` | Inflated counts (`hIncrBy(+1)` from join, no matching `hIncrBy(-1)` from leave) | Inflated per-room and total user counts |
+
+**Real-world symptom (observed):** After matches ended, admin dashboard showed:
+- Total Active Chat Rooms: 0
+- Total Active Users: 0
+- But website counts: score8o8.com = 116, halastream.live = 14, etc.
+- Redis `__socket_website__` had 150 stale entries
+
+**Why this is independent of room lifecycle:** A crash on instance 2 corrupts both keys immediately, regardless of whether matches are running. The stale data persists until something explicitly cleans it.
+
+**Fix:** Extend `validateCounts()` to reconcile both keys against the live socket state across all instances, and call it on every process startup.
+
+**Step 1 — Clean `__socket_website__`:**
+```js
+const [liveSocketIds, websiteEntries] = await Promise.all([
+  io.allSockets(),                          // cross-process via Redis adapter
+  redis.hGetAll(REDIS_SOCKET_WEBSITE),
+]);
+
+const staleSocketIds = Object.keys(websiteEntries).filter(
+  (socketId) => !liveSocketIds.has(socketId)
+);
+// delete stale entries via pipeline
+```
+
+**Step 2 — Reconcile `__room_counts__`:**
+```js
+const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
+for (const roomId of roomIds) {
+  const actualSockets = await io.in(roomId).allSockets();  // cross-process
+  const actualCount = actualSockets.size;
+  const storedCount = parseInt(storedCounts[roomId]) || 0;
+
+  if (actualCount !== storedCount) {
+    await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
+  }
+}
+```
+
+For each room, `io.in(roomId).allSockets()` returns the actual cross-process socket count. If `__room_counts__` disagrees, it gets corrected to the actual live value.
+
+**Step 3 — Startup sweep in `server.js`:**
+```js
+// After Redis adapter is set up, before server.listen()
+await validateCounts();
+```
+
+Runs `validateCounts()` once when each process boots. When a crashed instance gets restarted by PM2 (~3 seconds), the new process immediately reconciles all stale entries left by the dead instance — no waiting period.
+
+**Recovery time:**
+
+| Event | Recovery time |
+|---|---|
+| Instance crash (PM2 restart) | ~3 seconds — startup sweep runs on the new process |
+| Frontend reconnect (10s delay) | Count already corrected before user reconnects |
+| Rolling `pm2 reload` | Each restarted instance runs a sweep on boot |
+
+> The 2-minute periodic validation loop is currently commented out in `socket/roomManager.js`. Startup sweep handles the common case. Uncomment the `setInterval(validateCounts, 120000)` line later if mid-session drift from other causes ever becomes an issue.
+
+**Consistency guarantee after this fix:**
+
+| Redis Key | Survives instance crash? |
+|---|---|
+| `__rooms__` | Yes — only modified by API, not socket events |
+| `__room_counts__` | Self-heals within ~3 seconds via startup sweep |
+| `__socket_website__` | Self-heals within ~3 seconds via startup sweep |
+
+---
+
+### 6. `modules/chat/service.js` — Removed unused static imports
 
 `BATCH_FLUSH_INTERVAL` and `MAX_BATCH_SIZE` were imported from `perfomance_config` but never used. The code was already reading these values dynamically via `getCurrentPerformanceMode().settings.batchFlush` and `getCurrentPerformanceMode().settings.maxBatchSize`, which correctly respond to live performance mode changes without needing a restart.
 

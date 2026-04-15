@@ -368,6 +368,79 @@ Runs `validateCounts()` once when each process boots. When a crashed instance ge
 
 ---
 
+#### Future optimization — `validateCounts()` performance
+
+**Current cost at scale (100 rooms, 75,000 sockets):**
+
+| Operation | Cost | Notes |
+|---|---|---|
+| `io.allSockets()` | ~500ms–2s | Cross-process pub/sub, collects 75k IDs |
+| `redis.hGetAll(__socket_website__)` | ~20ms | Large hash read |
+| Stale filter + pipeline delete | ~50ms | JS filtering + one Redis round trip |
+| `io.in(roomId).allSockets()` in loop | **~3 seconds** | **N rooms × ~30ms each, sequential** |
+| Final stats (hGetAll × 2) | ~30ms | |
+
+**Total: ~3–5 seconds per run.**
+
+The main bottleneck is the sequential loop in Step 2:
+```js
+for (const roomId of roomIds) {
+  const actualSockets = await io.in(roomId).allSockets();  // awaited one at a time
+  // ...
+}
+```
+Each call is a cross-process pub/sub query. 100 rooms = 100 sequential round trips.
+
+**Why this is acceptable today:** It only runs as a startup sweep (once per process restart). ~3s of startup delay before accepting traffic is fine.
+
+**When to optimize:** If you uncomment the 2-minute periodic validation in `roomManager.js`, apply one of these optimizations first.
+
+**Option A — Parallelize the loop (easy fix, ~100x speedup):**
+```js
+const roomChecks = await Promise.all(
+  roomIds.map(async (roomId) => {
+    const sockets = await io.in(roomId).allSockets();
+    return { roomId, actualCount: sockets.size };
+  })
+);
+for (const { roomId, actualCount } of roomChecks) {
+  const storedCount = parseInt(storedCounts[roomId]) || 0;
+  if (actualCount !== storedCount) {
+    await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
+    fixedRooms++;
+  }
+}
+```
+All 100 queries fire concurrently. Total drops from ~3s → ~50ms (one round-trip).
+Trade-off: briefly puts 100 pub/sub messages through Redis at once.
+
+**Option B — Single `io.fetchSockets()` call (most efficient):**
+```js
+const allSockets = await io.fetchSockets();
+const actualCounts = {};
+for (const sock of allSockets) {
+  for (const room of sock.rooms) {
+    if (room !== sock.id) {
+      actualCounts[room] = (actualCounts[room] || 0) + 1;
+    }
+  }
+}
+for (const roomId of roomIds) {
+  const actualCount = actualCounts[roomId] || 0;
+  const storedCount = parseInt(storedCounts[roomId]) || 0;
+  if (actualCount !== storedCount) {
+    await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
+    fixedRooms++;
+  }
+}
+```
+One cross-process call returns all sockets with their rooms. No loop of queries.
+Trade-off: serializes full socket data over Redis pub/sub (heavier payload), but single network round trip instead of N+1.
+
+**Recommendation:** Start with Option A when re-enabling periodic validation. Move to Option B only if the periodic run shows measurable load on Redis.
+
+---
+
 ### 6. `modules/chat/service.js` — Removed unused static imports
 
 `BATCH_FLUSH_INTERVAL` and `MAX_BATCH_SIZE` were imported from `perfomance_config` but never used. The code was already reading these values dynamically via `getCurrentPerformanceMode().settings.batchFlush` and `getCurrentPerformanceMode().settings.maxBatchSize`, which correctly respond to live performance mode changes without needing a restart.

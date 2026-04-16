@@ -190,7 +190,7 @@ Added missing `await` on `createRoom()` call inside `createSocketRoomsForMatchSe
 
 ## Post-Migration Bug Fixes
 
-Five issues discovered via code review after the initial Redis migration:
+Six issues discovered via code review and production observation after the initial Redis migration:
 
 ### 1. `roomExists()` — Stale local fast-path (P1)
 
@@ -292,7 +292,156 @@ if (!exists) rooms.delete(roomId); // clean up stale local entry
 
 ---
 
-### 5. `modules/chat/service.js` — Removed unused static imports
+### 5. Stale `__socket_website__` AND `__room_counts__` from instance crashes (P1)
+
+**Root cause:** When a PM2 process dies abruptly (memory limit hit, crash, force restart), all sockets on that instance disconnect without `leaveRoom()` ever running. Two Redis structures get corrupted:
+
+| Redis Key | What gets stale | Visible symptom |
+|---|---|---|
+| `__socket_website__` | Orphaned `socketId → website` entries | Inflated website user counts on admin dashboard |
+| `__room_counts__` | Inflated counts (`hIncrBy(+1)` from join, no matching `hIncrBy(-1)` from leave) | Inflated per-room and total user counts |
+
+**Real-world symptom (observed):** After matches ended, admin dashboard showed:
+- Total Active Chat Rooms: 0
+- Total Active Users: 0
+- But website counts: score8o8.com = 116, halastream.live = 14, etc.
+- Redis `__socket_website__` had 150 stale entries
+
+**Why this is independent of room lifecycle:** A crash on instance 2 corrupts both keys immediately, regardless of whether matches are running. The stale data persists until something explicitly cleans it.
+
+**Fix:** Extend `validateCounts()` to reconcile both keys against the live socket state across all instances, and call it on every process startup.
+
+**Step 1 — Clean `__socket_website__`:**
+```js
+const [liveSocketIds, websiteEntries] = await Promise.all([
+  io.allSockets(),                          // cross-process via Redis adapter
+  redis.hGetAll(REDIS_SOCKET_WEBSITE),
+]);
+
+const staleSocketIds = Object.keys(websiteEntries).filter(
+  (socketId) => !liveSocketIds.has(socketId)
+);
+// delete stale entries via pipeline
+```
+
+**Step 2 — Reconcile `__room_counts__`:**
+```js
+const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
+for (const roomId of roomIds) {
+  const actualSockets = await io.in(roomId).allSockets();  // cross-process
+  const actualCount = actualSockets.size;
+  const storedCount = parseInt(storedCounts[roomId]) || 0;
+
+  if (actualCount !== storedCount) {
+    await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
+  }
+}
+```
+
+For each room, `io.in(roomId).allSockets()` returns the actual cross-process socket count. If `__room_counts__` disagrees, it gets corrected to the actual live value.
+
+**Step 3 — Startup sweep in `server.js`:**
+```js
+// After Redis adapter is set up, before server.listen()
+await validateCounts();
+```
+
+Runs `validateCounts()` once when each process boots. When a crashed instance gets restarted by PM2 (~3 seconds), the new process immediately reconciles all stale entries left by the dead instance — no waiting period.
+
+**Recovery time:**
+
+| Event | Recovery time |
+|---|---|
+| Instance crash (PM2 restart) | ~3 seconds — startup sweep runs on the new process |
+| Frontend reconnect (10s delay) | Count already corrected before user reconnects |
+| Rolling `pm2 reload` | Each restarted instance runs a sweep on boot |
+
+> The 2-minute periodic validation loop is currently commented out in `socket/roomManager.js`. Startup sweep handles the common case. Uncomment the `setInterval(validateCounts, 120000)` line later if mid-session drift from other causes ever becomes an issue.
+
+**Consistency guarantee after this fix:**
+
+| Redis Key | Survives instance crash? |
+|---|---|
+| `__rooms__` | Yes — only modified by API, not socket events |
+| `__room_counts__` | Self-heals within ~3 seconds via startup sweep |
+| `__socket_website__` | Self-heals within ~3 seconds via startup sweep |
+
+---
+
+#### Future optimization — `validateCounts()` performance
+
+**Current cost at scale (100 rooms, 75,000 sockets):**
+
+| Operation | Cost | Notes |
+|---|---|---|
+| `io.allSockets()` | ~500ms–2s | Cross-process pub/sub, collects 75k IDs |
+| `redis.hGetAll(__socket_website__)` | ~20ms | Large hash read |
+| Stale filter + pipeline delete | ~50ms | JS filtering + one Redis round trip |
+| `io.in(roomId).allSockets()` in loop | **~3 seconds** | **N rooms × ~30ms each, sequential** |
+| Final stats (hGetAll × 2) | ~30ms | |
+
+**Total: ~3–5 seconds per run.**
+
+The main bottleneck is the sequential loop in Step 2:
+```js
+for (const roomId of roomIds) {
+  const actualSockets = await io.in(roomId).allSockets();  // awaited one at a time
+  // ...
+}
+```
+Each call is a cross-process pub/sub query. 100 rooms = 100 sequential round trips.
+
+**Why this is acceptable today:** It only runs as a startup sweep (once per process restart). ~3s of startup delay before accepting traffic is fine.
+
+**When to optimize:** If you uncomment the 2-minute periodic validation in `roomManager.js`, apply one of these optimizations first.
+
+**Option A — Parallelize the loop (easy fix, ~100x speedup):**
+```js
+const roomChecks = await Promise.all(
+  roomIds.map(async (roomId) => {
+    const sockets = await io.in(roomId).allSockets();
+    return { roomId, actualCount: sockets.size };
+  })
+);
+for (const { roomId, actualCount } of roomChecks) {
+  const storedCount = parseInt(storedCounts[roomId]) || 0;
+  if (actualCount !== storedCount) {
+    await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
+    fixedRooms++;
+  }
+}
+```
+All 100 queries fire concurrently. Total drops from ~3s → ~50ms (one round-trip).
+Trade-off: briefly puts 100 pub/sub messages through Redis at once.
+
+**Option B — Single `io.fetchSockets()` call (most efficient):**
+```js
+const allSockets = await io.fetchSockets();
+const actualCounts = {};
+for (const sock of allSockets) {
+  for (const room of sock.rooms) {
+    if (room !== sock.id) {
+      actualCounts[room] = (actualCounts[room] || 0) + 1;
+    }
+  }
+}
+for (const roomId of roomIds) {
+  const actualCount = actualCounts[roomId] || 0;
+  const storedCount = parseInt(storedCounts[roomId]) || 0;
+  if (actualCount !== storedCount) {
+    await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
+    fixedRooms++;
+  }
+}
+```
+One cross-process call returns all sockets with their rooms. No loop of queries.
+Trade-off: serializes full socket data over Redis pub/sub (heavier payload), but single network round trip instead of N+1.
+
+**Recommendation:** Start with Option A when re-enabling periodic validation. Move to Option B only if the periodic run shows measurable load on Redis.
+
+---
+
+### 6. `modules/chat/service.js` — Removed unused static imports
 
 `BATCH_FLUSH_INTERVAL` and `MAX_BATCH_SIZE` were imported from `perfomance_config` but never used. The code was already reading these values dynamically via `getCurrentPerformanceMode().settings.batchFlush` and `getCurrentPerformanceMode().settings.maxBatchSize`, which correctly respond to live performance mode changes without needing a restart.
 

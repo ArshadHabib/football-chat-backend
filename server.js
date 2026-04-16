@@ -23,6 +23,7 @@ const {
   connectRedis,
 } = require("@project/config/redis");
 const { setPerformanceMode } = require("@project/utils/perfomance_config");
+const { validateCounts } = require("@project/socket/roomManager");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -82,6 +83,12 @@ app.get("/", (req, res) => {
     perfSubClient.subscribe("__perf_mode__", (mode) => {
       setPerformanceMode(mode);
     });
+
+    // Startup sweep — reconciles __socket_website__ and __room_counts__ against
+    // the live socket state across all instances. Catches stale entries left by
+    // a previously crashed/restarted instance within seconds of this process
+    // booting, instead of waiting for the 2-minute periodic validation.
+    await validateCounts();
 
     server.listen(PORT, async () => {
       console.log(`Server is running on http://localhost:${PORT}`);

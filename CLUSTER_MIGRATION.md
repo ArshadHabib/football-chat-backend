@@ -309,9 +309,14 @@ if (!exists) rooms.delete(roomId); // clean up stale local entry
 
 **Why this is independent of room lifecycle:** A crash on instance 2 corrupts both keys immediately, regardless of whether matches are running. The stale data persists until something explicitly cleans it.
 
-**Fix:** Extend `validateCounts()` to reconcile both keys against the live socket state across all instances, and call it on every process startup.
+**Fix:** Split `validateCounts()` into two modes using a `deleteStaleSockets` flag:
 
-**Step 1 — Clean `__socket_website__`:**
+| Call | What it does |
+|---|---|
+| `validateCounts({ deleteStaleSockets: true })` | Full cleanup (Steps 1 & 2) + count logging (Step 3) |
+| `validateCounts()` | Count logging only (Step 3) — cheap, no cross-process queries |
+
+**Step 1 — Clean `__socket_website__` (only when `deleteStaleSockets: true`):**
 ```js
 const [liveSocketIds, websiteEntries] = await Promise.all([
   io.allSockets(),                          // cross-process via Redis adapter
@@ -324,7 +329,7 @@ const staleSocketIds = Object.keys(websiteEntries).filter(
 // delete stale entries via pipeline
 ```
 
-**Step 2 — Reconcile `__room_counts__`:**
+**Step 2 — Reconcile `__room_counts__` (only when `deleteStaleSockets: true`):**
 ```js
 const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
 for (const roomId of roomIds) {
@@ -340,13 +345,28 @@ for (const roomId of roomIds) {
 
 For each room, `io.in(roomId).allSockets()` returns the actual cross-process socket count. If `__room_counts__` disagrees, it gets corrected to the actual live value.
 
-**Step 3 — Startup sweep in `server.js`:**
+**Step 3 — Count logging (always runs):**
+
+Reads `getUsersPerRoom()` and `getUsersPerWebsite()` from Redis and logs whether counts are consistent. Two cheap `hGetAll` calls — no cross-process pub/sub.
+
+---
+
+**How the two modes are used:**
+
+**Startup sweep in `server.js`** — full cleanup:
 ```js
 // After Redis adapter is set up, before server.listen()
-await validateCounts();
+await validateCounts({ deleteStaleSockets: true });
 ```
+Runs once when each process boots. When a crashed instance gets restarted by PM2 (~3 seconds), the new process immediately reconciles all stale entries left by the dead instance.
 
-Runs `validateCounts()` once when each process boots. When a crashed instance gets restarted by PM2 (~3 seconds), the new process immediately reconciles all stale entries left by the dead instance — no waiting period.
+**2-minute periodic interval in `roomManager.js`** — logging only:
+```js
+setInterval(async () => {
+  await validateCounts();  // no flag = logging only, no expensive cleanup
+}, 120000);
+```
+Runs every 2 minutes as a lightweight monitor. Logs count consistency to help detect drift. No cross-process queries, no cleanup — just reads Redis and flags mismatches.
 
 **Recovery time:**
 
@@ -355,8 +375,7 @@ Runs `validateCounts()` once when each process boots. When a crashed instance ge
 | Instance crash (PM2 restart) | ~3 seconds — startup sweep runs on the new process |
 | Frontend reconnect (10s delay) | Count already corrected before user reconnects |
 | Rolling `pm2 reload` | Each restarted instance runs a sweep on boot |
-
-> The 2-minute periodic validation loop is currently commented out in `socket/roomManager.js`. Startup sweep handles the common case. Uncomment the `setInterval(validateCounts, 120000)` line later if mid-session drift from other causes ever becomes an issue.
+| Mid-session drift | Detected by 2-minute logging; re-enable full cleanup in interval if needed |
 
 **Consistency guarantee after this fix:**
 

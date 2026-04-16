@@ -34,7 +34,7 @@ async function getTotalUsers() {
 async function getUsersPerRoom() {
   const counts = await redis.hGetAll(REDIS_ROOM_COUNTS);
   return Object.fromEntries(
-    Object.entries(counts).map(([k, v]) => [k, parseInt(v) || 0])
+    Object.entries(counts).map(([k, v]) => [k, parseInt(v) || 0]),
   );
 }
 
@@ -300,10 +300,7 @@ async function getCachedRoomData() {
     getUsersPerWebsite(),
   ]);
 
-  const totalUsers = Object.values(usersPerRoom).reduce(
-    (sum, v) => sum + v,
-    0
-  );
+  const totalUsers = Object.values(usersPerRoom).reduce((sum, v) => sum + v, 0);
 
   cachedRoomData = {
     usersPerRoom,
@@ -403,56 +400,59 @@ function getIO() {
 // Reconciles both __socket_website__ AND __room_counts__ against the live
 // socket state across all instances. Catches stale entries left by crashed
 // or restarted PM2 processes that didn't run leaveRoom on disconnect.
-async function validateCounts() {
-  const io = getIO();
+async function validateCounts(incomingObject = {}) {
+  const { deleteStaleSockets } = incomingObject || {};
+  if (deleteStaleSockets) {
+    const io = getIO();
 
-  if (io) {
-    // Step 1: Reconcile __socket_website__ against live sockets
-    // io.allSockets() works cross-process via the Redis adapter — returns
-    // every socket ID connected to any of the 5 instances right now.
-    const [liveSocketIds, websiteEntries] = await Promise.all([
-      io.allSockets(),
-      redis.hGetAll(REDIS_SOCKET_WEBSITE),
-    ]);
+    if (io) {
+      // Step 1: Reconcile __socket_website__ against live sockets
+      // io.allSockets() works cross-process via the Redis adapter — returns
+      // every socket ID connected to any of the 5 instances right now.
+      const [liveSocketIds, websiteEntries] = await Promise.all([
+        io.allSockets(),
+        redis.hGetAll(REDIS_SOCKET_WEBSITE),
+      ]);
 
-    const staleSocketIds = Object.keys(websiteEntries).filter(
-      (socketId) => !liveSocketIds.has(socketId)
-    );
-
-    if (staleSocketIds.length > 0) {
-      const pipeline = redis.multi();
-      staleSocketIds.forEach((socketId) => {
-        socketWebsite.delete(socketId);
-        pipeline.hDel(REDIS_SOCKET_WEBSITE, socketId);
-      });
-      await pipeline.exec();
-      console.log(
-        `🧹 Cleaned ${staleSocketIds.length} stale __socket_website__ entries`
+      const staleSocketIds = Object.keys(websiteEntries).filter(
+        (socketId) => !liveSocketIds.has(socketId),
       );
-    }
 
-    // Step 2: Reconcile __room_counts__ against actual live socket counts per room.
-    // For each room, the source of truth is io.in(roomId).allSockets().size
-    // (cross-process). If __room_counts__ disagrees, it's stale from a crash.
-    const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
-    const storedCounts = await redis.hGetAll(REDIS_ROOM_COUNTS);
-
-    let fixedRooms = 0;
-    for (const roomId of roomIds) {
-      const actualSockets = await io.in(roomId).allSockets();
-      const actualCount = actualSockets.size;
-      const storedCount = parseInt(storedCounts[roomId]) || 0;
-
-      if (actualCount !== storedCount) {
-        await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
-        fixedRooms++;
+      if (staleSocketIds.length > 0) {
+        const pipeline = redis.multi();
+        staleSocketIds.forEach((socketId) => {
+          socketWebsite.delete(socketId);
+          pipeline.hDel(REDIS_SOCKET_WEBSITE, socketId);
+        });
+        await pipeline.exec();
+        console.log(
+          `🧹 Cleaned ${staleSocketIds.length} stale __socket_website__ entries`,
+        );
       }
-    }
 
-    if (fixedRooms > 0) {
-      console.log(`🧹 Reconciled ${fixedRooms} room counts to actual values`);
-      invalidateCache();
-      scheduleAdminRoomUpdate();
+      // Step 2: Reconcile __room_counts__ against actual live socket counts per room.
+      // For each room, the source of truth is io.in(roomId).allSockets().size
+      // (cross-process). If __room_counts__ disagrees, it's stale from a crash.
+      const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
+      const storedCounts = await redis.hGetAll(REDIS_ROOM_COUNTS);
+
+      let fixedRooms = 0;
+      for (const roomId of roomIds) {
+        const actualSockets = await io.in(roomId).allSockets();
+        const actualCount = actualSockets.size;
+        const storedCount = parseInt(storedCounts[roomId]) || 0;
+
+        if (actualCount !== storedCount) {
+          await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
+          fixedRooms++;
+        }
+      }
+
+      if (fixedRooms > 0) {
+        console.log(`🧹 Reconciled ${fixedRooms} room counts to actual values`);
+        invalidateCache();
+        scheduleAdminRoomUpdate();
+      }
     }
   }
 
@@ -460,16 +460,19 @@ async function validateCounts() {
   const usersPerRoom = await getUsersPerRoom();
   const calculatedTotal = Object.values(usersPerRoom).reduce(
     (sum, count) => sum + count,
-    0
+    0,
   );
 
   const usersPerWebsite = await getUsersPerWebsite();
   const websiteSum = Object.values(usersPerWebsite).reduce(
     (sum, count) => sum + count,
-    0
+    0,
   );
 
-  const roomSum = Object.values(usersPerRoom).reduce((sum, count) => sum + count, 0);
+  const roomSum = Object.values(usersPerRoom).reduce(
+    (sum, count) => sum + count,
+    0,
+  );
   console.log(`🔍 COUNT VALIDATION:`);
   console.log(`   totalUsers: ${calculatedTotal}`);
   console.log(`   Sum of rooms: ${roomSum}`);
@@ -485,9 +488,9 @@ async function validateCounts() {
 // Run validation every 2 minutes — commented out for now, startup sweep in
 // server.js handles the common case (instance crash/restart). Uncomment to
 // re-enable as a safety net for mid-session drift.
-// setInterval(async () => {
-//   await validateCounts();
-// }, 120000);
+setInterval(async () => {
+  await validateCounts();
+}, 120000);
 
 module.exports = {
   createRoom,

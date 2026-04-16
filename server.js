@@ -88,7 +88,7 @@ app.get("/", (req, res) => {
     // the live socket state across all instances. Catches stale entries left by
     // a previously crashed/restarted instance within seconds of this process
     // booting, instead of waiting for the 2-minute periodic validation.
-    await validateCounts();
+    await validateCounts({ deleteStaleSockets: true });
 
     server.listen(PORT, async () => {
       console.log(`Server is running on http://localhost:${PORT}`);

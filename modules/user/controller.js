@@ -1,6 +1,8 @@
 const userService = require("./service");
 const { sendResponse, sendError, generateToken } = require("@project/utils");
 const { broadcastBanToAllRooms } = require("@project/socket/roomManager");
+const { pubClient: redis } = require("@project/config/redis");
+const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL } = require("@project/utils/const_config");
 
 async function registerUserController(req, res) {
   const { name, clientIp, inComingClientIp } = req?.body;
@@ -13,7 +15,19 @@ async function registerUserController(req, res) {
       return sendError(res, "You are banned from creating new users", 403);
     }
 
-    // 2️⃣ Check username availability
+    // 2️⃣ Rate limit: 1 account per IP per 10 minutes
+    const ip = inComingClientIp || clientIp;
+    if (ip) {
+      const set = await redis.set(`${REG_RATE_LIMIT_PREFIX}${ip}`, "1", {
+        NX: true,
+        EX: REG_RATE_LIMIT_TTL,
+      });
+      if (set === null) {
+        return sendError(res, "Account creation limit reached. Try again in 10 minutes.", 429);
+      }
+    }
+
+    // 3️⃣ Check username availability
     const existingUser = await userService.findUserByName(name);
     if (existingUser) {
       return sendError(res, "User name already taken!", 400);

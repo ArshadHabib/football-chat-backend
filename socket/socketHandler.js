@@ -21,7 +21,7 @@ const { findUserByName } = require("@project/modules/user/service");
 const { BANNED_USERS_KEY } = require("@project/utils/const_config");
 
 const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
-const ALLOWED_REACTIONS = ["👍", "❤️", "😂", "😮", "😢"];
+const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡"];
 
 // Typing state: Map<roomId, Map<socketId, { username, timer }>>
 const typingUsers = new Map();

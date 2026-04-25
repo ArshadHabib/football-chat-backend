@@ -2,7 +2,7 @@ const userService = require("./service");
 const { sendResponse, sendError, generateToken } = require("@project/utils");
 const { broadcastBanToAllRooms } = require("@project/socket/roomManager");
 const { pubClient: redis } = require("@project/config/redis");
-const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL } = require("@project/utils/const_config");
+const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL, BANNED_USERS_KEY } = require("@project/utils/const_config");
 
 async function registerUserController(req, res) {
   const { name, clientIp, inComingClientIp } = req?.body;
@@ -47,7 +47,10 @@ async function updateUser(req, res) {
   try {
     if (ipAddress && isBanned === true) {
       const bannedNames = await userService.banAllUsersByIp(ipAddress);
-      await broadcastBanToAllRooms(bannedNames);
+      if (bannedNames.length > 0) {
+        await redis.sAdd(BANNED_USERS_KEY, bannedNames);
+        await broadcastBanToAllRooms(bannedNames);
+      }
       return sendResponse(res, null, "Users Banned Successfully", 200);
     }
 
@@ -57,6 +60,13 @@ async function updateUser(req, res) {
     }
 
     await userService.updateUser(name, { isBanned });
+
+    if (isBanned === true) {
+      await redis.sAdd(BANNED_USERS_KEY, name);
+    } else {
+      await redis.sRem(BANNED_USERS_KEY, name);
+    }
+
     sendResponse(res, null, "User Data Updated Successfully", 200);
   } catch (error) {
     sendError(res, "Internal server error", 500);

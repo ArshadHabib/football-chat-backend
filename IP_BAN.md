@@ -42,6 +42,60 @@ Redis `SET NX EX` is used — this is a single atomic operation that sets a key 
 | `REG_RATE_LIMIT_PREFIX` | `"reg_ratelimit:"` | Redis key prefix |
 | `REG_RATE_LIMIT_TTL` | `600` | Window in seconds (10 minutes) |
 
+## Server-Side Ban Enforcement (Redis Set)
+
+### Problem
+The frontend stores `isBanned` in localStorage. A user can open DevTools, flip it to `false`, and keep sending messages since the server does not verify ban status on each message.
+
+### Solution
+A Redis Set `__banned_users__` acts as the server-side source of truth across all processes. localStorage flow is untouched — this sits on top of it.
+
+### Redis Key
+`__banned_users__` — a single shared Set, consistent across all PM2 processes via the shared Redis instance.
+
+### On Ban — `modules/user/controller.js` (`updateUser`)
+
+**IP ban** (`ipAddress` + `isBanned: true`):
+1. `banAllUsersByIp(ipAddress)` — MongoDB `updateMany({ ipAddress }, { isBanned: true })`, returns all banned usernames
+2. `redis.sAdd(BANNED_USERS_KEY, bannedNames)` — adds all usernames to the Redis Set in one call
+3. `broadcastBanToAllRooms(bannedNames)` — emits `user_updated` globally for each username
+
+**Single user ban** (`isBanned: true`, no `ipAddress`):
+1. MongoDB `findOneAndUpdate` sets `isBanned: true`
+2. `redis.sAdd(BANNED_USERS_KEY, name)` — adds username to the Redis Set
+
+### On Unban — `modules/user/controller.js` (`updateUser`)
+
+1. MongoDB `findOneAndUpdate` sets `isBanned: false`
+2. `redis.sRem(BANNED_USERS_KEY, name)` — removes username from the Redis Set
+
+### On `join_room` — `socket/socketHandler.js`
+
+Ban check on join is currently **disabled** — banned users are allowed to join rooms. Enforcement happens at the `room_message` level instead.
+
+The join block code is commented out in `socketHandler.js` and can be re-enabled if join blocking is needed in the future.
+
+### On `room_message` — `socket/socketHandler.js`
+
+Ban check is folded into the existing rate limit Redis pipeline — both run in a single round trip:
+
+```
+pipeline = redis.multi()
+pipeline.sIsMember(__banned_users__, senderName)   ← ban check
+pipeline.incr(ratelimit:{ip})                       ← rate limit (if IP present)
+pipeline.expire(ratelimit:{ip}, window, NX)
+
+results = pipeline.exec()
+  results[0] = isBanned  → true: drop message silently (no feedback to user), return
+  results[1] = msgCount  → over limit: emit server_rate_limit, return
+  → both pass: broadcast room_message
+```
+
+No extra Redis round trip — ban check costs nothing on top of the existing pipeline.
+
+### Known Loophole (to fix later)
+`senderName` in `room_message` comes from the frontend payload. A banned user could change it to a different username and bypass the `SISMEMBER` check. Fix: store `senderName` on the socket object at `join_room` and use `socket.senderName` for the ban check instead of `data.senderName`.
+
 ## Files Changed
 
 | File | Change |

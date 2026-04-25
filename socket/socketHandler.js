@@ -16,6 +16,8 @@ const {
 const { authenticateToken } = require("@project/middleware");
 const { pubClient: redis } = require("@project/config/redis");
 const { getCurrentPerformanceMode } = require("@project/utils/perfomance_config");
+const { findUserByName } = require("@project/modules/user/service");
+const { BANNED_USERS_KEY } = require("@project/utils/const_config");
 
 const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
 
@@ -213,6 +215,27 @@ function setupSocketHandlers(io) {
         socket.clientIp = data.inComingClientIp;
       }
 
+      // Ban check on join disabled — banned users are allowed to join but cannot send messages.
+      // The room_message pipeline blocks them via __banned_users__ Redis set check.
+      // Uncomment below to re-enable join blocking (also restores self-healing for pre-existing bans).
+      //
+      // try {
+      //   const inRedis = await redis.sIsMember(BANNED_USERS_KEY, senderName);
+      //   if (inRedis) {
+      //     socket.emit("join_result", { success: false, message: "You are banned from chat." });
+      //     return;
+      //   }
+      //   const user = await findUserByName(senderName);
+      //   if (!user || user.isBanned) {
+      //     if (user?.isBanned) await redis.sAdd(BANNED_USERS_KEY, senderName);
+      //     socket.emit("join_result", { success: false, message: "You are banned from chat." });
+      //     return;
+      //   }
+      // } catch {
+      //   socket.emit("join_result", { success: false, message: "Unable to verify user. Please try again." });
+      //   return;
+      // }
+
       const result = await joinRoom(roomId, socket, senderName, websiteName);
 
       if (result.success) {
@@ -232,19 +255,25 @@ function setupSocketHandlers(io) {
     socket.on("room_message", async (data) => {
       const { roomId, messageContent, senderName } = data; // senderName from frontend
 
-      // IP rate limit check — single pipeline round trip, shared across all 5 processes via Redis
+      // Ban + rate limit check — single pipeline round trip
       const ip = socket.clientIp;
+      const { rateLimitMax, rateLimitWindowSeconds } = getCurrentPerformanceMode().settings;
+      const pipeline = redis.multi();
+      pipeline.sIsMember(BANNED_USERS_KEY, senderName);
       if (ip) {
-        const { rateLimitMax, rateLimitWindowSeconds } = getCurrentPerformanceMode().settings;
         const key = `${REDIS_RATE_LIMIT_PREFIX}${ip}`;
-
-        const pipeline = redis.multi();
         pipeline.incr(key);
-        pipeline.expire(key, rateLimitWindowSeconds, "NX"); // NX = only set TTL if key has none yet
-        const [count] = await pipeline.exec();
+        pipeline.expire(key, rateLimitWindowSeconds, "NX");
+      }
+      const results = await pipeline.exec();
 
+      const isBanned = results[0];
+      if (isBanned) return;
+
+      if (ip) {
+        const count = results[1];
         if (count > rateLimitMax) {
-          const retryAfter = await redis.ttl(key);
+          const retryAfter = await redis.ttl(`${REDIS_RATE_LIMIT_PREFIX}${ip}`);
           socket.emit("server_rate_limit", {
             message: `Limit reached. Retry in ${retryAfter} seconds`,
             retryAfter,

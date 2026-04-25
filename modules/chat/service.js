@@ -55,6 +55,82 @@ async function flushMessageBatch() {
 
 setInterval(flushMessageBatch, getCurrentPerformanceMode().settings.batchFlush);
 
+// Reaction batch: Map<messageId, Map<emoji, Set<username>>>
+const reactionBatch = new Map();
+const dirtyMessageIds = new Set();
+
+async function flushReactionBatch() {
+  if (dirtyMessageIds.size === 0) return;
+  const ids = Array.from(dirtyMessageIds);
+  dirtyMessageIds.clear();
+
+  for (const messageId of ids) {
+    const reactions = reactionBatch.get(messageId);
+    if (!reactions) continue;
+    const serialized = {};
+    reactions.forEach((users, emoji) => {
+      if (users.size > 0) serialized[emoji] = Array.from(users);
+    });
+    try {
+      await MessageModel.updateOne(
+        { _id: messageId },
+        { $set: { reactions: serialized } }
+      );
+      // Evict from cache after flush — only if no new reaction arrived during the flush window
+      if (!dirtyMessageIds.has(messageId)) {
+        reactionBatch.delete(messageId);
+      }
+    } catch (err) {
+      // Re-add to dirty set so the next flush retries this messageId
+      dirtyMessageIds.add(messageId);
+      console.error("Reaction flush error:", err);
+    }
+  }
+}
+
+setInterval(flushReactionBatch, getCurrentPerformanceMode().settings.batchFlush);
+
+// Returns serialized reactions object after applying toggle/switch logic.
+// Loads from DB into batch on first access for a given messageId.
+async function applyReactionService(messageId, emoji, username) {
+  if (!reactionBatch.has(messageId)) {
+    const msg = await MessageModel.findById(messageId).select("reactions").lean();
+    if (!msg) return null;
+    const reactionMap = new Map();
+    if (msg.reactions) {
+      for (const [e, users] of Object.entries(msg.reactions)) {
+        reactionMap.set(e, new Set(users));
+      }
+    }
+    reactionBatch.set(messageId, reactionMap);
+  }
+
+  const reactions = reactionBatch.get(messageId);
+
+  // Remove user from any existing emoji (one reaction per user per message)
+  let previousEmoji = null;
+  reactions.forEach((users, e) => {
+    if (users.has(username)) {
+      previousEmoji = e;
+      users.delete(username);
+    }
+  });
+
+  // Toggle off if same emoji; otherwise add the new one
+  if (previousEmoji !== emoji) {
+    if (!reactions.has(emoji)) reactions.set(emoji, new Set());
+    reactions.get(emoji).add(username);
+  }
+
+  dirtyMessageIds.add(messageId);
+
+  const serialized = {};
+  reactions.forEach((users, e) => {
+    if (users.size > 0) serialized[e] = Array.from(users);
+  });
+  return serialized;
+}
+
 async function saveChatMessageService(roomId, messageData) {
   const message = {
     _id: new mongoose.Types.ObjectId(),
@@ -259,6 +335,7 @@ module.exports = {
   createChatRoomService,
   deleteChatRoomService,
   saveChatMessageService,
+  applyReactionService,
   retrieveRoomMessagesService,
   deleteAllChatMessagesService,
   deleteAllDBChatRoomService,

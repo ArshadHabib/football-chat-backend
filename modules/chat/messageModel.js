@@ -37,6 +37,11 @@ const messageSchema = new mongoose.Schema(
       required: false,
       default: false,
     },
+    reactions: {
+      type: Map,
+      of: [String],
+      default: {},
+    },
     timestamp: {
       type: Date,
       default: Date.now,
@@ -50,5 +55,6 @@ const messageSchema = new mongoose.Schema(
 
 // Compound index for fast room queries
 messageSchema.index({ roomId: 1, timestamp: -1 });
+messageSchema.index({ roomId: 1, isPinned: 1 });
 
 module.exports = mongoose.model("Message", messageSchema);

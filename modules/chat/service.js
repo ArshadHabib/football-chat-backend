@@ -58,6 +58,10 @@ setInterval(flushMessageBatch, getCurrentPerformanceMode().settings.batchFlush);
 // Reaction batch: Map<messageId, Map<emoji, Set<username>>>
 const reactionBatch = new Map();
 const dirtyMessageIds = new Set();
+// Tracks how many flush cycles a messageId has been pending without a DB match.
+// Prevents phantom entries from leaking memory if the message never appears.
+const reactionRetries = new Map();
+const MAX_REACTION_RETRIES = 10;
 
 async function flushReactionBatch() {
   if (dirtyMessageIds.size === 0) return;
@@ -72,13 +76,27 @@ async function flushReactionBatch() {
       if (users.size > 0) serialized[emoji] = Array.from(users);
     });
     try {
-      await MessageModel.updateOne(
+      const result = await MessageModel.updateOne(
         { _id: messageId },
         { $set: { reactions: serialized } }
       );
-      // Evict from cache after flush — only if no new reaction arrived during the flush window
-      if (!dirtyMessageIds.has(messageId)) {
-        reactionBatch.delete(messageId);
+      if (result.matchedCount === 0) {
+        // Message not in DB yet — may still be in another instance's write batch.
+        // Retry up to MAX_REACTION_RETRIES cycles, then give up.
+        const retries = (reactionRetries.get(messageId) || 0) + 1;
+        if (retries >= MAX_REACTION_RETRIES) {
+          reactionBatch.delete(messageId);
+          reactionRetries.delete(messageId);
+        } else {
+          reactionRetries.set(messageId, retries);
+          dirtyMessageIds.add(messageId);
+        }
+      } else {
+        reactionRetries.delete(messageId);
+        // Evict from cache only if no new reaction arrived during the flush window
+        if (!dirtyMessageIds.has(messageId)) {
+          reactionBatch.delete(messageId);
+        }
       }
     } catch (err) {
       // Re-add to dirty set so the next flush retries this messageId
@@ -95,14 +113,22 @@ setInterval(flushReactionBatch, getCurrentPerformanceMode().settings.batchFlush)
 async function applyReactionService(messageId, emoji, username) {
   if (!reactionBatch.has(messageId)) {
     const msg = await MessageModel.findById(messageId).select("reactions").lean();
-    if (!msg) return null;
-    const reactionMap = new Map();
-    if (msg.reactions) {
-      for (const [e, users] of Object.entries(msg.reactions)) {
-        reactionMap.set(e, new Set(users));
+    if (msg) {
+      const reactionMap = new Map();
+      if (msg.reactions) {
+        for (const [e, users] of Object.entries(msg.reactions)) {
+          reactionMap.set(e, new Set(users));
+        }
       }
+      reactionBatch.set(messageId, reactionMap);
+    } else {
+      // Message not in DB yet (still in a write batch on some instance).
+      // Seed an empty reaction map so the reaction is applied in memory now.
+      // flushReactionBatch will retry writing reactions to DB until the message
+      // appears — works across all PM2 instances since MongoDB is shared.
+      if (!mongoose.isValidObjectId(messageId)) return null;
+      reactionBatch.set(messageId, new Map());
     }
-    reactionBatch.set(messageId, reactionMap);
   }
 
   const reactions = reactionBatch.get(messageId);

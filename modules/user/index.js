@@ -9,7 +9,7 @@ const {
 
 // User routes
 router.post(
-  "/fakeregister-user",
+  "/register-user",
   attachClientIp,
   authController.registerUserController
 );

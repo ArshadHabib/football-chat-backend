@@ -1,5 +1,6 @@
 const userService = require("./service");
 const { sendResponse, sendError, generateToken } = require("@project/utils");
+const { broadcastBanToAllRooms } = require("@project/socket/roomManager");
 
 async function registerUserController(req, res) {
   const { name, clientIp, inComingClientIp } = req?.body;
@@ -27,15 +28,21 @@ async function registerUserController(req, res) {
 }
 
 async function updateUser(req, res) {
-  const { name, isBanned } = req?.body;
-  const user = await userService.findUserByName(name);
-  if (!user) {
-    return sendError(res, "User not found!", 404);
-  }
-  const newFields = { name, isBanned };
+  const { name, ipAddress, isBanned } = req?.body;
 
   try {
-    const user = await userService.updateUser(name, newFields);
+    if (ipAddress && isBanned === true) {
+      const bannedNames = await userService.banAllUsersByIp(ipAddress);
+      await broadcastBanToAllRooms(bannedNames);
+      return sendResponse(res, null, "Users Banned Successfully", 200);
+    }
+
+    const user = await userService.findUserByName(name);
+    if (!user) {
+      return sendError(res, "User not found!", 404);
+    }
+
+    await userService.updateUser(name, { isBanned });
     sendResponse(res, null, "User Data Updated Successfully", 200);
   } catch (error) {
     sendError(res, "Internal server error", 500);

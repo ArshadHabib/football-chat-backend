@@ -35,6 +35,14 @@ async function updateUser(name, updatedFields) {
   );
 }
 
+async function banAllUsersByIp(ipAddress) {
+  if (!ipAddress) return [];
+  const users = await User.find({ ipAddress }, { name: 1 });
+  if (users.length === 0) return [];
+  await User.updateMany({ ipAddress }, { isBanned: true });
+  return users.map((u) => u.name);
+}
+
 module.exports = {
   createUser,
   findUserByName,
@@ -42,4 +50,5 @@ module.exports = {
   updateUser,
   findUserByIp,
   findBannedUserByIp,
+  banAllUsersByIp,
 };

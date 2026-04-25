@@ -385,6 +385,23 @@ async function broadcastUserCountUpdates() {
   roomUserCountUpdates.clear();
 }
 
+async function broadcastBanToAllRooms(userNames) {
+  const io = getIO();
+  if (!io || userNames.length === 0) return;
+
+  const timestamp = new Date().toISOString();
+
+  for (const name of userNames) {
+    io.emit("user_updated", {
+      name,
+      isBanned: true,
+      updatedBy: "admin",
+      timestamp,
+      eventType: "user_updated",
+    });
+  }
+}
+
 // Utility functions
 let ioInstance = null;
 
@@ -513,4 +530,5 @@ module.exports = {
   setIO,
   scheduleUserCountUpdate,
   validateCounts,
+  broadcastBanToAllRooms,
 };

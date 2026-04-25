@@ -26,23 +26,16 @@ const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "�
 // Typing state: Map<roomId, Map<socketId, { username, timer }>>
 const typingUsers = new Map();
 
-function broadcastTyping(io, roomId) {
-  const roomTyping = typingUsers.get(roomId);
-  const names = roomTyping
-    ? Array.from(roomTyping.values()).map((u) => u.username)
-    : [];
-  io.to(roomId).emit("user_typing", { names });
-}
-
 function clearTypingUser(io, roomId, socketId) {
   const roomTyping = typingUsers.get(roomId);
   if (!roomTyping) return;
   const entry = roomTyping.get(socketId);
   if (!entry) return;
   clearTimeout(entry.timer);
+  const { username } = entry;
   roomTyping.delete(socketId);
   if (roomTyping.size === 0) typingUsers.delete(roomId);
-  broadcastTyping(io, roomId);
+  io.to(roomId).emit("user_typing", { username, isTyping: false });
 }
 
 function setupSocketHandlers(io) {
@@ -326,10 +319,12 @@ function setupSocketHandlers(io) {
       if (!typingUsers.has(roomId)) typingUsers.set(roomId, new Map());
       const roomTyping = typingUsers.get(roomId);
       const existing = roomTyping.get(socket.id);
+      const isNew = !existing;
       if (existing) clearTimeout(existing.timer);
       const timer = setTimeout(() => clearTypingUser(io, roomId, socket.id), 5000);
       roomTyping.set(socket.id, { username, timer });
-      broadcastTyping(io, roomId);
+      // Only broadcast on first start — heartbeat resets the timer without re-announcing
+      if (isNew) io.to(roomId).emit("user_typing", { username, isTyping: true });
     });
 
     socket.on("typing_stop", (data) => {

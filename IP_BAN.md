@@ -93,8 +93,16 @@ results = pipeline.exec()
 
 No extra Redis round trip — ban check costs nothing on top of the existing pipeline.
 
-### Known Loophole (to fix later)
-`senderName` in `room_message` comes from the frontend payload. A banned user could change it to a different username and bypass the `SISMEMBER` check. Fix: store `senderName` on the socket object at `join_room` and use `socket.senderName` for the ban check instead of `data.senderName`.
+### Known Loophole (fix ready, commented out)
+`senderName` in `room_message` comes from the frontend payload — a banned user could change it to a different username and bypass the `SISMEMBER` check.
+
+**Fix (implemented but commented out):**
+- At `join_room`, store the verified username server-side: `socket.senderName = senderName`
+- In `room_message`, use `socket.senderName` for the ban check instead of `data.senderName`
+- `socket.senderName` is set by the server at join time and cannot be tampered with by the client
+- Works per-process — each user's socket and their messages always live on the same process, so no cross-process issue
+
+**To enable:** uncomment `socket.senderName = senderName` in `join_room` and replace `senderName` with `socket.senderName` in the `room_message` pipeline check.
 
 ## Files Changed
 

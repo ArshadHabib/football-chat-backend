@@ -236,6 +236,12 @@ function setupSocketHandlers(io) {
       //   return;
       // }
 
+      // Store verified username on socket for server-side ban check in room_message.
+      // Prevents banned users from bypassing the Redis ban check by spoofing senderName in the payload.
+      // To use this, replace `socket.senderName ?? senderName` with `socket.senderName` in the
+      // room_message pipeline check and remove the fallback.
+      // socket.senderName = senderName;
+
       const result = await joinRoom(roomId, socket, senderName, websiteName);
 
       if (result.success) {
@@ -259,6 +265,8 @@ function setupSocketHandlers(io) {
       const ip = socket.clientIp;
       const { rateLimitMax, rateLimitWindowSeconds } = getCurrentPerformanceMode().settings;
       const pipeline = redis.multi();
+      // When socket.senderName fix is enabled, replace the line below with:
+      // pipeline.sIsMember(BANNED_USERS_KEY, socket.senderName ?? senderName);
       pipeline.sIsMember(BANNED_USERS_KEY, senderName);
       if (ip) {
         const key = `${REDIS_RATE_LIMIT_PREFIX}${ip}`;

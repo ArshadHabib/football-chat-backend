@@ -15,7 +15,13 @@ async function registerUserController(req, res) {
       return sendError(res, "You are banned from creating new users", 403);
     }
 
-    // 2️⃣ Rate limit: 1 account per IP per 10 minutes
+    // 2️⃣ Check username availability
+    const existingUser = await userService.findUserByName(name);
+    if (existingUser) {
+      return sendError(res, "User name already taken!", 400);
+    }
+
+    // 3️⃣ Rate limit: 1 account per IP per 10 minutes (only on successful creation)
     const ip = inComingClientIp || clientIp;
     if (ip) {
       const set = await redis.set(`${REG_RATE_LIMIT_PREFIX}${ip}`, "1", {
@@ -27,11 +33,6 @@ async function registerUserController(req, res) {
       }
     }
 
-    // 3️⃣ Check username availability
-    const existingUser = await userService.findUserByName(name);
-    if (existingUser) {
-      return sendError(res, "User name already taken!", 400);
-    }
     await userService.createUser(name, inComingClientIp || clientIp);
 
     sendResponse(res, null, "User created successfully", 201);

@@ -71,15 +71,20 @@ async function flushReactionBatch() {
   for (const messageId of ids) {
     const reactions = reactionBatch.get(messageId);
     if (!reactions) continue;
-    const serialized = {};
+    const setFields = {};
+    const unsetFields = {};
     reactions.forEach((users, emoji) => {
-      if (users.size > 0) serialized[emoji] = Array.from(users);
+      if (users.size > 0) {
+        setFields[`reactions.${emoji}`] = Array.from(users);
+      } else {
+        unsetFields[`reactions.${emoji}`] = "";
+      }
     });
+    const update = {};
+    if (Object.keys(setFields).length > 0) update.$set = setFields;
+    if (Object.keys(unsetFields).length > 0) update.$unset = unsetFields;
     try {
-      const result = await MessageModel.updateOne(
-        { _id: messageId },
-        { $set: { reactions: serialized } }
-      );
+      const result = await MessageModel.updateOne({ _id: messageId }, update);
       if (result.matchedCount === 0) {
         // Message not in DB yet — may still be in another instance's write batch.
         // Retry up to MAX_REACTION_RETRIES cycles, then give up.

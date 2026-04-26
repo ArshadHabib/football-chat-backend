@@ -41,6 +41,18 @@ function clearTypingUser(io, roomId, socketId) {
 function setupSocketHandlers(io) {
   setIO(io);
 
+  // Periodically evict typingUsers entries for rooms that have no connected sockets.
+  // Handles the edge case where a room is abandoned without a clean typing_stop/disconnect.
+  setInterval(() => {
+    for (const [roomId, roomTyping] of typingUsers) {
+      const socketsInRoom = io.sockets.adapter.rooms.get(roomId);
+      if (!socketsInRoom || socketsInRoom.size === 0) {
+        for (const { timer } of roomTyping.values()) clearTimeout(timer);
+        typingUsers.delete(roomId);
+      }
+    }
+  }, 5 * 60 * 1000); // every 5 minutes
+
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 

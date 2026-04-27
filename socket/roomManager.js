@@ -11,7 +11,6 @@ const { pubClient: redis } = require("@project/config/redis");
 // === LOCAL SOCKET TRACKING (per-process, for socket.join/leave mechanics) ===
 const rooms = new Map(); // roomId -> Set of local socketIds
 const adminSockets = new Set(); // local admin socket objects (for removeAdmin/isAdmin)
-const roomUserCountUpdates = new Map();
 const socketWebsite = new Map(); // socketId -> websiteName (local cache)
 
 // Redis keys
@@ -19,11 +18,11 @@ const REDIS_ROOMS_SET = "__rooms__";
 const REDIS_ROOM_COUNTS = "__room_counts__";
 const REDIS_SOCKET_WEBSITE = "__socket_website__";
 const REDIS_ROOM_SHOW_VIEWS = "__room_show_views__";
+const REDIS_ROOM_LAST_BROADCAST = "__room_last_broadcast__";
 
 // Cache and debouncing
 let cachedRoomData = null;
 let adminUpdateTimeout = null;
-let userCountUpdateTimeout = null;
 
 // === DERIVED COUNTERS — all read from Redis (cross-process truth) ===
 
@@ -98,12 +97,12 @@ async function deleteRoom(roomId) {
   await redis.sRem(REDIS_ROOMS_SET, roomId);
   await redis.hDel(REDIS_ROOM_COUNTS, roomId);
   await redis.hDel(REDIS_ROOM_SHOW_VIEWS, roomId);
+  await redis.hDel(REDIS_ROOM_LAST_BROADCAST, roomId);
 
   deleteChatRoomService(roomId);
 
   invalidateCache();
   scheduleAdminRoomUpdate();
-  roomUserCountUpdates.delete(roomId);
   return { success: true, roomId };
 }
 
@@ -119,6 +118,7 @@ async function deleteAllRooms() {
     redis.del(REDIS_ROOMS_SET),
     redis.del(REDIS_ROOM_COUNTS),
     redis.del(REDIS_ROOM_SHOW_VIEWS),
+    redis.del(REDIS_ROOM_LAST_BROADCAST),
     redis.del(REDIS_SOCKET_WEBSITE),
   ]);
 
@@ -361,41 +361,39 @@ function emitToAdmin(socketId, eventName, data) {
   return true;
 }
 
-function scheduleUserCountUpdate(roomId, usersCount) {
-  // Store the latest count for this room
-  roomUserCountUpdates.set(roomId, usersCount);
+async function scheduleUserCountUpdate(roomId) {
+  const debounceMs = getCurrentPerformanceMode().settings.userCountUpdateDebounce;
+  const debounceKey = `__user_count_debounce__:${roomId}`;
 
-  // Debounce updates
-  if (userCountUpdateTimeout) {
-    clearTimeout(userCountUpdateTimeout);
-  }
+  // Only the first process to set this key within the debounce window broadcasts.
+  // All other processes see the key already exists and skip — cross-process coordination.
+  const won = await redis.set(debounceKey, "1", { NX: true, PX: debounceMs });
+  if (!won) return;
 
-  userCountUpdateTimeout = setTimeout(async () => {
-    await broadcastUserCountUpdates();
-  }, getCurrentPerformanceMode().settings.userCountUpdateDebounce);
-}
+  setTimeout(async () => {
+    const io = getIO();
+    if (!io) return;
 
-async function broadcastUserCountUpdates() {
-  const io = getIO();
-  if (!io) return;
-
-  for (const [roomId, usersCount] of roomUserCountUpdates) {
-    // Only broadcast if room still exists — always check Redis as source of truth
     const exists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
-    if (!exists) rooms.delete(roomId); // clean up stale local entry if room is gone
-    if (exists) {
-      const showViewsValue = await redis.hGet(REDIS_ROOM_SHOW_VIEWS, roomId);
-      // null means key not set (pre-deploy rooms) — treat as true to preserve existing behaviour
-      if (showViewsValue !== "false") {
-        io.to(roomId).emit("room_user_count_update", {
-          roomId,
-          usersCount,
-        });
-      }
+    if (!exists) {
+      rooms.delete(roomId);
+      return;
     }
-  }
 
-  roomUserCountUpdates.clear();
+    const showViewsValue = await redis.hGet(REDIS_ROOM_SHOW_VIEWS, roomId);
+    if (showViewsValue === "false") return;
+
+    const [countRaw, lastBroadcastRaw] = await Promise.all([
+      redis.hGet(REDIS_ROOM_COUNTS, roomId),
+      redis.hGet(REDIS_ROOM_LAST_BROADCAST, roomId),
+    ]);
+    const count = parseInt(countRaw) || 0;
+    const lastBroadcast = parseInt(lastBroadcastRaw) || 0;
+    if (count === lastBroadcast) return;
+
+    io.to(roomId).emit("room_user_count_update", { roomId, usersCount: count });
+    await redis.hSet(REDIS_ROOM_LAST_BROADCAST, roomId, count.toString());
+  }, debounceMs);
 }
 
 async function broadcastBanToAllRooms(userNames) {

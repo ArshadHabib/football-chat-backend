@@ -258,7 +258,7 @@ function setupSocketHandlers(io) {
 
       if (result.success) {
         socket.emit("join_result", result);
-        scheduleUserCountUpdate(roomId, result.usersCount);
+        scheduleUserCountUpdate(roomId);
         // socket.to(roomId).emit("user_joined", {
         //   senderName, // From frontend
         //   roomId,
@@ -387,7 +387,7 @@ function setupSocketHandlers(io) {
 
       const result = await leaveRoom(socket);
       if (result) {
-        scheduleUserCountUpdate(result.roomId, result.usersCount);
+        scheduleUserCountUpdate(result.roomId);
         // socket.to(result.roomId).emit("user_left", {
         //   // Note: We don't have senderName here anymore
         //   roomId: result.roomId,

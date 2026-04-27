@@ -185,10 +185,13 @@ async function joinRoom(roomId, socket, senderName, websiteName) {
   invalidateCache();
   scheduleAdminRoomUpdate();
 
+  const showViewsValue = await redis.hGet(REDIS_ROOM_SHOW_VIEWS, roomId);
+  const showViews = showViewsValue !== "false";
+
   return {
     success: true,
     roomId,
-    usersCount: count,
+    ...(showViews && { usersCount: count }),
   };
 }
 

@@ -18,6 +18,7 @@ const socketWebsite = new Map(); // socketId -> websiteName (local cache)
 const REDIS_ROOMS_SET = "__rooms__";
 const REDIS_ROOM_COUNTS = "__room_counts__";
 const REDIS_SOCKET_WEBSITE = "__socket_website__";
+const REDIS_ROOM_SHOW_VIEWS = "__room_show_views__";
 
 // Cache and debouncing
 let cachedRoomData = null;
@@ -52,7 +53,7 @@ function getRoomUserCount(roomId) {
   return socketIds ? socketIds.size : 0;
 }
 
-async function createRoom(roomId) {
+async function createRoom(roomId, showViews = true) {
   const alreadyInRedis = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
   if (alreadyInRedis) {
     return { success: false, message: "Room already exists" };
@@ -61,6 +62,7 @@ async function createRoom(roomId) {
   rooms.set(roomId, new Set());
   await redis.sAdd(REDIS_ROOMS_SET, roomId);
   await redis.hSet(REDIS_ROOM_COUNTS, roomId, "0");
+  await redis.hSet(REDIS_ROOM_SHOW_VIEWS, roomId, showViews ? "true" : "false");
 
   console.log(`Room created: ${roomId}`);
 
@@ -95,6 +97,7 @@ async function deleteRoom(roomId) {
   rooms.delete(roomId);
   await redis.sRem(REDIS_ROOMS_SET, roomId);
   await redis.hDel(REDIS_ROOM_COUNTS, roomId);
+  await redis.hDel(REDIS_ROOM_SHOW_VIEWS, roomId);
 
   deleteChatRoomService(roomId);
 
@@ -115,6 +118,7 @@ async function deleteAllRooms() {
   await Promise.all([
     redis.del(REDIS_ROOMS_SET),
     redis.del(REDIS_ROOM_COUNTS),
+    redis.del(REDIS_ROOM_SHOW_VIEWS),
     redis.del(REDIS_SOCKET_WEBSITE),
   ]);
 
@@ -238,7 +242,12 @@ async function roomExists(roomId) {
   return exists;
 }
 
-function updateViewsVisibility(data) {
+async function updateViewsVisibility(data) {
+  await redis.hSet(
+    REDIS_ROOM_SHOW_VIEWS,
+    data?.roomId,
+    data?.data?.showViews ? "true" : "false",
+  );
   const io = getIO();
   if (io) {
     io.to(data?.roomId).emit("update_views_visibility", data?.data);
@@ -375,10 +384,14 @@ async function broadcastUserCountUpdates() {
     const exists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
     if (!exists) rooms.delete(roomId); // clean up stale local entry if room is gone
     if (exists) {
-      io.to(roomId).emit("room_user_count_update", {
-        roomId,
-        usersCount,
-      });
+      const showViewsValue = await redis.hGet(REDIS_ROOM_SHOW_VIEWS, roomId);
+      // null means key not set (pre-deploy rooms) — treat as true to preserve existing behaviour
+      if (showViewsValue !== "false") {
+        io.to(roomId).emit("room_user_count_update", {
+          roomId,
+          usersCount,
+        });
+      }
     }
   }
 

@@ -1,4 +1,4 @@
-# Typing Indicator & Message Reactions — Implementation Plan
+# Typing Indicator & Message Reactions — Implementation
 
 ## Overview
 
@@ -12,11 +12,14 @@ Two features across three projects:
 ## 1. TYPING INDICATOR
 
 ### How it works
-- Client emits `typing_start` on keypress (debounced)
-- Client emits `typing_stop` on send or after 1.5s idle
+- Client emits `typing_start` on first `onChange` (not on keypress, not debounced). Sends a heartbeat every 3s to reset the server's 5s auto-clear timer.
+- Client emits `typing_stop` on send or after 1.5s idle (`setTimeout 1500ms` reset on every keystroke)
 - Backend maintains a per-room in-memory `Map<roomId, Map<socketId, { username, timer }>>`
-- On each change, backend broadcasts `user_typing` with the current names array to the whole room
+- Backend broadcasts `user_typing` as a **single-user event** `{ username, isTyping: boolean }` — NOT a names array
+- Each client maintains its own `typingUsers: string[]` array by adding/removing on each event
 - Auto-clears a user after 5s with no `typing_start` (handles tab switch / disconnect without stop event)
+- On disconnect, server clears all typing entries for that socket across all rooms
+- 5-minute background sweep removes entries for abandoned rooms with no connected sockets
 - Admin receives `user_typing` broadcast but never emits typing events
 
 ### Display logic (client + admin)
@@ -25,61 +28,76 @@ Two features across three projects:
 | 0 | nothing |
 | 1 | `guest2 is typing...` |
 | 2 | `guest2 and guest3 are typing...` |
-| 3+ | `guest2, guest3 and 2 others are typing...` |
+| 3+ | `guest2, guest3 and N more are typing...` where N = `names.length - 2` |
 
-Animated `...` using CSS keyframe opacity pulse.
+Animated 3-dot bounce using CSS keyframe (`translateY` + opacity).
+
+### Typing indicator UI
+- **Client**: memoized `TypingIndicator` component, `position: absolute, bottom: 0, left: 0, right: 0` inside the `flex:1 position:relative` messages box. Opacity fade (0.2s). Theme-aware gradient: dark `rgba(0,0,0,0.55)`, light `rgba(255,255,255,1)`. `pointerEvents: none, zIndex: 2`. No layout shift.
+- **Admin**: `position: absolute, top: -22, left: 16` inside the input wrapper `<Box sx={{ px: 2, position: 'relative' }}>`. Floats into the Paper's existing bottom padding. No gradient. Opacity fade (0.2s). No layout shift.
 
 ### Storage
-- **In-memory only** — typing state is ephemeral (1-2s lifespan)
-- Socket.io Redis adapter already broadcasts across all PM2 processes
-- No Redis, no MongoDB changes needed
+- **In-memory only** — typing state is ephemeral
+- Socket.io Redis adapter broadcasts across all PM2 processes
+- No Redis, no MongoDB
 
 ---
 
 ## 2. MESSAGE REACTIONS
 
 ### How it works
-- Every message has a always-visible 😊 `IconButton` on the right side
-- Clicking it opens a small `Popover` with 5 emoji options: 👍 ❤️ 😂 😮 😢
+- Every message has a `+` `IconButton` to open a reaction picker
+- Clicking it opens a `Popover` with 7 emoji options: 👍 👎 ❤️ 😂 😮 😢 😡
 - While the popover is open, **auto-scroll is locked** (via `isPopoverOpenRef`)
 - Clicking an emoji emits `add_reaction` to the backend
+- **Optimistic update**: client updates `messages` state immediately before emitting — no wait for server echo
 - Toggle: clicking your active emoji again removes it
 - Switch: clicking a different emoji replaces your previous one (one reaction per user per message)
-- Reaction counts shown as pills below message content: `👍 3  ❤️ 1`
-- Admin sees reaction pills read-only — no 😊 button, no interaction
+- Reaction pills shown below message content: emoji always shown, count shown only when `users.length > 1` — e.g. `👍` (1 user) vs `👍 3` (3 users)
+- Highlighted (`primary.main`) if the current user reacted with that emoji
+- Typing only emitted for registered users — anonymous users (no `userName`) do not emit `typing_start`/`typing_stop`
+- Admin sees reaction pills read-only — no picker button, no interaction
 
 ### Socket events
 | Event | Direction | Payload |
 |---|---|---|
-| `add_reaction` | client → server | `{ roomId, messageId, emoji }` |
-| `message_reaction_updated` | server → room | `{ messageId, reactions: { "👍": ["u1","u3"], "❤️": ["u2"] } }` |
+| `typing_start` | client → server | `{ roomId, username }` |
+| `typing_stop` | client → server | `{ roomId }` |
+| `user_typing` | server → room | `{ username, isTyping: boolean }` |
+| `add_reaction` | client → server | `{ roomId, messageId, emoji, username }` |
+| `message_reaction_updated` | server → room | `{ messageId, reactions: { emoji: string[] } }` |
 
-### Storage — In-memory batch + MongoDB flush (same pattern as messages)
+### Storage — In-memory batch + MongoDB flush
 
-**In-memory batch** (per process, in `socketHandler.js` or a new `reactionManager.js`):
+**In-memory batch** (in `modules/chat/service.js`):
 ```js
-// Map<messageId, { "👍": Set<username>, "❤️": Set<username> }>
-const reactionBatch = new Map();
+const reactionBatch = new Map(); // Map<messageId, Map<emoji, Set<username>>>
+const dirtyMessageIds = new Set();
+const reactionRetries = new Map(); // retry counter per messageId
+const MAX_REACTION_RETRIES = 10;
 ```
 
 **On `add_reaction` event:**
-1. Get or create entry in `reactionBatch` for `messageId`
-2. Apply toggle/switch logic on the in-memory Sets
+1. Load message reactions from DB into batch on first access for a `messageId`
+2. Apply toggle/switch logic on in-memory Sets
 3. Broadcast `message_reaction_updated` immediately to room
-4. Mark `messageId` as dirty (needs flush)
+4. Mark `messageId` as dirty
 
-**Flush interval** (same cadence as message batch — 1-5s based on perf mode):
+**Flush interval** (fixed at startup — value taken from perf mode at boot time: 1s normal / 3s peak / 5s extreme):
 ```js
-// For each dirty messageId:
-// Message.updateOne({ _id: messageId }, { $set: { reactions: serialized } })
+// Per-emoji $set/$unset — NOT whole-object overwrite
+// Avoids cross-instance conflicts when different PM2 processes flush different emojis
+MessageModel.updateOne({ _id: messageId }, {
+  $set:   { "reactions.👍": ["u1", "u2"] },   // non-empty Sets
+  $unset: { "reactions.😢": "" }               // empty Sets (removed)
+})
 ```
 
-**On message history load** (`fetchChatMessages`):
-- Messages from MongoDB already have `reactions` field
-- No extra lookup needed
+**Retry logic:** if `matchedCount === 0` (message not in DB yet — still in write batch), re-adds to dirty set and retries up to 10 cycles, then discards.
 
-### MongoDB — Message model change
-Add `reactions` field to `messageModel.js`:
+**On message history load:** `reactions` field comes from MongoDB automatically — no extra lookup needed.
+
+### MongoDB — Message model
 ```js
 reactions: {
   type: Map,
@@ -90,112 +108,22 @@ reactions: {
 
 ---
 
-## 3. IMPLEMENTATION STEPS
+## 3. ALLOWED EMOJIS
 
-### Step 1 — Backend (`football-chat-backend`)
+```js
+const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡"];
+```
 
-#### 1a. Message model
-- Add `reactions` field to `messageModel.js`
-
-#### 1b. Typing handler in `socketHandler.js`
-- Add `typingUsers` Map at module level: `Map<roomId, Map<socketId, { username, timer }>>`
-- Listen to `typing_start`:
-  - Add/reset user entry with 5s auto-clear timer
-  - Broadcast `user_typing` with current names array to room (exclude sender)
-- Listen to `typing_stop`:
-  - Remove user entry, clear timer
-  - Broadcast updated `user_typing` to room
-- On `disconnect`:
-  - Remove user from all typing maps, broadcast updates
-
-#### 1c. Reaction handler in `socketHandler.js` (or new `reactionManager.js`)
-- Add `reactionBatch` Map and `dirtyMessageIds` Set at module level
-- Listen to `add_reaction`:
-  - Validate: `roomId`, `messageId`, `emoji` present; emoji in allowed list
-  - Check banned users (same as message handler)
-  - Apply toggle/switch logic on in-memory batch
-  - Broadcast `message_reaction_updated` to room with full reactions object
-  - Mark messageId as dirty
-- Add flush interval (tied to perf mode cadence):
-  - For each dirty messageId, run `Message.updateOne` with serialized reactions
-  - Clear dirty set after flush
-
-#### 1d. History endpoint
-- `fetchChatMessages` — no change needed, `reactions` comes from MongoDB automatically once model is updated
+Validated on the backend — any other emoji is rejected silently. Banned users also rejected.
 
 ---
 
-### Step 2 — Client (`football-next-score8o8` — `chatBox.tsx`)
-
-#### Typing
-- Add `typingUsers` state: `string[]`
-- In `ChatInput`, on every keypress emit `typing_start` to socket (pass socket down or use a ref)
-- Debounce: after 1.5s of no keypress emit `typing_stop`
-- On message send: emit `typing_stop` immediately
-- Listen to `user_typing` → set `typingUsers` state
-- On disconnect/unmount: emit `typing_stop`
-- Render typing indicator between message list and input box:
-  ```
-  guest2 is typing...   (animated dots)
-  ```
-
-#### Reactions
-- Add `isPopoverOpenRef = useRef(false)` — plug into existing smart scroll `useEffect` (already has the check ready from admin pattern)
-- Add `reactionAnchor` state: `{ el: HTMLElement, messageId: string } | null`
-- Add `openReactionPicker(el, messageId)` and `closeReactionPicker()` handlers
-- On `add_reaction` emit: `{ roomId, messageId, emoji }`
-- Listen to `message_reaction_updated` → update that message's reactions in state in-place
-- On message history load: reactions come from MongoDB, already on message objects
-- In message render (`room_message` type):
-  - Add 😊 `IconButton` always visible, right side of message header
-  - Add `Popover` with 5 emoji `IconButton`s: 👍 ❤️ 😂 😮 😢
-  - Add reaction pills below message content if reactions exist
-  - Highlight the pill of the emoji the current user has reacted with
-
----
-
-### Step 3 — Admin (`football-admin` — `chat-table-rows.tsx`)
-
-#### Typing (read-only)
-- Add `typingUsers` state: `string[]`
-- Listen to `user_typing` → set state
-- Render typing indicator same as client (display only)
-
-#### Reactions (read-only)
-- Listen to `message_reaction_updated` → update message reactions in state in-place
-- On message history load: reactions come from MongoDB automatically
-- In `room_message` render: add reaction pills below message content
-- No 😊 button, no Popover, no emit
-
----
-
-## 4. NEW SOCKET EVENTS SUMMARY
-
-| Event | From | To | Payload |
-|---|---|---|---|
-| `typing_start` | client | server | `{ roomId, username }` |
-| `typing_stop` | client | server | `{ roomId, username }` |
-| `user_typing` | server | room | `{ names: string[] }` |
-| `add_reaction` | client | server | `{ roomId, messageId, emoji }` |
-| `message_reaction_updated` | server | room | `{ messageId, reactions: { emoji: string[] } }` |
-
----
-
-## 5. FILES TO CHANGE
+## 4. FILES CHANGED
 
 | File | Changes |
 |---|---|
-| `football-chat-backend/modules/chat/messageModel.js` | Add `reactions` field |
-| `football-chat-backend/socket/socketHandler.js` | Typing handlers + reaction handlers + flush interval |
-| `football-next-score8o8/src/components/chatBox/chatBox.tsx` | Typing emit/display + reaction UI + scroll lock |
+| `football-chat-backend/modules/chat/messageModel.js` | Added `reactions` field |
+| `football-chat-backend/modules/chat/service.js` | Reaction batch, flush, retry logic |
+| `football-chat-backend/socket/socketHandler.js` | Typing handlers + reaction handler |
+| `football-next-score8o8/src/components/chatBox/chatBox.tsx` | Typing emit/display + reaction UI + optimistic update + scroll lock |
 | `football-admin/src/sections/matches/chat-table-rows.tsx` | Typing display + reaction pills read-only |
-
----
-
-## 6. ALLOWED EMOJIS
-
-```js
-const ALLOWED_REACTIONS = ['👍', '❤️', '😂', '😮', '😢'];
-```
-
-Validated on the backend — any other emoji is rejected.

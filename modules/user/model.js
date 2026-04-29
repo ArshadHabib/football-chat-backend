@@ -27,4 +27,6 @@ const userSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+userSchema.index({ ipAddress: 1, isBanned: 1 });
+
 module.exports = mongoose.model("ChatUsers", userSchema);

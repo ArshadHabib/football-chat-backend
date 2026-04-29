@@ -7,22 +7,21 @@ const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL, BANNED_USERS_KEY } = require(
 async function registerUserController(req, res) {
   const { name, clientIp, inComingClientIp } = req?.body;
   try {
-    // 1️⃣ Block banned IP immediately
-    const bannedIpUser = await userService.findBannedUserByIp(
-      inComingClientIp || clientIp
-    );
+    const ip = inComingClientIp || clientIp;
+
+    // 1️⃣ Ban check + username availability in parallel
+    const [bannedIpUser, existingUser] = await Promise.all([
+      userService.findBannedUserByIp(ip),
+      userService.findUserByName(name),
+    ]);
     if (bannedIpUser) {
       return sendError(res, "You are banned from creating new users", 403);
     }
-
-    // 2️⃣ Check username availability
-    const existingUser = await userService.findUserByName(name);
     if (existingUser) {
       return sendError(res, "User name already taken!", 400);
     }
 
-    // 3️⃣ Rate limit check: reject if this IP already registered within the window
-    const ip = inComingClientIp || clientIp;
+    // 2️⃣ Rate limit check: reject if this IP already registered within the window
     if (ip) {
       const existing = await redis.get(`${REG_RATE_LIMIT_PREFIX}${ip}`);
       if (existing !== null) {
@@ -30,8 +29,8 @@ async function registerUserController(req, res) {
       }
     }
 
-    // 4️⃣ Create user — rate limit key set only after this succeeds
-    await userService.createUser(name, inComingClientIp || clientIp);
+    // 3️⃣ Create user — rate limit key set only after this succeeds
+    await userService.createUser(name, ip);
 
     if (ip) {
       await redis.set(`${REG_RATE_LIMIT_PREFIX}${ip}`, "1", {
@@ -92,10 +91,14 @@ async function getUserController(req, res) {
 async function isUserBannedController(req, res) {
   const { name } = req?.body;
   try {
+    const isBannedInRedis = await redis.sIsMember(BANNED_USERS_KEY, name);
+    if (isBannedInRedis) {
+      return sendResponse(res, { isBanned: true, userName: name }, "User Data Retrieved Successfully", 200);
+    }
     const user = await userService.findUserByName(name);
     sendResponse(
       res,
-      { isBanned: user.isBanned, userName: user.name },
+      { isBanned: user?.isBanned ?? false, userName: user?.name ?? name },
       "User Data Retrieved Successfully",
       200
     );

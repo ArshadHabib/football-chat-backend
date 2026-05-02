@@ -7,13 +7,20 @@ const {
   getCurrentPerformanceMode,
 } = require("@project/utils/perfomance_config");
 const { pubClient: redis } = require("@project/config/redis");
+const {
+  REDIS_ROOM_MSG_COUNTS,
+  REDIS_ROOM_LAST_ACTIVITY,
+  REDIS_ROOM_MSG_COUNTS_DRAIN,
+  REDIS_ROOM_LAST_ACTIVITY_DRAIN,
+  DRAIN_LOCK_KEY,
+} = require("@project/utils/const_config");
 
 // === LOCAL SOCKET TRACKING (per-process, for socket.join/leave mechanics) ===
 const rooms = new Map(); // roomId -> Set of local socketIds
 const adminSockets = new Set(); // local admin socket objects (for removeAdmin/isAdmin)
 const socketWebsite = new Map(); // socketId -> websiteName (local cache)
 
-// Redis keys
+// Redis keys local to roomManager (used only here)
 const REDIS_ROOMS_SET = "__rooms__";
 const REDIS_ROOM_COUNTS = "__room_counts__";
 const REDIS_SOCKET_WEBSITE = "__socket_website__";
@@ -98,6 +105,10 @@ async function deleteRoom(roomId) {
   await redis.hDel(REDIS_ROOM_COUNTS, roomId);
   await redis.hDel(REDIS_ROOM_SHOW_VIEWS, roomId);
   await redis.hDel(REDIS_ROOM_LAST_BROADCAST, roomId);
+  // Wipe pending counter-drain entries — prevents the next drain from
+  // upserting (resurrecting) the room doc we just deleted.
+  await redis.hDel(REDIS_ROOM_MSG_COUNTS, roomId);
+  await redis.hDel(REDIS_ROOM_LAST_ACTIVITY, roomId);
 
   deleteChatRoomService(roomId);
 
@@ -120,6 +131,12 @@ async function deleteAllRooms() {
     redis.del(REDIS_ROOM_SHOW_VIEWS),
     redis.del(REDIS_ROOM_LAST_BROADCAST),
     redis.del(REDIS_SOCKET_WEBSITE),
+    // Counter-drain state — admin reset wipes everything cluster-wide.
+    redis.del(REDIS_ROOM_MSG_COUNTS),
+    redis.del(REDIS_ROOM_LAST_ACTIVITY),
+    redis.del(REDIS_ROOM_MSG_COUNTS_DRAIN),
+    redis.del(REDIS_ROOM_LAST_ACTIVITY_DRAIN),
+    redis.del(DRAIN_LOCK_KEY),
   ]);
 
   if (roomIds.length === 0) {

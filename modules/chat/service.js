@@ -2,11 +2,20 @@ const mongoose = require("mongoose");
 const ChatRoomModel = require("./model");
 const MessageModel = require("./messageModel");
 const {
-  BATCH_FLUSH_INTERVAL,
-  MAX_BATCH_SIZE,
   getCurrentPerformanceMode,
 } = require("@project/utils/perfomance_config");
-const { MAX_ROOM_MESSAGES_LIMIT } = require("@project/utils/const_config");
+const {
+  MAX_ROOM_MESSAGES_LIMIT,
+  REDIS_ROOM_MSG_COUNTS,
+  REDIS_ROOM_LAST_ACTIVITY,
+  REDIS_ROOM_MSG_COUNTS_DRAIN,
+  REDIS_ROOM_LAST_ACTIVITY_DRAIN,
+  DRAIN_LOCK_KEY,
+} = require("@project/utils/const_config");
+const { pubClient: redis } = require("@project/config/redis");
+
+// Drain lock TTL floor — only used here, behavior tuning not a Redis key.
+const DRAIN_LOCK_TTL_FLOOR_MS = 10_000;
 
 // Batch message saving
 const messageBatch = new Map();
@@ -17,7 +26,6 @@ async function flushMessageBatch() {
   const allMessages = [];
   const roomUpdates = [];
 
-  // Collect data
   messageBatch.forEach((messages, roomId) => {
     if (messages.length > 0) {
       allMessages.push(...messages);
@@ -26,21 +34,22 @@ async function flushMessageBatch() {
   });
 
   try {
-    // Insert all messages
     if (allMessages.length > 0) {
       await MessageModel.insertMany(allMessages, { ordered: false });
     }
 
-    // Update rooms
-    for (const { roomId, count } of roomUpdates) {
-      await ChatRoomModel.findOneAndUpdate(
-        { roomId },
-        {
-          lastActivity: new Date(),
-          $inc: { messageCount: count },
-        },
-        { upsert: true }
-      );
+    // Counter writes go to Redis instead of MongoDB. The elected drainer
+    // (drainRoomCountersLoop) periodically flushes the accumulated counts
+    // to ChatRoomModel via a single bulkWrite — eliminating same-document
+    // write contention across the 5 PM2 instances.
+    if (roomUpdates.length > 0) {
+      const pipeline = redis.multi();
+      const now = Date.now().toString();
+      for (const { roomId, count } of roomUpdates) {
+        pipeline.hIncrBy(REDIS_ROOM_MSG_COUNTS, roomId, count);
+        pipeline.hSet(REDIS_ROOM_LAST_ACTIVITY, roomId, now);
+      }
+      await pipeline.exec();
     }
 
     console.log(
@@ -53,7 +62,110 @@ async function flushMessageBatch() {
   messageBatch.clear();
 }
 
-setInterval(flushMessageBatch, getCurrentPerformanceMode().settings.batchFlush);
+// Self-rescheduling loop replaces setInterval. Re-reads batchFlush each cycle
+// so live performance-mode changes (POST /change-server-mode) take effect on
+// the next iteration instead of being locked in at module load.
+async function flushMessageBatchLoop() {
+  try {
+    await flushMessageBatch();
+  } catch (err) {
+    console.error("Flush loop error:", err);
+  } finally {
+    const next = getCurrentPerformanceMode().settings.batchFlush;
+    setTimeout(flushMessageBatchLoop, next);
+  }
+}
+flushMessageBatchLoop();
+
+// Drains Redis-accumulated room counters to MongoDB once per batchFlush window.
+// Uses RENAME swap-key pattern: live accumulator atomically renamed into a drain
+// key, bulkWrite to Mongo, then drain key is deleted only on success. Survives
+// crashes — a half-drained snapshot stays in the swap key and the next elected
+// instance resumes from it. No data loss, no double-counting.
+async function drainRoomCounters() {
+  const leftoverExists = await redis.exists(REDIS_ROOM_MSG_COUNTS_DRAIN);
+
+  if (!leftoverExists) {
+    try {
+      await redis.rename(REDIS_ROOM_MSG_COUNTS, REDIS_ROOM_MSG_COUNTS_DRAIN);
+    } catch {
+      return; // source key absent — no pending counter data this cycle
+    }
+    if (await redis.exists(REDIS_ROOM_LAST_ACTIVITY)) {
+      await redis.rename(
+        REDIS_ROOM_LAST_ACTIVITY,
+        REDIS_ROOM_LAST_ACTIVITY_DRAIN,
+      );
+    }
+  }
+
+  const [counts, activities] = await Promise.all([
+    redis.hGetAll(REDIS_ROOM_MSG_COUNTS_DRAIN),
+    redis.hGetAll(REDIS_ROOM_LAST_ACTIVITY_DRAIN),
+  ]);
+
+  const roomIds = Object.keys(counts || {});
+  if (roomIds.length === 0) {
+    await redis.del([
+      REDIS_ROOM_MSG_COUNTS_DRAIN,
+      REDIS_ROOM_LAST_ACTIVITY_DRAIN,
+    ]);
+    return;
+  }
+
+  const ops = roomIds.map((roomId) => ({
+    updateOne: {
+      filter: { roomId },
+      update: {
+        $inc: { messageCount: parseInt(counts[roomId]) || 0 },
+        $set: {
+          lastActivity: new Date(parseInt(activities[roomId]) || Date.now()),
+        },
+      },
+      upsert: true,
+    },
+  }));
+
+  try {
+    await ChatRoomModel.bulkWrite(ops, { ordered: false });
+    await redis.del([
+      REDIS_ROOM_MSG_COUNTS_DRAIN,
+      REDIS_ROOM_LAST_ACTIVITY_DRAIN,
+    ]);
+    console.log(`Drained counters for ${roomIds.length} rooms`);
+  } catch (err) {
+    console.error("Counter drain bulkWrite failed — will retry next cycle:", err);
+    // Swap keys remain intact so the next election retries the same snapshot.
+  }
+}
+
+// Mode-aware drainer loop. Only one instance per cycle wins the NX lock and
+// runs drainRoomCounters; the other 4 return immediately. Re-reads batchFlush
+// each iteration so admin mode changes take effect within one cycle.
+async function drainRoomCountersLoop() {
+  try {
+    const interval = getCurrentPerformanceMode().settings.batchFlush;
+    const lockTtl = Math.max(interval * 2, DRAIN_LOCK_TTL_FLOOR_MS);
+    const won = await redis.set(DRAIN_LOCK_KEY, "1", {
+      NX: true,
+      PX: lockTtl,
+    });
+
+    if (won) {
+      try {
+        await drainRoomCounters();
+      } finally {
+        await redis.del(DRAIN_LOCK_KEY).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.error("Drain loop error:", err);
+  } finally {
+    const next = getCurrentPerformanceMode().settings.batchFlush;
+    setTimeout(drainRoomCountersLoop, next);
+  }
+}
+drainRoomCountersLoop();
 
 // Reaction batch: Map<messageId, Map<emoji, Set<username>>>
 const reactionBatch = new Map();

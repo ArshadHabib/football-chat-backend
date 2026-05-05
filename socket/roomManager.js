@@ -382,7 +382,8 @@ function emitToAdmin(socketId, eventName, data) {
 }
 
 async function scheduleUserCountUpdate(roomId) {
-  const debounceMs = getCurrentPerformanceMode().settings.userCountUpdateDebounce;
+  const debounceMs =
+    getCurrentPerformanceMode().settings.userCountUpdateDebounce;
   const debounceKey = `__user_count_debounce__:${roomId}`;
 
   // Only the first process to set this key within the debounce window broadcasts.
@@ -537,7 +538,7 @@ async function validateCounts(incomingObject = {}) {
 // server.js handles the common case (instance crash/restart). Uncomment to
 // re-enable as a safety net for mid-session drift.
 setInterval(async () => {
-  await validateCounts();
+  await validateCounts({ deleteStaleSockets: true });
 }, 120000);
 
 module.exports = {

@@ -538,7 +538,7 @@ async function validateCounts(incomingObject = {}) {
 // server.js handles the common case (instance crash/restart). Uncomment to
 // re-enable as a safety net for mid-session drift.
 setInterval(async () => {
-  await validateCounts({ deleteStaleSockets: true });
+  await validateCounts();
 }, 120000);
 
 module.exports = {

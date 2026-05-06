@@ -42,6 +42,12 @@ async function getRoomMessagesController(req, res) {
   try {
     const { roomId, noLimit } = req.query;
     const messages = await retrieveRoomMessagesService(roomId, noLimit);
+    // Allow nginx/browser to cache the response for 5s during burst traffic.
+    // Admin requests (noLimit=true) always bypass Redis and hit MongoDB fresh,
+    // so we only set the cache header for the standard user path.
+    if (!noLimit) {
+      res.set("Cache-Control", "public, max-age=5");
+    }
     return sendResponse(
       res,
       messages,

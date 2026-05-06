@@ -11,6 +11,10 @@ const {
   REDIS_ROOM_MSG_COUNTS_DRAIN,
   REDIS_ROOM_LAST_ACTIVITY_DRAIN,
   DRAIN_LOCK_KEY,
+  REDIS_MSG_CACHE_PREFIX,
+  REDIS_PINNED_MSG_PREFIX,
+  MSG_CACHE_LIMIT,
+  PINNED_MSG_CACHE_TTL,
 } = require("@project/utils/const_config");
 const { pubClient: redis } = require("@project/config/redis");
 
@@ -175,6 +179,43 @@ const dirtyMessageIds = new Set();
 const reactionRetries = new Map();
 const MAX_REACTION_RETRIES = 10;
 
+// Lua script: atomically finds the message by _id in the sorted set and
+// patches its reactions field. Running in Lua ensures the ZRANGE → ZREM → ZADD
+// sequence is never interleaved with a concurrent flush from another PM2 instance,
+// which would otherwise produce duplicate entries for the same message.
+const REACTION_SORTED_SET_SCRIPT = `
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+for i, val in ipairs(members) do
+  local ok, decoded = pcall(cjson.decode, val)
+  if ok and tostring(decoded['_id']) == ARGV[1] then
+    local score = redis.call('ZSCORE', KEYS[1], val)
+    local ok2, newReactions = pcall(cjson.decode, ARGV[2])
+    if ok2 then decoded['reactions'] = newReactions end
+    redis.call('ZREM', KEYS[1], val)
+    redis.call('ZADD', KEYS[1], tonumber(score), cjson.encode(decoded))
+    return 1
+  end
+end
+return 0
+`;
+
+// Accepts canonical reactions from MongoDB (plain object) so the sorted set
+// always reflects the true merged state, not just one instance's batch.
+async function updateReactionInSortedSet(roomId, messageId, reactionsFromDb) {
+  const serialized = {};
+  if (reactionsFromDb) {
+    for (const [emoji, users] of Object.entries(reactionsFromDb)) {
+      if (users.length > 0) serialized[emoji] = users;
+    }
+  }
+  await redis
+    .eval(REACTION_SORTED_SET_SCRIPT, {
+      keys: [`${REDIS_MSG_CACHE_PREFIX}${roomId}`],
+      arguments: [String(messageId), JSON.stringify(serialized)],
+    })
+    .catch(() => {});
+}
+
 async function flushReactionBatch() {
   if (dirtyMessageIds.size === 0) return;
   const ids = Array.from(dirtyMessageIds);
@@ -214,6 +255,20 @@ async function flushReactionBatch() {
         if (!dirtyMessageIds.has(messageId)) {
           reactionBatch.delete(messageId);
         }
+        // Re-read from MongoDB to get the canonical merged reactions (all PM2
+        // instances write their own reactions via $set patches; the findById here
+        // sees the combined result). This value — not the in-memory batch — is
+        // what goes into the sorted set, so concurrent flushes converge correctly.
+        const canonical = await MessageModel.findById(messageId)
+          .select("reactions roomId")
+          .lean();
+        if (canonical?.roomId) {
+          await updateReactionInSortedSet(
+            String(canonical.roomId),
+            messageId,
+            canonical.reactions,
+          );
+        }
       }
     } catch (err) {
       // Re-add to dirty set so the next flush retries this messageId
@@ -223,7 +278,17 @@ async function flushReactionBatch() {
   }
 }
 
-setInterval(flushReactionBatch, getCurrentPerformanceMode().settings.batchFlush);
+async function flushReactionBatchLoop() {
+  try {
+    await flushReactionBatch();
+  } catch (err) {
+    console.error("Reaction flush loop error:", err);
+  } finally {
+    const next = getCurrentPerformanceMode().settings.batchFlush;
+    setTimeout(flushReactionBatchLoop, next);
+  }
+}
+flushReactionBatchLoop();
 
 // Returns serialized reactions object after applying toggle/switch logic.
 // Loads from DB into batch on first access for a given messageId.
@@ -281,6 +346,24 @@ async function saveChatMessageService(roomId, messageData) {
     ...messageData,
     timestamp: new Date(),
   };
+
+  // Write to sorted set cache immediately so history loads reflect the latest
+  // messages without waiting for the batch flush to hit MongoDB.
+  const cacheKey = `${REDIS_MSG_CACHE_PREFIX}${roomId}`;
+  const cachePipeline = redis.multi();
+  cachePipeline.zAdd(cacheKey, {
+    score: message.timestamp.getTime(),
+    value: JSON.stringify(message),
+  });
+  cachePipeline.zRemRangeByRank(cacheKey, 0, -(MSG_CACHE_LIMIT + 1));
+  if (message.isPinned) {
+    cachePipeline.set(
+      `${REDIS_PINNED_MSG_PREFIX}${roomId}`,
+      JSON.stringify(message),
+      { EX: PINNED_MSG_CACHE_TTL },
+    );
+  }
+  await cachePipeline.exec().catch((err) => console.error("Cache write error:", err));
 
   if (!messageBatch.has(roomId)) {
     messageBatch.set(roomId, []);
@@ -365,50 +448,91 @@ async function deleteAllDBChatRoomService() {
   }
 }
 
+// Per-instance coalescing map: roomId → Promise<messages[]>
+// Thousands of simultaneous cache misses on the same instance share one MongoDB query.
+const cachePopulationInFlight = new Map();
+
+async function getRecentMessagesWithCache(roomId, limit) {
+  const cacheKey = `${REDIS_MSG_CACHE_PREFIX}${roomId}`;
+
+  const cached = await redis.zRange(cacheKey, 0, -1);
+  if (cached.length > 0) {
+    return cached.map((s) => JSON.parse(s));
+  }
+
+  if (cachePopulationInFlight.has(roomId)) {
+    return await cachePopulationInFlight.get(roomId);
+  }
+
+  const populatePromise = (async () => {
+    const messages = await MessageModel.find({ roomId })
+      .sort({ timestamp: -1 })
+      .limit(limit)
+      .lean();
+
+    if (messages.length > 0) {
+      const pipeline = redis.multi();
+      for (const msg of messages) {
+        pipeline.zAdd(cacheKey, {
+          score: new Date(msg.timestamp).getTime(),
+          value: JSON.stringify(msg),
+        });
+      }
+      pipeline.zRemRangeByRank(cacheKey, 0, -(MSG_CACHE_LIMIT + 1));
+      await pipeline.exec().catch((err) => console.error("Cache seed error:", err));
+    }
+
+    return messages.reverse();
+  })();
+
+  cachePopulationInFlight.set(roomId, populatePromise);
+  populatePromise.finally(() => cachePopulationInFlight.delete(roomId));
+
+  return await populatePromise;
+}
+
 async function retrieveRoomMessagesService(roomId, noLimit, options = {}) {
   try {
-    const {
-      limit = 200,
-      skip = 0,
-      before = new Date(), // For pagination
-    } = options;
-    let messages = [];
-    let pinnedMessage = null;
+    const { limit = 50 } = options;
 
     if (noLimit) {
-      messages = await MessageModel.find({
-        roomId,
-      })
+      // Admin path — always fresh from MongoDB
+      const messages = await MessageModel.find({ roomId })
         .sort({ timestamp: -1 })
         .limit(MAX_ROOM_MESSAGES_LIMIT)
         .lean();
+      return { messages: messages?.reverse(), pinnedMessage: null };
+    }
+
+    // Standard user path — Redis first
+    const messages = await getRecentMessagesWithCache(roomId, limit);
+
+    // Pinned message — short-TTL Redis cache
+    let pinnedMessage = null;
+    const pinnedKey = `${REDIS_PINNED_MSG_PREFIX}${roomId}`;
+    const cachedPinned = await redis.get(pinnedKey);
+
+    if (cachedPinned !== null) {
+      pinnedMessage = cachedPinned === "null" ? null : JSON.parse(cachedPinned);
     } else {
-      messages = await MessageModel.find({
-        roomId,
-        timestamp: { $lt: before },
-      })
-        .sort({ timestamp: -1 })
-        .limit(limit)
-        .skip(skip)
-        .lean();
-      pinnedMessage = await MessageModel.find({
-        roomId,
-        isPinned: true,
-      })
+      const pinnedResult = await MessageModel.find({ roomId, isPinned: true })
         .sort({ timestamp: -1 })
         .limit(1)
         .lean();
+      pinnedMessage = pinnedResult?.[0] ?? null;
+      await redis
+        .set(pinnedKey, JSON.stringify(pinnedMessage ?? null), {
+          EX: PINNED_MSG_CACHE_TTL,
+        })
+        .catch(() => {});
     }
 
-    console.log(`Retrieved ${messages?.length} messages from room: ${roomId}`);
-    return {
-      messages: messages?.reverse(),
-      pinnedMessage: pinnedMessage ? pinnedMessage[0] : null,
-    };
+    console.log(`Retrieved ${messages.length} messages from room: ${roomId}`);
+    return { messages, pinnedMessage };
   } catch (error) {
     console.error(
       `Error retrieving messages from room ${roomId}:`,
-      error.message
+      error.message,
     );
     return [];
   }

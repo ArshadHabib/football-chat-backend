@@ -2,26 +2,28 @@ const userService = require("./service");
 const { sendResponse, sendError, generateToken } = require("@project/utils");
 const { broadcastBanToAllRooms } = require("@project/socket/roomManager");
 const { pubClient: redis } = require("@project/config/redis");
-const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL, BANNED_USERS_KEY } = require("@project/utils/const_config");
+const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL, BANNED_USERS_KEY, BANNED_IPS_KEY } = require("@project/utils/const_config");
 
 async function registerUserController(req, res) {
   const { name, clientIp, inComingClientIp } = req?.body;
   try {
     const ip = inComingClientIp || clientIp;
 
-    // 1️⃣ Ban check + username availability in parallel
-    const [bannedIpUser, existingUser] = await Promise.all([
-      userService.findBannedUserByIp(ip),
-      userService.findUserByName(name),
-    ]);
-    if (bannedIpUser) {
-      return sendError(res, "You are banned from creating new users", 403);
+    // 1️⃣ IP ban check via Redis (warm at startup, updated on every ban action)
+    if (ip) {
+      const ipBanned = await redis.sIsMember(BANNED_IPS_KEY, ip);
+      if (ipBanned) {
+        return sendError(res, "You are banned from creating new users", 403);
+      }
     }
+
+    // 2️⃣ Username availability — MongoDB (no Redis equivalent for all usernames)
+    const existingUser = await userService.findUserByName(name);
     if (existingUser) {
       return sendError(res, "User name already taken!", 400);
     }
 
-    // 2️⃣ Rate limit check: reject if this IP already registered within the window
+    // 3️⃣ Rate limit check: reject if this IP already registered within the window
     if (ip) {
       const existing = await redis.get(`${REG_RATE_LIMIT_PREFIX}${ip}`);
       if (existing !== null) {
@@ -29,7 +31,7 @@ async function registerUserController(req, res) {
       }
     }
 
-    // 3️⃣ Create user — rate limit key set only after this succeeds
+    // 4️⃣ Create user — rate limit key set only after this succeeds
     await userService.createUser(name, ip);
 
     if (ip) {
@@ -53,7 +55,10 @@ async function updateUser(req, res) {
     if (ipAddress && isBanned === true) {
       const bannedNames = await userService.banAllUsersByIp(ipAddress);
       if (bannedNames.length > 0) {
-        await redis.sAdd(BANNED_USERS_KEY, bannedNames);
+        const pipeline = redis.multi();
+        pipeline.sAdd(BANNED_USERS_KEY, bannedNames);
+        pipeline.sAdd(BANNED_IPS_KEY, ipAddress);
+        await pipeline.exec();
         await broadcastBanToAllRooms(bannedNames);
       }
       return sendResponse(res, null, "Users Banned Successfully", 200);
@@ -68,8 +73,11 @@ async function updateUser(req, res) {
 
     if (isBanned === true) {
       await redis.sAdd(BANNED_USERS_KEY, name);
+      if (user.ipAddress) await redis.sAdd(BANNED_IPS_KEY, user.ipAddress);
     } else {
       await redis.sRem(BANNED_USERS_KEY, name);
+      // Do NOT remove from BANNED_IPS_KEY — other accounts on the same IP may
+      // still be banned. IP removal requires an explicit IP-level ban action.
     }
 
     sendResponse(res, null, "User Data Updated Successfully", 200);
@@ -91,16 +99,14 @@ async function getUserController(req, res) {
 async function isUserBannedController(req, res) {
   const { name } = req?.body;
   try {
-    const isBannedInRedis = await redis.sIsMember(BANNED_USERS_KEY, name);
-    if (isBannedInRedis) {
-      return sendResponse(res, { isBanned: true, userName: name }, "User Data Retrieved Successfully", 200);
-    }
-    const user = await userService.findUserByName(name);
-    sendResponse(
+    // BANNED_USERS_KEY is the source of truth — warm at startup, kept in sync
+    // on every ban/unban. No MongoDB fallback needed.
+    const isBanned = !!(await redis.sIsMember(BANNED_USERS_KEY, name));
+    return sendResponse(
       res,
-      { isBanned: user?.isBanned ?? false, userName: user?.name ?? name },
+      { isBanned, userName: name },
       "User Data Retrieved Successfully",
-      200
+      200,
     );
   } catch (error) {
     sendError(res, "Internal server error", 500);

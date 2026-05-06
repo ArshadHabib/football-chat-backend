@@ -13,6 +13,8 @@ const {
   REDIS_ROOM_MSG_COUNTS_DRAIN,
   REDIS_ROOM_LAST_ACTIVITY_DRAIN,
   DRAIN_LOCK_KEY,
+  REDIS_MSG_CACHE_PREFIX,
+  REDIS_PINNED_MSG_PREFIX,
 } = require("@project/utils/const_config");
 
 // === LOCAL SOCKET TRACKING (per-process, for socket.join/leave mechanics) ===
@@ -109,6 +111,9 @@ async function deleteRoom(roomId) {
   // upserting (resurrecting) the room doc we just deleted.
   await redis.hDel(REDIS_ROOM_MSG_COUNTS, roomId);
   await redis.hDel(REDIS_ROOM_LAST_ACTIVITY, roomId);
+  // Wipe read-path caches for this room.
+  await redis.del(`${REDIS_MSG_CACHE_PREFIX}${roomId}`);
+  await redis.del(`${REDIS_PINNED_MSG_PREFIX}${roomId}`);
 
   deleteChatRoomService(roomId);
 
@@ -138,6 +143,16 @@ async function deleteAllRooms() {
     redis.del(REDIS_ROOM_LAST_ACTIVITY_DRAIN),
     redis.del(DRAIN_LOCK_KEY),
   ]);
+
+  // Wipe per-room read-path caches using the roomIds already fetched above.
+  if (roomIds.length > 0) {
+    await Promise.all(
+      roomIds.flatMap((id) => [
+        redis.del(`${REDIS_MSG_CACHE_PREFIX}${id}`),
+        redis.del(`${REDIS_PINNED_MSG_PREFIX}${id}`),
+      ]),
+    );
+  }
 
   if (roomIds.length === 0) {
     console.log("No Socket Rooms to Delete!");

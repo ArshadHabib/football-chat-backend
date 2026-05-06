@@ -24,6 +24,7 @@ const {
 } = require("@project/config/redis");
 const { setPerformanceMode } = require("@project/utils/perfomance_config");
 const { validateCounts } = require("@project/socket/roomManager");
+const { warmBanCaches } = require("@project/modules/user/warmup");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -89,6 +90,16 @@ app.get("/", (req, res) => {
     // a previously crashed/restarted instance within seconds of this process
     // booting, instead of waiting for the 2-minute periodic validation.
     await validateCounts({ deleteStaleSockets: true });
+
+    // Seed ban Sets from MongoDB before accepting traffic.
+    await warmBanCaches();
+    // Re-warm on Redis reconnect (Redis crash while PM2 stays running).
+    // Registered after connectRedis() so only catches future reconnects.
+    pubClient.on("ready", () => {
+      warmBanCaches().catch((err) =>
+        console.error("Ban cache re-warm failed:", err),
+      );
+    });
 
     server.listen(PORT, async () => {
       console.log(`Server is running on http://localhost:${PORT}`);

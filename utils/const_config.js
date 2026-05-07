@@ -26,6 +26,12 @@ const PINNED_MSG_CACHE_TTL = 30; // seconds
 // IP ban set (mirrors isBanned: true records in MongoDB)
 const BANNED_IPS_KEY = "__banned_ips__";
 
+// Shared Redis key for the rooms set — used by socketHandler.js pipeline (Issue 2 fix)
+const REDIS_ROOMS_SET = "__rooms__";
+
+// Website-level user counter — one entry per distinct websiteName (replaces hGetAll on socket map)
+const REDIS_WEBSITE_COUNTS = "__website_counts__";
+
 module.exports = {
   ADMIN_KEY,
   MINUTES_BEFORE_MATCH_TO_SCRAP,
@@ -43,4 +49,6 @@ module.exports = {
   REDIS_PINNED_MSG_PREFIX,
   MSG_CACHE_LIMIT,
   PINNED_MSG_CACHE_TTL,
+  REDIS_ROOMS_SET,
+  REDIS_WEBSITE_COUNTS,
 };

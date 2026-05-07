@@ -127,7 +127,6 @@ const attachClientIp = (req, res, next) => {
     req.clientIp = ip;
     req.body.clientIp = ip;
 
-    console.log("Client IP:", ip);
     next();
   } catch (error) {
     console.error("IP middleware error:", error);

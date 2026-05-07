@@ -56,9 +56,6 @@ async function flushMessageBatch() {
       await pipeline.exec();
     }
 
-    console.log(
-      `Flushed ${allMessages.length} messages to ${roomUpdates.length} rooms`
-    );
   } catch (error) {
     console.error("Batch flush error:", error);
   }
@@ -136,7 +133,6 @@ async function drainRoomCounters() {
       REDIS_ROOM_MSG_COUNTS_DRAIN,
       REDIS_ROOM_LAST_ACTIVITY_DRAIN,
     ]);
-    console.log(`Drained counters for ${roomIds.length} rooms`);
   } catch (err) {
     console.error("Counter drain bulkWrite failed — will retry next cycle:", err);
     // Swap keys remain intact so the next election retries the same snapshot.
@@ -341,7 +337,6 @@ async function applyReactionService(messageId, emoji, username) {
 
 async function saveChatMessageService(roomId, messageData) {
   const message = {
-    _id: new mongoose.Types.ObjectId(),
     roomId,
     ...messageData,
     timestamp: new Date(),
@@ -403,20 +398,6 @@ async function createChatRoomService(roomId) {
   } catch (error) {
     console.error(`Error creating chat room ${roomId}:`, error.message);
     return false;
-  }
-}
-
-async function deleteChatRoomService(roomId) {
-  try {
-    const deletedRoom = await ChatRoomModel.findOneAndDelete({ roomId });
-    if (!deletedRoom) {
-      console.error(`DB Chat room with roomId '${roomId}' not found`);
-      return null;
-    }
-    console.log(`DB Chat room deleted successfully with roomId: ${roomId}`);
-    return true;
-  } catch (error) {
-    return null;
   }
 }
 
@@ -527,7 +508,6 @@ async function retrieveRoomMessagesService(roomId, noLimit, options = {}) {
         .catch(() => {});
     }
 
-    console.log(`Retrieved ${messages.length} messages from room: ${roomId}`);
     return { messages, pinnedMessage };
   } catch (error) {
     console.error(

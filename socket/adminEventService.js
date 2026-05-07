@@ -23,7 +23,6 @@ function processEventBatch() {
     if (result > 0) sentCount++;
   });
 
-  console.log(`Processed ${batch.length} events, sent ${sentCount}`);
 
   // Schedule next batch if there are more events
   if (eventQueue.length > 0) {

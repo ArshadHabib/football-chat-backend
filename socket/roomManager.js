@@ -15,6 +15,8 @@ const {
   DRAIN_LOCK_KEY,
   REDIS_MSG_CACHE_PREFIX,
   REDIS_PINNED_MSG_PREFIX,
+  REDIS_ROOMS_SET,
+  REDIS_WEBSITE_COUNTS,
 } = require("@project/utils/const_config");
 
 // === LOCAL SOCKET TRACKING (per-process, for socket.join/leave mechanics) ===
@@ -23,15 +25,13 @@ const adminSockets = new Set(); // local admin socket objects (for removeAdmin/i
 const socketWebsite = new Map(); // socketId -> websiteName (local cache)
 
 // Redis keys local to roomManager (used only here)
-const REDIS_ROOMS_SET = "__rooms__";
 const REDIS_ROOM_COUNTS = "__room_counts__";
 const REDIS_SOCKET_WEBSITE = "__socket_website__";
 const REDIS_ROOM_SHOW_VIEWS = "__room_show_views__";
 const REDIS_ROOM_LAST_BROADCAST = "__room_last_broadcast__";
 
-// Cache and debouncing
+// Cache
 let cachedRoomData = null;
-let adminUpdateTimeout = null;
 
 // === DERIVED COUNTERS — all read from Redis (cross-process truth) ===
 
@@ -48,12 +48,10 @@ async function getUsersPerRoom() {
 }
 
 async function getUsersPerWebsite() {
-  const websiteMap = await redis.hGetAll(REDIS_SOCKET_WEBSITE);
-  const counts = {};
-  Object.values(websiteMap).forEach((site) => {
-    if (site) counts[site] = (counts[site] || 0) + 1;
-  });
-  return counts;
+  const counts = await redis.hGetAll(REDIS_WEBSITE_COUNTS);
+  return Object.fromEntries(
+    Object.entries(counts).map(([k, v]) => [k, parseInt(v) || 0]),
+  );
 }
 
 function getRoomUserCount(roomId) {
@@ -68,9 +66,11 @@ async function createRoom(roomId, showViews = true) {
   }
 
   rooms.set(roomId, new Set());
-  await redis.sAdd(REDIS_ROOMS_SET, roomId);
-  await redis.hSet(REDIS_ROOM_COUNTS, roomId, "0");
-  await redis.hSet(REDIS_ROOM_SHOW_VIEWS, roomId, showViews ? "true" : "false");
+  const createPipeline = redis.multi();
+  createPipeline.sAdd(REDIS_ROOMS_SET, roomId);
+  createPipeline.hSet(REDIS_ROOM_COUNTS, roomId, "0");
+  createPipeline.hSet(REDIS_ROOM_SHOW_VIEWS, roomId, showViews ? "true" : "false");
+  await createPipeline.exec();
 
   console.log(`Room created: ${roomId}`);
 
@@ -89,31 +89,56 @@ async function deleteRoom(roomId) {
   const io = getIO();
 
   // Fetch ALL socket IDs in this room across all processes via the Redis adapter
-  // then clean up their website tracking entries in one pipeline
   const allSocketIds = io ? await io.in(roomId).allSockets() : new Set();
+  const socketIdArray = [...allSocketIds];
+
+  // Read website names before deleting so REDIS_WEBSITE_COUNTS can be decremented
+  // correctly. hmGet returns values in the same order as the input keys.
+  const websiteNames = socketIdArray.length > 0
+    ? await redis.hmGet(REDIS_SOCKET_WEBSITE, socketIdArray)
+    : [];
+  const websiteDecrements = {};
+  websiteNames.forEach((site) => {
+    if (site) websiteDecrements[site] = (websiteDecrements[site] || 0) + 1;
+  });
+
   const pipeline = redis.multi();
-  allSocketIds.forEach((socketId) => {
-    socketWebsite.delete(socketId); // clean local cache too
+  socketIdArray.forEach((socketId) => {
+    socketWebsite.delete(socketId);
     pipeline.hDel(REDIS_SOCKET_WEBSITE, socketId);
   });
-  await pipeline.exec();
+  const websiteDecrementEntries = Object.entries(websiteDecrements);
+  for (const [site, count] of websiteDecrementEntries) {
+    pipeline.hIncrBy(REDIS_WEBSITE_COUNTS, site, -count);
+  }
+  const socketCleanupResults = await pipeline.exec();
+  // Floor-clamp any WEBSITE_COUNTS that went negative (double-decrement race
+  // between deleteRoom and a simultaneous leaveRoom on the same socket).
+  for (let i = 0; i < websiteDecrementEntries.length; i++) {
+    const [site] = websiteDecrementEntries[i];
+    const webCount = parseInt(socketCleanupResults[socketIdArray.length + i]) || 0;
+    if (webCount < 0) await redis.hSet(REDIS_WEBSITE_COUNTS, site, "0");
+  }
 
   if (io) {
     io.to(roomId).emit("room_deleted", { roomId });
   }
 
   rooms.delete(roomId);
-  await redis.sRem(REDIS_ROOMS_SET, roomId);
-  await redis.hDel(REDIS_ROOM_COUNTS, roomId);
-  await redis.hDel(REDIS_ROOM_SHOW_VIEWS, roomId);
-  await redis.hDel(REDIS_ROOM_LAST_BROADCAST, roomId);
+  // Pipeline all cleanup writes — all are independent.
+  const cleanupPipeline = redis.multi();
+  cleanupPipeline.sRem(REDIS_ROOMS_SET, roomId);
+  cleanupPipeline.hDel(REDIS_ROOM_COUNTS, roomId);
+  cleanupPipeline.hDel(REDIS_ROOM_SHOW_VIEWS, roomId);
+  cleanupPipeline.hDel(REDIS_ROOM_LAST_BROADCAST, roomId);
   // Wipe pending counter-drain entries — prevents the next drain from
   // upserting (resurrecting) the room doc we just deleted.
-  await redis.hDel(REDIS_ROOM_MSG_COUNTS, roomId);
-  await redis.hDel(REDIS_ROOM_LAST_ACTIVITY, roomId);
+  cleanupPipeline.hDel(REDIS_ROOM_MSG_COUNTS, roomId);
+  cleanupPipeline.hDel(REDIS_ROOM_LAST_ACTIVITY, roomId);
   // Wipe read-path caches for this room.
-  await redis.del(`${REDIS_MSG_CACHE_PREFIX}${roomId}`);
-  await redis.del(`${REDIS_PINNED_MSG_PREFIX}${roomId}`);
+  cleanupPipeline.del(`${REDIS_MSG_CACHE_PREFIX}${roomId}`);
+  cleanupPipeline.del(`${REDIS_PINNED_MSG_PREFIX}${roomId}`);
+  await cleanupPipeline.exec();
 
   deleteChatRoomService(roomId);
 
@@ -136,6 +161,7 @@ async function deleteAllRooms() {
     redis.del(REDIS_ROOM_SHOW_VIEWS),
     redis.del(REDIS_ROOM_LAST_BROADCAST),
     redis.del(REDIS_SOCKET_WEBSITE),
+    redis.del(REDIS_WEBSITE_COUNTS),
     // Counter-drain state — admin reset wipes everything cluster-wide.
     redis.del(REDIS_ROOM_MSG_COUNTS),
     redis.del(REDIS_ROOM_LAST_ACTIVITY),
@@ -182,7 +208,12 @@ async function deleteAllRooms() {
 }
 
 async function joinRoom(roomId, socket, senderName, websiteName) {
-  const existsInRedis = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+  // Step 1: parallel reads — no dependency on each other
+  const [existsInRedis, showViewsValue] = await Promise.all([
+    redis.sIsMember(REDIS_ROOMS_SET, roomId),
+    redis.hGet(REDIS_ROOM_SHOW_VIEWS, roomId),
+  ]);
+
   if (!existsInRedis) {
     return { success: false, message: "Room does not exist" };
   }
@@ -195,31 +226,36 @@ async function joinRoom(roomId, socket, senderName, websiteName) {
   const socketIds = rooms.get(roomId);
   const isNewJoin = !socketIds.has(socket.id);
   socketIds.add(socket.id);
-
-  // Store room ID for this socket
   socket.roomId = roomId;
+  if (websiteName) socket.websiteName = websiteName;
 
-  // Store website name locally and in Redis
+  // Step 2: pipeline writes — hSet + count + website counter in one round trip
+  const joinPipeline = redis.multi();
+  let countIdx = 0;
   if (websiteName) {
     socketWebsite.set(socket.id, websiteName);
-    await redis.hSet(REDIS_SOCKET_WEBSITE, socket.id, websiteName);
-  }
-
-  socket.join(roomId);
-
-  let count;
-  if (isNewJoin) {
-    count = await redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1);
+    joinPipeline.hSet(REDIS_SOCKET_WEBSITE, socket.id, websiteName); // [0]
+    countIdx = 1;
+    if (isNewJoin) {
+      joinPipeline.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1);            // [1]
+      joinPipeline.hIncrBy(REDIS_WEBSITE_COUNTS, websiteName, 1);    // [2]
+    } else {
+      joinPipeline.hGet(REDIS_ROOM_COUNTS, roomId);                  // [1]
+    }
   } else {
-    count = parseInt(await redis.hGet(REDIS_ROOM_COUNTS, roomId)) || 0;
+    if (isNewJoin) {
+      joinPipeline.hIncrBy(REDIS_ROOM_COUNTS, roomId, 1);            // [0]
+    } else {
+      joinPipeline.hGet(REDIS_ROOM_COUNTS, roomId);                  // [0]
+    }
   }
+  socket.join(roomId);
+  const joinResults = await joinPipeline.exec();
+  const count = parseInt(joinResults[countIdx]) || 0;
 
-  invalidateCache();
   scheduleAdminRoomUpdate();
 
-  const showViewsValue = await redis.hGet(REDIS_ROOM_SHOW_VIEWS, roomId);
   const showViews = showViewsValue !== "false";
-
   return {
     success: true,
     roomId,
@@ -235,27 +271,39 @@ async function leaveRoom(socket) {
   if (rooms.has(roomId)) {
     const socketIds = rooms.get(roomId);
     socketIds.delete(socket.id);
+    if (socketIds.size === 0) rooms.delete(roomId);
   }
 
-  // Clean up website data locally and in Redis
+  // Save website name before cleanup — socket.websiteName set at join time
+  const websiteName = socket.websiteName || socketWebsite.get(socket.id);
   socketWebsite.delete(socket.id);
-  await redis.hDel(REDIS_SOCKET_WEBSITE, socket.id);
-
   socket.leave(roomId);
   socket.roomId = null;
 
-  // Decrement Redis counter only if room still exists
-  const roomStillExists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+  // Step 1: pipeline hDel + sIsMember — independent operations
+  const leavePipeline = redis.multi();
+  leavePipeline.hDel(REDIS_SOCKET_WEBSITE, socket.id);
+  leavePipeline.sIsMember(REDIS_ROOMS_SET, roomId);
+  const [, roomStillExists] = await leavePipeline.exec();
+
+  // Step 2: conditional decrements — room count + website counter in one pipeline
   let count = 0;
   if (roomStillExists) {
-    count = await redis.hIncrBy(REDIS_ROOM_COUNTS, roomId, -1);
+    const decrPipeline = redis.multi();
+    decrPipeline.hIncrBy(REDIS_ROOM_COUNTS, roomId, -1);
+    if (websiteName) decrPipeline.hIncrBy(REDIS_WEBSITE_COUNTS, websiteName, -1);
+    const decrResults = await decrPipeline.exec();
+    count = parseInt(decrResults[0]) || 0;
     if (count < 0) {
       await redis.hSet(REDIS_ROOM_COUNTS, roomId, "0");
       count = 0;
     }
+    if (websiteName) {
+      const webCount = parseInt(decrResults[1]) || 0;
+      if (webCount < 0) await redis.hSet(REDIS_WEBSITE_COUNTS, websiteName, "0");
+    }
   }
 
-  invalidateCache();
   scheduleAdminRoomUpdate();
 
   return {
@@ -305,15 +353,19 @@ function removeAdmin(socket) {
   // socket.leave("__admins__") is handled automatically by Socket.io on disconnect
 }
 
-function scheduleAdminRoomUpdate() {
-  if (adminUpdateTimeout) {
-    clearTimeout(adminUpdateTimeout);
-  }
+async function scheduleAdminRoomUpdate() {
+  // Cluster-wide throttle via Redis NX key — only one instance across all 5
+  // PM2 processes fires the update per 2 s window. Other instances skip.
+  // Uses same pattern as scheduleUserCountUpdate.
+  const won = await redis.set("__admin_update_throttle__", "1", {
+    NX: true,
+    PX: 2000,
+  });
+  if (!won) return;
 
-  // Always fire immediately regardless of performance mode — admins get real-time updates
-  adminUpdateTimeout = setTimeout(async () => {
+  setTimeout(async () => {
     await notifyAdminRoomUpdate();
-  }, 0);
+  }, 2000);
 }
 
 async function notifyAdminRoomUpdate() {
@@ -323,8 +375,6 @@ async function notifyAdminRoomUpdate() {
   const roomData = await getCachedRoomData();
   // io.to("__admins__") reaches ALL admin sockets across all 6 processes via Redis adapter
   io.to("__admins__").emit("admin_room_update", roomData);
-
-  console.log(`Admin room update sent to __admins__ room`);
 }
 
 // Smart caching
@@ -410,19 +460,19 @@ async function scheduleUserCountUpdate(roomId) {
     const io = getIO();
     if (!io) return;
 
-    const exists = await redis.sIsMember(REDIS_ROOMS_SET, roomId);
+    // All 4 reads are independent — one pipeline RTT instead of 3 serial groups.
+    const checkPipeline = redis.multi();
+    checkPipeline.sIsMember(REDIS_ROOMS_SET, roomId);       // [0]
+    checkPipeline.hGet(REDIS_ROOM_SHOW_VIEWS, roomId);      // [1]
+    checkPipeline.hGet(REDIS_ROOM_COUNTS, roomId);          // [2]
+    checkPipeline.hGet(REDIS_ROOM_LAST_BROADCAST, roomId);  // [3]
+    const [exists, showViewsValue, countRaw, lastBroadcastRaw] = await checkPipeline.exec();
+
     if (!exists) {
       rooms.delete(roomId);
       return;
     }
-
-    const showViewsValue = await redis.hGet(REDIS_ROOM_SHOW_VIEWS, roomId);
     if (showViewsValue === "false") return;
-
-    const [countRaw, lastBroadcastRaw] = await Promise.all([
-      redis.hGet(REDIS_ROOM_COUNTS, roomId),
-      redis.hGet(REDIS_ROOM_LAST_BROADCAST, roomId),
-    ]);
     const count = parseInt(countRaw) || 0;
     const lastBroadcast = parseInt(lastBroadcastRaw) || 0;
     if (count === lastBroadcast) return;
@@ -494,23 +544,47 @@ async function validateCounts(incomingObject = {}) {
         );
       }
 
+      // Rebuild REDIS_WEBSITE_COUNTS from live entries — websiteEntries and
+      // liveSocketIds are already in memory from the Promise.all above, so
+      // no extra Redis round trip needed. Handles crash/restart drift.
+      const websiteCounts = {};
+      Object.entries(websiteEntries).forEach(([socketId, site]) => {
+        if (liveSocketIds.has(socketId) && site) {
+          websiteCounts[site] = (websiteCounts[site] || 0) + 1;
+        }
+      });
+      const rebuildPipeline = redis.multi();
+      rebuildPipeline.del(REDIS_WEBSITE_COUNTS);
+      if (Object.keys(websiteCounts).length > 0) {
+        rebuildPipeline.hSet(REDIS_WEBSITE_COUNTS, websiteCounts);
+      }
+      await rebuildPipeline.exec();
+      console.log(`🔄 Website counts rebuilt: ${JSON.stringify(websiteCounts)}`);
+
       // Step 2: Reconcile __room_counts__ against actual live socket counts per room.
       // For each room, the source of truth is io.in(roomId).allSockets().size
       // (cross-process). If __room_counts__ disagrees, it's stale from a crash.
       const roomIds = await redis.sMembers(REDIS_ROOMS_SET);
       const storedCounts = await redis.hGetAll(REDIS_ROOM_COUNTS);
 
-      let fixedRooms = 0;
-      for (const roomId of roomIds) {
-        const actualSockets = await io.in(roomId).allSockets();
-        const actualCount = actualSockets.size;
-        const storedCount = parseInt(storedCounts[roomId]) || 0;
+      // Parallel allSockets queries — one Redis adapter RTT group instead of N serial.
+      const actualSocketCounts = await Promise.all(
+        roomIds.map(async (roomId) => {
+          const sockets = await io.in(roomId).allSockets();
+          return { roomId, actualCount: sockets.size };
+        }),
+      );
 
+      const fixPipeline = redis.multi();
+      let fixedRooms = 0;
+      for (const { roomId, actualCount } of actualSocketCounts) {
+        const storedCount = parseInt(storedCounts[roomId]) || 0;
         if (actualCount !== storedCount) {
-          await redis.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
+          fixPipeline.hSet(REDIS_ROOM_COUNTS, roomId, actualCount.toString());
           fixedRooms++;
         }
       }
+      if (fixedRooms > 0) await fixPipeline.exec();
 
       if (fixedRooms > 0) {
         console.log(`🧹 Reconciled ${fixedRooms} room counts to actual values`);

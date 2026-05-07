@@ -18,7 +18,7 @@ const { authenticateToken } = require("@project/middleware");
 const { pubClient: redis } = require("@project/config/redis");
 const { getCurrentPerformanceMode } = require("@project/utils/perfomance_config");
 const { findUserByName } = require("@project/modules/user/service");
-const { BANNED_USERS_KEY } = require("@project/utils/const_config");
+const { BANNED_USERS_KEY, REDIS_ROOMS_SET } = require("@project/utils/const_config");
 
 const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
 const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡"];
@@ -54,7 +54,6 @@ function setupSocketHandlers(io) {
   }, 5 * 60 * 1000); // every 5 minutes
 
   io.on("connection", (socket) => {
-    console.log("User connected:", socket.id);
 
         // Connection limits — remove this block to let max_memory_restart in ecosystem.config.js act as the only safety net
     if (io.engine.clientsCount > 15000) {
@@ -271,25 +270,28 @@ function setupSocketHandlers(io) {
 
    // Messages - senderName comes from frontend
     socket.on("room_message", async (data) => {
-      const { roomId, messageContent, senderName } = data;// senderName from frontend
-      // Ban + rate limit check — single pipeline round trip
+      const { roomId, messageContent, senderName } = data;
+      // Ban + room existence + rate limit — single pipeline round trip
       const ip = socket.clientIp;
       const { rateLimitMax, rateLimitWindowSeconds } =
         getCurrentPerformanceMode().settings;
       const pipeline = redis.multi();
       // When socket.senderName fix is enabled, replace the line below with:
       // pipeline.sIsMember(BANNED_USERS_KEY, socket.senderName ?? senderName);
-      pipeline.sIsMember(BANNED_USERS_KEY, senderName);
+      pipeline.sIsMember(BANNED_USERS_KEY, senderName); // [0]
+      pipeline.sIsMember(REDIS_ROOMS_SET, roomId);       // [1]
       if (ip) {
         const key = `${REDIS_RATE_LIMIT_PREFIX}${ip}`;
-        pipeline.incr(key);
-        pipeline.expire(key, rateLimitWindowSeconds, "NX");
+        pipeline.incr(key);                              // [2]
+        pipeline.expire(key, rateLimitWindowSeconds, "NX"); // [3]
       }
       const results = await pipeline.exec();
       const isBanned = results[0];
       if (isBanned) return;
+      const roomStillExists = results[1];
+      if (!roomStillExists) return;
       if (ip) {
-        const count = results[1];
+        const count = results[2];
         if (count > rateLimitMax) {
           const retryAfter = await redis.ttl(`${REDIS_RATE_LIMIT_PREFIX}${ip}`);
           socket.emit("server_rate_limit", {
@@ -299,30 +301,24 @@ function setupSocketHandlers(io) {
           return;
         }
       }
-      if (await roomExists(roomId)) {
-        const msgId = new mongoose.Types.ObjectId();
-        const messageData = {
-          _id: msgId.toString(),
-          senderName,
-          messageContent,
-          roomId,
-          timestamp: new Date().toISOString(),
-        };
-        // Broadcast to room including sender
-        io.to(roomId).emit("room_message", messageData);
-         // Save message asynchronously
-        try {
-          await saveChatMessageService(roomId, {
-            _id: msgId,
-            senderName, // Use from frontend
-            senderId: socket.id,
-            messageContent,
-            messageType: "room_message",
-          });
-        } catch (error) {
-          console.error("Failed to save message:", error);
-        }
-      }
+      const msgId = new mongoose.Types.ObjectId();
+      const messageData = {
+        _id: msgId.toString(),
+        senderName,
+        messageContent,
+        roomId,
+        timestamp: new Date().toISOString(),
+      };
+      // Broadcast immediately — message is already live
+      io.to(roomId).emit("room_message", messageData);
+      // Save asynchronously — handler returns now, save continues in background
+      saveChatMessageService(roomId, {
+        _id: msgId,
+        senderName,
+        senderId: socket.id,
+        messageContent,
+        messageType: "room_message",
+      }).catch((error) => console.error("Failed to save message:", error));
     });
 
     socket.on("typing_start", (data) => {
@@ -374,7 +370,6 @@ function setupSocketHandlers(io) {
     });
 
     socket.on("disconnect", async () => {
-      console.log("User disconnected:", socket.id);
 
       // Clean up typing for this socket across all rooms
       for (const [roomId] of typingUsers) {

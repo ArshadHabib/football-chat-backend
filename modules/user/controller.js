@@ -49,21 +49,9 @@ async function registerUserController(req, res) {
 }
 
 async function updateUser(req, res) {
-  const { name, ipAddress, isBanned } = req?.body;
+  const { name, isBanned } = req?.body;
 
   try {
-    if (ipAddress && isBanned === true) {
-      const bannedNames = await userService.banAllUsersByIp(ipAddress);
-      if (bannedNames.length > 0) {
-        const pipeline = redis.multi();
-        pipeline.sAdd(BANNED_USERS_KEY, bannedNames);
-        pipeline.sAdd(BANNED_IPS_KEY, ipAddress);
-        await pipeline.exec();
-        await broadcastBanToAllRooms(bannedNames);
-      }
-      return sendResponse(res, null, "Users Banned Successfully", 200);
-    }
-
     const user = await userService.findUserByName(name);
     if (!user) {
       return sendError(res, "User not found!", 404);
@@ -72,8 +60,18 @@ async function updateUser(req, res) {
     await userService.updateUser(name, { isBanned });
 
     if (isBanned === true) {
-      await redis.sAdd(BANNED_USERS_KEY, name);
-      if (user.ipAddress) await redis.sAdd(BANNED_IPS_KEY, user.ipAddress);
+      if (user.ipAddress) {
+        const bannedNames = await userService.banAllUsersByIp(user.ipAddress);
+        if (bannedNames.length > 0) {
+          const pipeline = redis.multi();
+          pipeline.sAdd(BANNED_USERS_KEY, bannedNames);
+          pipeline.sAdd(BANNED_IPS_KEY, user.ipAddress);
+          await pipeline.exec();
+          await broadcastBanToAllRooms(bannedNames);
+        }
+      } else {
+        await redis.sAdd(BANNED_USERS_KEY, name);
+      }
     } else {
       await redis.sRem(BANNED_USERS_KEY, name);
       // Do NOT remove from BANNED_IPS_KEY — other accounts on the same IP may
@@ -89,8 +87,10 @@ async function updateUser(req, res) {
 async function getUserController(req, res) {
   const { name } = req?.body;
   try {
-    const user = await userService.findUserByName(name);
-    sendResponse(res, user, "User Data Retrieved Successfully", 200);
+    // const user = await userService.findUserByName(name);
+    // sendResponse(res, user, "User Data Retrieved Successfully", 200);
+    const isBanned = !!(await redis.sIsMember(BANNED_USERS_KEY, name));
+    sendResponse(res, { name, isBanned }, "User Data Retrieved Successfully", 200);
   } catch (error) {
     sendError(res, "Internal server error", 500);
   }

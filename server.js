@@ -25,6 +25,7 @@ const {
 const { setPerformanceMode } = require("@project/utils/perfomance_config");
 const { validateCounts } = require("@project/socket/roomManager");
 const { warmBanCaches } = require("@project/modules/user/warmup");
+const { startDrainLoop } = require("@project/modules/chat/service");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -93,6 +94,7 @@ app.get("/", (req, res) => {
 
     // Seed ban Sets from MongoDB before accepting traffic.
     await warmBanCaches();
+    startDrainLoop();
     // Re-warm on Redis reconnect (Redis crash while PM2 stays running).
     // Registered after connectRedis() so only catches future reconnects.
     pubClient.on("ready", () => {

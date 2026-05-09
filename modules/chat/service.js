@@ -165,7 +165,9 @@ async function drainRoomCountersLoop() {
     setTimeout(drainRoomCountersLoop, next);
   }
 }
-drainRoomCountersLoop();
+function startDrainLoop() {
+  drainRoomCountersLoop();
+}
 
 // Reaction batch: Map<messageId, Map<emoji, Set<username>>>
 const reactionBatch = new Map();
@@ -587,4 +589,5 @@ module.exports = {
   deleteAllChatMessagesService,
   deleteAllDBChatRoomService,
   getRoomStats,
+  startDrainLoop,
 };

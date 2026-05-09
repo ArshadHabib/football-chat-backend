@@ -220,11 +220,14 @@ function setupSocketHandlers(io) {
     socket.on("join_room", async (data) => {
       const { senderName, roomId, websiteName } = data;
 
-      // Upgrade to inComingClientIp (ipify.org) if provided — more accurate than headers.
-      // Baseline IP from headers is already set at connection time.
-      if (data.inComingClientIp) {
-        socket.clientIp = data.inComingClientIp;
-      }
+      // inComingClientIp override removed — client-supplied value (ipify.org)
+      // can be spoofed by a scripted client to bypass per-IP rate limit,
+      // IP ban, and banAllUsersByIp cascade. socket.clientIp set at connection
+      // time from x-real-ip / x-forwarded-for (nginx-forwarded) is the only
+      // trusted source.
+      // if (data.inComingClientIp) {
+      //   socket.clientIp = data.inComingClientIp;
+      // }
 
       // Ban check on join disabled — banned users are allowed to join but cannot send messages.
       // The room_message pipeline blocks them via __banned_users__ Redis set check.

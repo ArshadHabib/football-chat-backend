@@ -5,9 +5,16 @@ const { pubClient: redis } = require("@project/config/redis");
 const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL, BANNED_USERS_KEY, BANNED_IPS_KEY } = require("@project/utils/const_config");
 
 async function registerUserController(req, res) {
-  const { name, clientIp, inComingClientIp } = req?.body;
+  // inComingClientIp (client-supplied via ipify.org) is no longer trusted —
+  // a scripted client can spoof it to bypass per-IP rate limit, IP ban, and
+  // banAllUsersByIp cascade. Use req.clientIp (set by attachClientIp from
+  // req.ip, which Express resolves from nginx's X-Forwarded-For under
+  // `trust proxy: 1`) as the only source of truth.
+  // const { name, clientIp, inComingClientIp } = req?.body;
+  const { name, clientIp } = req?.body;
   try {
-    const ip = inComingClientIp || clientIp;
+    // const ip = inComingClientIp || clientIp;
+    const ip = clientIp;
 
     // 1️⃣ IP ban check via Redis (warm at startup, updated on every ban action)
     if (ip) {

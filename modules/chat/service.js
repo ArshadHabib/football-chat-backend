@@ -55,7 +55,6 @@ async function flushMessageBatch() {
       }
       await pipeline.exec();
     }
-
   } catch (error) {
     console.error("Batch flush error:", error);
   }
@@ -134,7 +133,10 @@ async function drainRoomCounters() {
       REDIS_ROOM_LAST_ACTIVITY_DRAIN,
     ]);
   } catch (err) {
-    console.error("Counter drain bulkWrite failed — will retry next cycle:", err);
+    console.error(
+      "Counter drain bulkWrite failed — will retry next cycle:",
+      err,
+    );
     // Swap keys remain intact so the next election retries the same snapshot.
   }
 }
@@ -164,9 +166,6 @@ async function drainRoomCountersLoop() {
     const next = getCurrentPerformanceMode().settings.batchFlush;
     setTimeout(drainRoomCountersLoop, next);
   }
-}
-function startDrainLoop() {
-  drainRoomCountersLoop();
 }
 
 // Reaction batch: Map<messageId, Map<emoji, Set<username>>>
@@ -292,7 +291,9 @@ flushReactionBatchLoop();
 // Loads from DB into batch on first access for a given messageId.
 async function applyReactionService(messageId, emoji, username) {
   if (!reactionBatch.has(messageId)) {
-    const msg = await MessageModel.findById(messageId).select("reactions").lean();
+    const msg = await MessageModel.findById(messageId)
+      .select("reactions")
+      .lean();
     if (msg) {
       const reactionMap = new Map();
       if (msg.reactions) {
@@ -360,7 +361,9 @@ async function saveChatMessageService(roomId, messageData) {
       { EX: PINNED_MSG_CACHE_TTL },
     );
   }
-  await cachePipeline.exec().catch((err) => console.error("Cache write error:", err));
+  await cachePipeline
+    .exec()
+    .catch((err) => console.error("Cache write error:", err));
 
   if (!messageBatch.has(roomId)) {
     messageBatch.set(roomId, []);
@@ -390,11 +393,11 @@ async function createChatRoomService(roomId) {
         upsert: true,
         new: true,
         setDefaultsOnInsert: true,
-      }
+      },
     );
 
     console.log(
-      `Chat room created/verified successfully with roomId: ${roomId}`
+      `Chat room created/verified successfully with roomId: ${roomId}`,
     );
     return true;
   } catch (error) {
@@ -422,7 +425,7 @@ async function deleteAllDBChatRoomService() {
     }
 
     console.log(
-      `All chat rooms and messages deleted successfully. Rooms: ${roomResult.deletedCount}, Messages: ${messageResult.deletedCount}`
+      `All chat rooms and messages deleted successfully. Rooms: ${roomResult.deletedCount}, Messages: ${messageResult.deletedCount}`,
     );
     return true;
   } catch (error) {
@@ -462,7 +465,9 @@ async function getRecentMessagesWithCache(roomId, limit) {
         });
       }
       pipeline.zRemRangeByRank(cacheKey, 0, -(MSG_CACHE_LIMIT + 1));
-      await pipeline.exec().catch((err) => console.error("Cache seed error:", err));
+      await pipeline
+        .exec()
+        .catch((err) => console.error("Cache seed error:", err));
     }
 
     return messages.reverse();
@@ -533,11 +538,11 @@ async function deleteAllChatMessagesService() {
           messageCount: 0,
           lastActivity: new Date(),
         },
-      }
+      },
     );
 
     console.log(
-      `All chat messages deleted successfully. Messages: ${messageResult.deletedCount}, Rooms reset: ${roomResult.modifiedCount}`
+      `All chat messages deleted successfully. Messages: ${messageResult.deletedCount}, Rooms reset: ${roomResult.modifiedCount}`,
     );
     return true;
   } catch (error) {
@@ -571,7 +576,7 @@ async function deleteChatRoomService(roomId) {
     ]);
 
     console.log(
-      `Chat room and messages deleted: ${roomId}. Messages: ${messageResult.deletedCount}`
+      `Chat room and messages deleted: ${roomId}. Messages: ${messageResult.deletedCount}`,
     );
     return true;
   } catch (error) {
@@ -589,5 +594,5 @@ module.exports = {
   deleteAllChatMessagesService,
   deleteAllDBChatRoomService,
   getRoomStats,
-  startDrainLoop,
+  startDrainLoop: drainRoomCountersLoop,
 };

@@ -284,22 +284,32 @@ async function leaveRoom(socket) {
   const leavePipeline = redis.multi();
   leavePipeline.hDel(REDIS_SOCKET_WEBSITE, socket.id);
   leavePipeline.sIsMember(REDIS_ROOMS_SET, roomId);
-  const [, roomStillExists] = await leavePipeline.exec();
+  const [socketWebsiteDeleted, roomStillExists] = await leavePipeline.exec();
 
-  // Step 2: conditional decrements — room count + website counter in one pipeline
+  // Step 2: decrements
+  // socketWebsiteDeleted === 1 means leaveRoom deleted the SOCKET_WEBSITE entry itself,
+  // so deleteRoom hadn't touched it yet → we are responsible for decrementing WEBSITE_COUNTS.
+  // socketWebsiteDeleted === 0 means deleteRoom already deleted the entry AND already
+  // decremented WEBSITE_COUNTS → skip to avoid double-decrement.
+  // ROOM_COUNTS only decremented if room still exists — deleteRoom cleans it via hDel otherwise.
   let count = 0;
-  if (roomStillExists) {
-    const decrPipeline = redis.multi();
-    decrPipeline.hIncrBy(REDIS_ROOM_COUNTS, roomId, -1);
-    if (websiteName) decrPipeline.hIncrBy(REDIS_WEBSITE_COUNTS, websiteName, -1);
+  const shouldDecrWebsite = websiteName && socketWebsiteDeleted === 1;
+  const decrPipeline = redis.multi();
+  if (roomStillExists) decrPipeline.hIncrBy(REDIS_ROOM_COUNTS, roomId, -1);
+  if (shouldDecrWebsite) decrPipeline.hIncrBy(REDIS_WEBSITE_COUNTS, websiteName, -1);
+
+  if (roomStillExists || shouldDecrWebsite) {
     const decrResults = await decrPipeline.exec();
-    count = parseInt(decrResults[0]) || 0;
-    if (count < 0) {
-      await redis.hSet(REDIS_ROOM_COUNTS, roomId, "0");
-      count = 0;
+    if (roomStillExists) {
+      count = parseInt(decrResults[0]) || 0;
+      if (count < 0) {
+        await redis.hSet(REDIS_ROOM_COUNTS, roomId, "0");
+        count = 0;
+      }
     }
-    if (websiteName) {
-      const webCount = parseInt(decrResults[1]) || 0;
+    if (shouldDecrWebsite) {
+      const webIdx = roomStillExists ? 1 : 0;
+      const webCount = parseInt(decrResults[webIdx]) || 0;
       if (webCount < 0) await redis.hSet(REDIS_WEBSITE_COUNTS, websiteName, "0");
     }
   }

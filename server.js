@@ -87,6 +87,13 @@ app.get("/", (req, res) => {
       setPerformanceMode(mode);
     });
 
+    // Hydrate perf mode from Redis at boot. Without this, a worker that
+    // crashes and respawns boots back to "normal" regardless of cluster
+    // state — silent desync from the rest of the cluster until the next
+    // admin click. The companion SET runs in changeServerModeController.
+    const persistedMode = await pubClient.get("__perf_mode_current__");
+    if (persistedMode) setPerformanceMode(persistedMode);
+
     // Hydrate feature flags from Redis (or seed defaults on first cluster
     // boot) and start listening for cross-instance toggle changes. Must run
     // before warmBanCaches/startDrainLoop because subsequent code paths
@@ -109,6 +116,23 @@ app.get("/", (req, res) => {
       warmBanCaches().catch((err) =>
         console.error("Ban cache re-warm failed:", err),
       );
+      // Re-hydrate perf mode in case Redis was wiped or recovered to a
+      // different state while this worker was disconnected. Idempotent —
+      // applying the same mode is a no-op.
+      pubClient
+        .get("__perf_mode_current__")
+        .then((m) => {
+          if (m) setPerformanceMode(m);
+        })
+        .catch((err) =>
+          console.error("Perf mode re-hydrate failed:", err),
+        );
+      // Re-hydrate feature flags too, mirroring the same pattern.
+      featureFlags
+        .loadFromRedis()
+        .catch((err) =>
+          console.error("Feature flags re-hydrate failed:", err),
+        );
     });
 
     server.listen(PORT, async () => {

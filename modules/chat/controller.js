@@ -134,6 +134,11 @@ async function changeServerModeController(req, res) {
   const { mode } = req.body;
   try {
     setPerformanceMode(mode);
+    // Persist before publishing so a worker that crashes and respawns
+    // hydrates from Redis at boot instead of falling back to "normal" and
+    // silently desyncing from the rest of the cluster. Source-of-truth
+    // pattern matches utils/feature_flags.js.
+    await pubClient.set("__perf_mode_current__", mode);
     // Broadcast to all other processes so they update their mode too
     await pubClient.publish("__perf_mode__", mode);
     return sendResponse(

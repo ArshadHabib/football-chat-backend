@@ -12,6 +12,7 @@
 | 2.3 — Strike counter + auto-ban | Pending | Will be added on top of validation later. |
 | 2.4 — Admin feature flags: New User Registration + Validate Each Message | ✅ **Deployed** | Cluster-wide, Redis-persisted toggles via admin UI. See [Phase 2.4 — Deployed Summary](#phase-24--deployed-summary). |
 | 2.5 — Profanity parity with FE (`bad-words` `cleanString` for messages) | ✅ **Deployed** | Messages censored before broadcast/persist. Username `isProfane` check intentionally NOT enforced server-side — FE-only. See [Phase 2.5 — Profanity parity](#phase-25--profanity-parity-with-fe-bad-words-filter). |
+| 2.6 — `__perf_mode__` persistence in Redis | ✅ **Deployed** | Chat Server Mode survives worker restarts: `SET __perf_mode_current__` before publish, hydrate at startup + on Redis reconnect. Closes the cluster-desync gap that motivated 2.4's persistence design. |
 | 3.x — CAPTCHA + connection cap | Pending | |
 | 4.x — Hash-spam detector + admin panic actions | Pending | |
 
@@ -302,7 +303,7 @@ When the admin flips "Validate Each Message" to OFF, the intent is "the server s
 
 #### Architecture — Redis-persisted, pub/sub-propagated
 
-Mirrors the `__perf_mode__` pattern but adds **Redis persistence** to fix a known weakness in that pattern: a PM2 worker that crashes and restarts in `__perf_mode__` boots back to `normal` regardless of cluster state, silently diverging until the next admin click. Feature flags avoid that — every worker hydrates from Redis at boot, so a restart never desyncs.
+Mirrors the `__perf_mode__` pattern but adds **Redis persistence** so a PM2 worker that crashes and restarts can hydrate from Redis at boot, never silently desyncing from the rest of the cluster. The same persistence pattern was retrofitted to `__perf_mode__` itself in [Phase 2.6](#phase-26--deployed-summary-__perf_mode__-persistence) so both control planes now share this property.
 
 ```
 Admin UI clicks "Validate Each Message" → ON
@@ -387,9 +388,91 @@ On first cluster boot, `loadFromRedis()` finds both keys absent and seeds them w
 
 #### What was intentionally NOT done
 
-- **No persistence of perf mode** — `__perf_mode__` still resets to `normal` on instance crash. That existing weakness was deliberately left alone in this phase to keep the diff focused. Same fix applies if/when wanted: `SET perf_mode <mode>` before `PUBLISH`, hydrate at startup.
-- **No re-hydrate on Redis reconnect** — flags don't auto-resync if an instance loses Redis mid-session. See edge case in the table above. Add later if monitoring shows the issue.
 - **No per-flag audit log** — admin actions aren't recorded anywhere except logs (`console.log` in the API call wrappers). If you need an audit trail, write to an `admin_audit` Mongo collection inside `setFlag()`.
+
+---
+
+### Phase 2.6 — Deployed Summary (`__perf_mode__` persistence)
+
+**Status:** ✅ Deployed.
+
+The existing Chat Server Mode toggle (`__perf_mode__`) now persists in Redis using the same pattern as the feature flags introduced in Phase 2.4. A PM2 worker that crashes and respawns no longer falls back to `normal` and silently desyncs from the cluster — it hydrates the cluster's current mode from Redis at boot, and re-hydrates on Redis reconnect.
+
+#### The gap that was closed
+
+Before this fix:
+
+```
+T0  Cluster: 5 workers, all on "Peak" mode (admin set it earlier).
+T1  Worker #3 crashes (OOM, segfault, unhandled rejection, …).
+T2  PM2 respawns Worker #3.
+T3  Fresh worker: setPerformanceMode never called from a publish (the
+    publish was T0 — long gone). performanceMode.level = "normal".
+
+Cluster state: 4 workers on Peak, 1 worker on Normal.
+No log line, no telemetry, no admin notification.
+Stays drifted until next admin click on the Chat Server Mode radio.
+```
+
+After this fix:
+
+```
+T0  Admin sets "Peak" → controller does:
+      setPerformanceMode("peak")
+      pubClient.set("__perf_mode_current__", "peak")    ← NEW
+      pubClient.publish("__perf_mode__", "peak")
+T1  Worker #3 crashes.
+T2  PM2 respawns Worker #3.
+T3  Fresh worker boot → server.js startup:
+      const persistedMode = await pubClient.get("__perf_mode_current__")
+      → "peak" → setPerformanceMode("peak")             ← NEW
+
+Cluster state: 5 workers on Peak. ✅
+```
+
+#### Impact this would have caused (now no longer possible)
+
+| Setting consumed | Peak value | Normal value | Effect on the drifted worker (pre-fix) |
+|------------------|-----------|--------------|----------------------------------------|
+| `batchFlush` | 3000 ms | 1000 ms | Mongo writes 3× more frequently — slightly higher DB load |
+| `maxBatchSize` | 100 | 50 | Smaller batches when forced flush triggers |
+| `adminDebounce` | 2000 ms | 500 ms | Admin updates fire 4× more often from this worker |
+| `userCountUpdateDebounce` | 3000 ms | 1000 ms | Rooms whose count broadcasts land here update faster than other rooms |
+| `cacheTTL` | 10000 ms | 2000 ms | Admin room data 5× fresher on this worker — admins may see flicker between requests |
+| `rateLimitMax` / `rateLimitWindowSeconds` | 1 / 5s | 1 / 5s | No effect — currently identical across modes |
+
+Not a correctness bug — no messages lost, no users locked out — but operational drift that the fix eliminates.
+
+#### Files shipped
+
+| File | Change |
+|------|--------|
+| `modules/chat/controller.js` | `changeServerModeController` now does `pubClient.set("__perf_mode_current__", mode)` **before** `pubClient.publish("__perf_mode__", mode)`. Persists first, broadcasts second — so even if the publish is missed (e.g., subscriber disconnected), the value lives in Redis. |
+| `server.js` | Startup hydration after `connectRedis()` and before `validateCounts`: `const persistedMode = await pubClient.get("__perf_mode_current__"); if (persistedMode) setPerformanceMode(persistedMode);` — falls through to the `normal` default only if Redis has no value (first cluster boot). |
+| `server.js` | Reconnect handler extended: the existing `pubClient.on("ready", ...)` block (originally just `warmBanCaches`) now also re-hydrates perf mode and feature flags. Idempotent — applying the same mode is a no-op. |
+
+#### Redis key design
+
+| Key | Purpose | Lifetime |
+|-----|---------|----------|
+| `__perf_mode_current__` | Persisted Chat Server Mode value (`"normal"` / `"peak"` / `"extreme"`) | Permanent — written on every admin change, never expires |
+| `__perf_mode__` | Pub/sub channel name (existing — unchanged) | Transient (Redis pub/sub doesn't persist) |
+
+The persisted key and the pub/sub channel share the prefix but live in different Redis namespaces (keys vs channels) so they don't collide.
+
+#### Restart-safety table (matches Phase 2.4)
+
+| Scenario | Outcome |
+|----------|---------|
+| Admin sets "Peak" → 1 worker crashes → PM2 respawns it | Respawned worker reads `__perf_mode_current__` = "peak" → `setPerformanceMode("peak")`. ✅ |
+| Admin sets "Peak" → all 5 workers restart simultaneously (deploy) | Every worker hydrates from Redis at boot. State preserved across the deploy. ✅ |
+| Redis is wiped or cluster is brand new | `GET __perf_mode_current__` returns null → falls back to default `normal`. ✅ |
+| Worker loses Redis connection mid-session, then Redis recovers | `pubClient.on("ready")` fires → re-hydrates perf mode + feature flags + ban caches. ✅ |
+
+#### What was intentionally NOT done in 2.6
+
+- **No migration from existing in-memory state.** When this deploys, the first worker on each instance reads Redis. If the cluster was already on Peak before this deploy and Redis has no `__perf_mode_current__` key (because the SET was never run), the workers will boot to `normal` after the deploy. **First action post-deploy: have an admin click the desired mode once** to write the key. From then on it's persistent.
+- **No `EXPIRE` on the key.** Persistence is permanent; the key only changes when admin clicks the toggle. If you ever want a TTL (e.g., auto-revert to normal after N hours), add `EX 3600` to the `SET` call.
 
 ---
 
@@ -463,12 +546,13 @@ The IPs in this incident are residential proxies/VPS ranges in RU/JP/BR. If the 
 | 2.3 — strike counter + auto-ban | Pending | ~1 hr | Wave self-extinguishes without admin action |
 | 2.4 — admin feature flags (registration / validation) | ✅ Deployed | ~2 hr | Cluster-wide kill-switches: flip registration off mid-wave; flip validation on/off without restart |
 | 2.5 — `bad-words` parity (cleanString on messages) | ✅ Deployed | ~30 min | Profanity censored before broadcast/persist. Username `isProfane` not enforced server-side (FE only). |
+| 2.6 — `__perf_mode__` persistence | ✅ Deployed | ~10 min | Chat Server Mode survives worker restarts; cluster no longer desyncs on PM2 respawn. |
 | 3.1 — CAPTCHA | Pending | ~half day | Future waves cannot scale account creation |
 | 3.3 — connection cap | Pending | ~30 min | One real IP cannot hold hundreds of sockets |
 | 4.1 — hash-spam detector | Pending | ~2 hr | Coordinated copy-paste detected automatically |
 | 4.2 — admin panic actions | Pending | ~half day | Manual override available during incidents |
 
-**Currently deployed:** Phase 1.1 + 2.1 + 2.2 + 2.4 + 2.5 — IP-based defenses work against the real client IP, FE heuristics run server-side with invalid messages dropped silently, message profanity is censored before broadcast/persist when validation is on, and admin has cluster-wide kill-switches for both new-user registration and per-message validation. Cleaning + heuristic drops gate together on the validation toggle. Username profanity check stays FE-only.
+**Currently deployed:** Phase 1.1 + 2.1 + 2.2 + 2.4 + 2.5 + 2.6 — IP-based defenses work against the real client IP, FE heuristics run server-side with invalid messages dropped silently, message profanity is censored before broadcast/persist when validation is on, admin has cluster-wide kill-switches for both new-user registration and per-message validation, and the existing Chat Server Mode now also survives worker restarts via Redis persistence. Cleaning + heuristic drops gate together on the validation toggle. Username profanity check stays FE-only.
 
 **Next minimal hardening:** Phase 1.2 + 1.3 (5 min each — closes username-spoof bypass and disconnects banned accounts at join) followed by Phase 2.3 (~1 hr — turns repeat violations into auto-bans so admins don't have to chase waves manually).
 
@@ -520,6 +604,22 @@ Real client IP (from nginx x-real-ip / x-forwarded-for, never client body)
 Message broadcast to room + persist to MongoDB
 ```
 
+**Control-plane state (separate from the message flow above):**
+
+```
+Redis (source of truth)                           Cache on each PM2 worker
+──────────────────────────────                    ─────────────────────────
+__perf_mode_current__   ← Phase 2.6   ──────────► performanceMode.level
+feature:registration    ← Phase 2.4   ──────────► flags.registration
+feature:validation      ← Phase 2.4   ──────────► flags.validation
+
+On admin click → SET in Redis + PUBLISH on the matching channel.
+On worker boot → GET from Redis to hydrate the cache.
+On Redis reconnect → re-GET to resync the cache.
+
+Result: workers never desync from cluster state, even after crash + respawn.
+```
+
 ---
 
 ## What Does NOT Change
@@ -532,6 +632,7 @@ Message broadcast to room + persist to MongoDB
 | MongoDB models | Unchanged |
 | Redis key design for ban/rate-limit | Unchanged — same keys, just keyed off real IP now |
 | Admin message flow (`admin_room_message`) | Unchanged — admins are not validated or rate limited |
+| Chat Server Mode UI / behaviour | Unchanged on the surface — same radio buttons, same per-mode settings. Only difference is the value now persists across worker crashes (Phase 2.6). |
 
 ---
 
@@ -599,6 +700,14 @@ No new dependencies added — `bad-words` and `url-regex-safe` were intentionall
 | `utils/messageValidation.js` | New `cleanString` and `isProfane` exports; shared `Filter` instance; `validateMessage` now returns `cleaned` alongside `normalized` |
 | `socket/socketHandler.js` | `room_message` resolves `outputContent` (`verdict.cleaned` if validation flag on, raw `messageContent` if off) and uses it for both broadcast and Mongo persistence. Cleaning gated on the same `FEATURE_VALIDATION` toggle as the heuristic drops. |
 | `modules/user/controller.js` | (No change — username `isProfane` gate intentionally kept FE-only) |
+
+### Phase 2.6 — ✅ Deployed (`__perf_mode__` persistence)
+
+| File | Change |
+|------|--------|
+| `modules/chat/controller.js` | `changeServerModeController` calls `pubClient.set("__perf_mode_current__", mode)` before `pubClient.publish("__perf_mode__", mode)`. Persists first, broadcasts second — survives missed publishes. |
+| `server.js` | After `connectRedis()`, before `validateCounts`: `const persistedMode = await pubClient.get("__perf_mode_current__"); if (persistedMode) setPerformanceMode(persistedMode);` — hydrates respawned workers to the cluster's current mode at boot. |
+| `server.js` | `pubClient.on("ready", ...)` reconnect handler extended to also re-hydrate perf mode and feature flags (mirroring the existing `warmBanCaches` re-warm pattern). Idempotent — applying the same mode is a no-op. |
 
 ### Phase 3 — Pending
 | File | Change |

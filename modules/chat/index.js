@@ -15,6 +15,8 @@ const {
   updateShowViewsVisibilityToUsersController,
   changeServerModeController,
   getServerModeController,
+  setFeatureFlagController,
+  getFeatureFlagsController,
 } = require("./controller");
 
 router.get(
@@ -56,5 +58,7 @@ router.post(
   changeServerModeController
 );
 router.post("/get-server-mode", isAdminKeyCorrect, getServerModeController);
+router.post("/set-feature-flag", isAdminKeyCorrect, setFeatureFlagController);
+router.post("/get-feature-flags", isAdminKeyCorrect, getFeatureFlagsController);
 
 module.exports = router;

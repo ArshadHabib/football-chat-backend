@@ -1,6 +1,9 @@
 // socket/socketHandler.js
 const mongoose = require("mongoose");
-const { saveChatMessageService, applyReactionService } = require("@project/modules/chat/service");
+const {
+  saveChatMessageService,
+  applyReactionService,
+} = require("@project/modules/chat/service");
 const {
   joinRoom,
   leaveRoom,
@@ -16,12 +19,20 @@ const {
 } = require("./roomManager");
 const { authenticateToken } = require("@project/middleware");
 const { pubClient: redis } = require("@project/config/redis");
-const { getCurrentPerformanceMode } = require("@project/utils/perfomance_config");
+const {
+  getCurrentPerformanceMode,
+} = require("@project/utils/perfomance_config");
 const { findUserByName } = require("@project/modules/user/service");
-const { BANNED_USERS_KEY, REDIS_ROOMS_SET } = require("@project/utils/const_config");
+const {
+  BANNED_USERS_KEY,
+  REDIS_ROOMS_SET,
+} = require("@project/utils/const_config");
+const { validateMessage } = require("@project/utils/messageValidation");
+const { getFlag, FEATURE_VALIDATION } = require("@project/utils/feature_flags");
 
 const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
 const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡"];
+const RECENT_MESSAGES_BUFFER = 5;
 
 // Typing state: Map<roomId, Map<socketId, { username, timer }>>
 const typingUsers = new Map();
@@ -43,26 +54,28 @@ function setupSocketHandlers(io) {
 
   // Periodically evict typingUsers entries for rooms that have no connected sockets.
   // Handles the edge case where a room is abandoned without a clean typing_stop/disconnect.
-  setInterval(() => {
-    for (const [roomId, roomTyping] of typingUsers) {
-      const socketsInRoom = io.sockets.adapter.rooms.get(roomId);
-      if (!socketsInRoom || socketsInRoom.size === 0) {
-        for (const { timer } of roomTyping.values()) clearTimeout(timer);
-        typingUsers.delete(roomId);
+  setInterval(
+    () => {
+      for (const [roomId, roomTyping] of typingUsers) {
+        const socketsInRoom = io.sockets.adapter.rooms.get(roomId);
+        if (!socketsInRoom || socketsInRoom.size === 0) {
+          for (const { timer } of roomTyping.values()) clearTimeout(timer);
+          typingUsers.delete(roomId);
+        }
       }
-    }
-  }, 5 * 60 * 1000); // every 5 minutes
+    },
+    5 * 60 * 1000,
+  ); // every 5 minutes
 
   io.on("connection", (socket) => {
-
-        // Connection limits — remove this block to let max_memory_restart in ecosystem.config.js act as the only safety net
+    // Connection limits — remove this block to let max_memory_restart in ecosystem.config.js act as the only safety net
     if (io.engine.clientsCount > 15000) {
       socket.emit("error", { message: "Server at capacity" });
       socket.disconnect();
       return;
     }
 
-        // Set IP at connection time — ensures rate limiting applies even if join_room is skipped
+    // Set IP at connection time — ensures rate limiting applies even if join_room is skipped
     let connIp =
       socket.handshake.headers["x-real-ip"] ||
       socket.handshake.headers["x-forwarded-for"]?.split(",")?.[0]?.trim() ||
@@ -147,7 +160,7 @@ function setupSocketHandlers(io) {
         return;
       }
       const msgId = new mongoose.Types.ObjectId();
-            // Use senderName from admin data
+      // Use senderName from admin data
       const messageData = {
         _id: msgId.toString(),
         senderName: "Admin",
@@ -179,7 +192,8 @@ function setupSocketHandlers(io) {
       // Validate required fields
       if (!roomId || !userData || typeof userData !== "object") {
         socket.emit("error", {
-          message: "Missing or invalid parameters: roomId and userData are required",
+          message:
+            "Missing or invalid parameters: roomId and userData are required",
         });
         return;
       }
@@ -190,14 +204,14 @@ function setupSocketHandlers(io) {
         });
         return;
       }
-            // Check if admin is in the room (optional but recommended)
+      // Check if admin is in the room (optional but recommended)
       if (!socket.rooms.has(roomId)) {
         socket.emit("warning", {
           message: "You are not in this room, but broadcasting anyway",
           roomId,
         });
       }
-       // Check if room exists
+      // Check if room exists
       if (!(await roomExists(roomId))) {
         socket.emit("error", { message: "Room does not exist", roomId });
         return;
@@ -216,7 +230,7 @@ function setupSocketHandlers(io) {
       io.to(roomId).emit("user_updated", broadcastData);
     });
 
-     // User joining room - websiteName still needed for analytics
+    // User joining room - websiteName still needed for analytics
     socket.on("join_room", async (data) => {
       const { senderName, roomId, websiteName } = data;
 
@@ -271,7 +285,7 @@ function setupSocketHandlers(io) {
       }
     });
 
-   // Messages - senderName comes from frontend
+    // Messages - senderName comes from frontend
     socket.on("room_message", async (data) => {
       const { roomId, messageContent, senderName } = data;
       // Ban + room existence + rate limit — single pipeline round trip
@@ -282,10 +296,10 @@ function setupSocketHandlers(io) {
       // When socket.senderName fix is enabled, replace the line below with:
       // pipeline.sIsMember(BANNED_USERS_KEY, socket.senderName ?? senderName);
       pipeline.sIsMember(BANNED_USERS_KEY, senderName); // [0]
-      pipeline.sIsMember(REDIS_ROOMS_SET, roomId);       // [1]
+      pipeline.sIsMember(REDIS_ROOMS_SET, roomId); // [1]
       if (ip) {
         const key = `${REDIS_RATE_LIMIT_PREFIX}${ip}`;
-        pipeline.incr(key);                              // [2]
+        pipeline.incr(key); // [2]
         pipeline.expire(key, rateLimitWindowSeconds, "NX"); // [3]
       }
       const results = await pipeline.exec();
@@ -304,22 +318,47 @@ function setupSocketHandlers(io) {
           return;
         }
       }
+
+      // Server-side content handling — gated entirely on the
+      // FEATURE_VALIDATION flag. When ON: heuristic drops + profanity
+      // censoring (cleanString) both run. When OFF: nothing runs, raw
+      // content is broadcast as the client sent it. Admin flips the flag
+      // cluster-wide via Redis pub/sub without restarting the backend.
+      // Default OFF (see utils/feature_flags.js DEFAULTS). Drops are
+      // silent — no error emit, gives bots no feedback to tune against.
+      // Strike counter / auto-ban deferred to Phase 2.3.
+      let outputContent;
+      if (getFlag(FEATURE_VALIDATION)) {
+        socket.recentMessages = socket.recentMessages || [];
+        const verdict = validateMessage(messageContent, socket.recentMessages);
+        if (!verdict.ok) return;
+        socket.recentMessages = [
+          ...socket.recentMessages.slice(-(RECENT_MESSAGES_BUFFER - 1)),
+          verdict.normalized,
+        ];
+        outputContent = verdict.cleaned;
+      } else {
+        outputContent = messageContent;
+      }
+
       const msgId = new mongoose.Types.ObjectId();
       const messageData = {
         _id: msgId.toString(),
         senderName,
-        messageContent,
+        messageContent: outputContent,
         roomId,
         timestamp: new Date().toISOString(),
       };
       // Broadcast immediately — message is already live
       io.to(roomId).emit("room_message", messageData);
-      // Save asynchronously — handler returns now, save continues in background
+      // Save asynchronously — handler returns now, save continues in background.
+      // Persist the cleaned content (matches what was broadcast) so message
+      // history loaded later via fetchChatMessages displays the same text.
       saveChatMessageService(roomId, {
         _id: msgId,
         senderName,
         senderId: socket.id,
-        messageContent,
+        messageContent: outputContent,
         messageType: "room_message",
       }).catch((error) => console.error("Failed to save message:", error));
     });
@@ -332,10 +371,14 @@ function setupSocketHandlers(io) {
       const existing = roomTyping.get(socket.id);
       const isNew = !existing;
       if (existing) clearTimeout(existing.timer);
-      const timer = setTimeout(() => clearTypingUser(io, roomId, socket.id), 5000);
+      const timer = setTimeout(
+        () => clearTypingUser(io, roomId, socket.id),
+        5000,
+      );
       roomTyping.set(socket.id, { username, timer });
       // Only broadcast on first start — heartbeat resets the timer without re-announcing
-      if (isNew) io.to(roomId).emit("user_typing", { username, isTyping: true });
+      if (isNew)
+        io.to(roomId).emit("user_typing", { username, isTyping: true });
     });
 
     socket.on("typing_stop", (data) => {
@@ -353,9 +396,16 @@ function setupSocketHandlers(io) {
       if (isBanned) return;
 
       try {
-        const reactions = await applyReactionService(messageId, emoji, username);
+        const reactions = await applyReactionService(
+          messageId,
+          emoji,
+          username,
+        );
         if (!reactions) return;
-        io.to(roomId).emit("message_reaction_updated", { messageId, reactions });
+        io.to(roomId).emit("message_reaction_updated", {
+          messageId,
+          reactions,
+        });
       } catch (err) {
         console.error("Reaction error:", err);
       }
@@ -373,7 +423,6 @@ function setupSocketHandlers(io) {
     });
 
     socket.on("disconnect", async () => {
-
       // Clean up typing for this socket across all rooms
       for (const [roomId] of typingUsers) {
         clearTypingUser(io, roomId, socket.id);

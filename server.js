@@ -26,6 +26,7 @@ const { setPerformanceMode } = require("@project/utils/perfomance_config");
 const { validateCounts } = require("@project/socket/roomManager");
 const { warmBanCaches } = require("@project/modules/user/warmup");
 const { startDrainLoop } = require("@project/modules/chat/service");
+const featureFlags = require("@project/utils/feature_flags");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -85,6 +86,13 @@ app.get("/", (req, res) => {
     perfSubClient.subscribe("__perf_mode__", (mode) => {
       setPerformanceMode(mode);
     });
+
+    // Hydrate feature flags from Redis (or seed defaults on first cluster
+    // boot) and start listening for cross-instance toggle changes. Must run
+    // before warmBanCaches/startDrainLoop because subsequent code paths
+    // (registration, room_message) read the flags.
+    await featureFlags.loadFromRedis();
+    await featureFlags.subscribeToChanges();
 
     // Startup sweep — reconciles __socket_website__ and __room_counts__ against
     // the live socket state across all instances. Catches stale entries left by

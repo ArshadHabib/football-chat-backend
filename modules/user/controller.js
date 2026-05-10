@@ -3,8 +3,16 @@ const { sendResponse, sendError, generateToken } = require("@project/utils");
 const { broadcastBanToAllRooms } = require("@project/socket/roomManager");
 const { pubClient: redis } = require("@project/config/redis");
 const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL, BANNED_USERS_KEY, BANNED_IPS_KEY } = require("@project/utils/const_config");
+const { getFlag, FEATURE_REGISTRATION } = require("@project/utils/feature_flags");
 
 async function registerUserController(req, res) {
+  // Feature flag gate — admin can disable new registrations cluster-wide
+  // without restarting the chat backend. Existing users continue to chat;
+  // only new account creation is blocked.
+  if (!getFlag(FEATURE_REGISTRATION)) {
+    return sendError(res, "New user registration is currently disabled.", 403);
+  }
+
   // inComingClientIp (client-supplied via ipify.org) is no longer trusted —
   // a scripted client can spoof it to bypass per-IP rate limit, IP ban, and
   // banAllUsersByIp cascade. Use req.clientIp (set by attachClientIp from

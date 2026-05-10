@@ -169,6 +169,50 @@ async function getServerModeController(req, res) {
   }
 }
 
+const featureFlags = require("@project/utils/feature_flags");
+
+async function setFeatureFlagController(req, res) {
+  const { name, value } = req.body;
+  try {
+    if (typeof name !== "string") {
+      return sendError(res, "Missing 'name'", 400);
+    }
+    if (typeof value !== "boolean") {
+      return sendError(res, "'value' must be a boolean", 400);
+    }
+    await featureFlags.setFlag(name, value);
+    return sendResponse(
+      res,
+      featureFlags.getAllFlags(),
+      `Feature flag '${name}' set to ${value}`,
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in setting feature flag",
+      500
+    );
+  }
+}
+
+async function getFeatureFlagsController(req, res) {
+  try {
+    return sendResponse(
+      res,
+      featureFlags.getAllFlags(),
+      "Success in getting feature flags!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in getting feature flags",
+      500
+    );
+  }
+}
+
 module.exports = {
   getUsersPerRoomController,
   getRoomMessagesController,
@@ -179,4 +223,6 @@ module.exports = {
   updateShowViewsVisibilityToUsersController,
   changeServerModeController,
   getServerModeController,
+  setFeatureFlagController,
+  getFeatureFlagsController,
 };

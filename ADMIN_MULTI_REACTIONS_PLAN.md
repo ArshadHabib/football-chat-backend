@@ -655,11 +655,173 @@ useEffect(() => () => {
 
 ---
 
-## 10. ROLLOUT ORDER
+## 10. NO-REGRESSION GUARANTEES
 
-1. **Backend first** — schema + service + socket handlers + Lua extension. Real-user reactions keep working since the field is additive.
-2. **Verify with a manual `socket.emit` from a console** that `admin_add_reaction` increments and broadcasts `adminReactions`.
-3. **Score8o8 client** — additive render change. Old clients still work (just see fewer reactions).
+Every edit below was audited against the existing codepaths. The plan must not change observable behavior for code that doesn't touch admin reactions.
+
+### 10.1 History endpoints — **zero changes required**
+
+Both server-side history paths use `.lean()` with **no `.select()` projection**:
+- `getRecentMessagesWithCache` ([service.js:454-457](/Users/arshad/learning/football-chat-backend/modules/chat/service.js#L454-L457))
+- `retrieveRoomMessagesService` admin path ([service.js:488-491](/Users/arshad/learning/football-chat-backend/modules/chat/service.js#L488-L491))
+- Pinned-message fetch ([service.js:506-509](/Users/arshad/learning/football-chat-backend/modules/chat/service.js#L506-L509))
+
+→ The new `adminReactions` field is returned automatically. Redis sorted-set cache also returns full JSON. No history-path code edits.
+
+### 10.2 The two projections that DO need extending
+
+Both are inside `service.js` and used only for the reaction lazy-seed / canonical re-read:
+
+| Today | After |
+|---|---|
+| `MessageModel.findById(messageId).select("reactions roomId").lean()` ([line 259-261](/Users/arshad/learning/football-chat-backend/modules/chat/service.js#L259-L261)) | `.select("reactions adminReactions roomId")` |
+| `MessageModel.findById(messageId).select("reactions").lean()` ([line 294-295](/Users/arshad/learning/football-chat-backend/modules/chat/service.js#L294-L295)) | `.select("reactions adminReactions")` |
+
+Both reads already happen once per message; adding one field adds bytes, not round trips.
+
+### 10.3 The latent bug in `flushReactionBatch` that must be fixed BEFORE shipping
+
+Today at [service.js:222-223](/Users/arshad/learning/football-chat-backend/modules/chat/service.js#L222-L223):
+```js
+const reactions = reactionBatch.get(messageId);
+if (!reactions) continue;
+```
+A messageId dirty solely from admin deltas (no real reactions in this flush window) would be **silently dropped**. Fix:
+```js
+const reactions = reactionBatch.get(messageId);
+const adminDeltas = adminReactionBatch.get(messageId);
+if (!reactions && !adminDeltas) continue;
+```
+
+### 10.4 The real-user broadcast must also include `adminReactions` — server side
+
+Today the `add_reaction` handler emits `{ messageId, reactions }` only. If clients are upgraded to spread `data.adminReactions` into state, an `add_reaction` broadcast would clobber their `adminReactions` to `undefined`.
+
+Fix in both the real-user handler and the new admin handlers — always emit the combined view:
+
+```js
+// inside the existing add_reaction handler, after applyReactionService returns:
+const adminSnapshot = readAdminSnapshot(messageId);  // returns {} if not loaded
+io.to(roomId).emit("message_reaction_updated", {
+  messageId,
+  reactions,             // from applyReactionService
+  adminReactions: adminSnapshot,
+});
+```
+
+`applyReactionService` already does a first-access DB read on the message — extend its `.select()` to pull `adminReactions` and seed `adminReactionSnapshot` in the same call. Cost: zero extra DB round trips.
+
+### 10.5 The real-user broadcast must also include `adminReactions` — client side defense
+
+Even with the server fix, partial-rollout windows happen. Make the listener defensive — preserve `adminReactions` when the payload omits it:
+
+```ts
+newSocket.on("message_reaction_updated", (data) => {
+  isReactionUpdateRef.current = true;
+  setMessages((prev) =>
+    prev.map((msg) =>
+      msg._id === data.messageId
+        ? {
+            ...msg,
+            reactions: data.reactions,
+            // Only overwrite if server actually sent the field
+            adminReactions: data.adminReactions ?? msg.adminReactions,
+          }
+        : msg,
+    ),
+  );
+});
+```
+
+Belt + suspenders: server always sends, client preserves on omission. Either side alone is sufficient; both makes the rollout window safe.
+
+### 10.6 Old messages with no `adminReactions` field
+
+Mongoose `Map<Number>` with `default: {}` ensures **new writes** always have the field. Existing messages in Mongo without it: read paths see `adminReactions: undefined`. All render paths use `msg.adminReactions || {}` — handled.
+
+Same goes for Redis sorted-set cached messages serialized before the schema change — they lack the field until the Lua script patches them. Defensive `|| {}` guards the client.
+
+### 10.7 Picker and hover panel — anchor stability
+
+- **Picker anchor**: the smiley `+` IconButton is part of the message row. Rows are append-only; the IconButton's DOM node stays stable while the picker is open. Safe.
+- **Hover panel anchor**: a reaction pill can disappear if a real-user un-reacts the only real reaction AND admin count drops to 0 at the same instant. Guard:
+
+  ```tsx
+  useEffect(() => {
+    if (!hoverPanel) return;
+    const msg = messages.find((m) => m._id === hoverPanel.messageId);
+    const realN = msg?.reactions?.[hoverPanel.emoji]?.length || 0;
+    const adminN = msg?.adminReactions?.[hoverPanel.emoji] || 0;
+    if (realN + adminN === 0) {
+      isPopoverOpenRef.current = false;
+      setHoverPanel(null);
+    }
+  }, [messages, hoverPanel]);
+  ```
+
+  Closes the panel cleanly if the anchored pill is about to unmount.
+
+### 10.8 Existing client `emitReaction` optimistic update — preserve `adminReactions`
+
+[chatBox.tsx:1187-1214](/Users/arshad/learning/football-next-score8o8/src/components/chatBox/chatBox.tsx#L1187-L1214) builds a fresh `reactions` object and returns `{ ...msg, reactions }`. The spread already preserves `adminReactions`. No change strictly needed — but worth verifying in implementation since `Object.entries(msg.reactions || {})` doesn't touch admin counts.
+
+### 10.9 The Lua script
+
+Today, `REACTION_SORTED_SET_SCRIPT` decodes the message and writes `decoded['reactions']`. Extending it to also write `decoded['adminReactions']` is purely additive on the cached JSON. Messages cached **before** the script change have no `adminReactions` key; messages cached **after** do. The client treats both with `|| {}`. No invalidation, no migration.
+
+The script still runs in a single `EVAL` — atomicity unchanged, race window unchanged.
+
+### 10.10 PM2 process restart
+
+In-memory state lost (same as today for `reactionBatch`). On next admin reaction, snapshot reloads from canonical Mongo, which holds all `$inc`-merged increments from other processes. Any unflushed delta at the moment of restart is lost — same risk profile as today's real-user reactions, acceptable per the existing convention documented in `BATCH_FLUSH_CLUSTER_PLAN.md`.
+
+---
+
+## 11. PERFORMANCE GUARANTEES
+
+| Vector | Baseline | After change | Impact |
+|---|---|---|---|
+| Mongo round trips per real-user reaction | 1 lazy read (first access) + 1 `updateOne` per flush + 1 canonical re-read per flush | Same — `adminReactions` co-fetched in the same `.select()` | 0 extra round trips |
+| Mongo round trips per admin reaction | n/a | 1 lazy read (first access, **shared with real-user lazy-seed if either touched first**) + amortized into the same `updateOne` per flush | 0 extra round trips beyond the first-access seed |
+| `updateOne` payload size | `$set`/`$unset` for reactions | Same + `$inc` for adminReactions (only if deltas exist) | Identical wire format, additive bytes |
+| Lua `EVAL` calls | 1 per flush per messageId | Same — extended script writes both fields | 0 extra calls |
+| Broadcast payload size | `~ users.length * 16B per emoji` JSON | + at most 7 emoji→Number entries (~70-100 bytes) | Negligible with socket.io compression |
+| Admin rapid-click (e.g., 50 clicks in 2s) | n/a | 50 in-memory increments, 1 `$inc { 'adminReactions.👍': 50 }` per flush window | Same scaling as today's typing throttle |
+| Client render cost per message | `Object.entries(reactions)` | `Object.entries(reactions)` + `Object.entries(adminReactions)` + dedupe | O(7) constant per message — bounded by `ALLOWED_REACTIONS.length` |
+| Memory: in-memory batches | `reactionBatch` + `reactionRetries` + `dirtyMessageIds` per active message | + `adminReactionBatch` + `adminReactionSnapshot` per active message | One additional `Map<emoji, Number>` and one `Map<emoji, Number>` per message — bounded; same eviction lifecycle as `reactionBatch` |
+| Socket auth check per admin reaction | n/a | `if (!socket.isAdmin)` boolean read | O(1) |
+
+### Why nothing slows down the hot path
+
+The **hot path** is real-user `add_reaction` events arriving from the score8o8 chat. The plan touches the hot path only in two ways:
+1. The lazy-seed `.select()` gains one extra field — 1-2 bytes more on the wire from Mongo.
+2. The broadcast payload gains the `adminReactions` field — at most ~100 bytes JSON, well under socket.io's compression threshold.
+
+No extra Mongo writes, no extra Redis calls, no extra Lua evals, no extra broadcasts. The new feature **piggybacks on existing trips**.
+
+### Admin-side hot path
+
+The new hot path is the admin spam-clicking the picker. This is bounded by:
+- Network — one socket emit per click (negligible)
+- Server — one in-memory `Map.set` per click, accumulated into a single `$inc` per flush window
+- Broadcast — one `message_reaction_updated` per click (could be 50/sec in worst case). Each is `O(emojis) = 7` JSON entries. Socket.io's room broadcast scales with room size, not click rate, so 1000 viewers in a room cost the same per broadcast.
+
+**Optional throttle** if peak admin clicks ever exceed broadcast bandwidth: server-side debounce the broadcast (e.g., coalesce within 100ms windows) while still applying every in-memory increment. Not in v1 — defer until observed.
+
+### What we explicitly do NOT do (and why)
+
+- **No new Redis keys.** Admin reactions live inside the existing message JSON in the sorted set. No new key namespace, no new TTLs, no new memory growth in Redis.
+- **No new Mongo indexes.** `adminReactions` is read only by `_id` (already indexed primary key).
+- **No new socket rooms.** Admins are already joined to the chat rooms they admin via `admin_join_room`.
+- **No optimistic update on admin side in v1.** Avoids state-divergence under multi-admin concurrency. Canonical broadcast round trip is ~50-100ms — fine.
+
+---
+
+## 12. ROLLOUT ORDER
+
+1. **Backend first** — schema + service + socket handlers + Lua extension. Real-user reactions keep working since the field is additive. The two `.select()` extensions and the `flushReactionBatch` early-continue fix go in this PR.
+2. **Verify with a manual `socket.emit` from a console** that `admin_add_reaction` increments and broadcasts `adminReactions`, and that real-user `add_reaction` now also broadcasts `adminReactions`.
+3. **Score8o8 client** — additive render change with the defensive `?? msg.adminReactions` listener. Old clients still work (just see fewer reactions).
 4. **Admin UI** — picker + hover panel.
 
-Each step is independently deployable; nothing breaks if step N is shipped before step N+1.
+Each step is independently deployable; the no-regression guarantees above mean nothing breaks if step N is shipped before step N+1.

@@ -1,0 +1,665 @@
+# Admin Multi-Reactions — Implementation Plan
+
+## Goal
+
+Let admins react **multiple times** to any chat message with any allowed emoji, inflating the visible reaction count clients see. From a regular client's perspective the message looks like many users reacted to it. From the admin's perspective there is a picker (click `+`) and a hover-controlled `-` / `+` panel on each existing pill to adjust their own counter.
+
+Three projects:
+- `football-chat-backend` — new socket events + new data field + flush/Redis sync
+- `football-admin` — picker UI + hover tooltip UI (write path)
+- `football-next-score8o8` — read-only render of the inflated count (no UI change of behavior)
+
+---
+
+## 1. DATA MODEL
+
+### New field on `Message`
+
+Today:
+```js
+reactions: { type: Map, of: [String], default: {} }   // emoji -> [usernames]
+```
+
+Add:
+```js
+adminReactions: { type: Map, of: Number, default: {} } // emoji -> count
+```
+
+Why a **count** (not an array of admin usernames):
+- The requirement is a single shared counter per emoji per message — every admin click increments it, every admin minus-click decrements it. Whether two different admins did it doesn't matter; the visible-to-client effect is identical.
+- A `Number` is mergeable across PM2 instances via Mongo `$inc` (atomic, conflict-free). An array of fake names would either need ever-growing strings or fight `$set` against itself.
+- Storage is O(emojis) per message instead of O(clicks).
+
+### Why keep `reactions` and `adminReactions` separate
+
+- `reactions` keeps its current semantics: real-user reactions, one per user per message, used for highlighting "you reacted with X".
+- `adminReactions` is purely additive count. It never affects highlight logic on the client side.
+- Final displayed count on every client = `realUsers.length + (adminReactions[emoji] || 0)`.
+
+### Allowed emojis
+
+Reuse the existing constant — no new emojis:
+```js
+const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡"];
+```
+
+---
+
+## 2. SOCKET EVENTS
+
+| Event | Direction | Payload | Auth |
+|---|---|---|---|
+| `admin_add_reaction` | admin → server | `{ roomId, messageId, emoji }` | `socket.isAdmin` required |
+| `admin_remove_reaction` | admin → server | `{ roomId, messageId, emoji }` | `socket.isAdmin` required |
+| `message_reaction_updated` | server → room | `{ messageId, reactions, adminReactions }` | n/a (existing event, **payload extended**) |
+
+### Why extend the existing `message_reaction_updated`
+
+- Clients already subscribe to it. Adding the `adminReactions` field is additive; old clients ignore it (display unchanged, no admin inflation).
+- Every reaction broadcast — whether from `add_reaction` (real user), `admin_add_reaction`, or `admin_remove_reaction` — emits the **full combined view** so listeners never need to merge deltas.
+
+### `admin_add_reaction` flow
+
+```js
+socket.on("admin_add_reaction", async (data) => {
+  if (!socket.isAdmin) {
+    socket.emit("error", { message: "Admin access required" });
+    return;
+  }
+  const { roomId, messageId, emoji } = data;
+  if (!roomId || !messageId || !emoji) return;
+  if (!ALLOWED_REACTIONS.includes(emoji)) return;
+
+  try {
+    const result = await applyAdminReactionService(messageId, emoji, +1);
+    if (!result) return;
+    io.to(roomId).emit("message_reaction_updated", {
+      messageId,
+      reactions: result.reactions,
+      adminReactions: result.adminReactions,
+    });
+  } catch (err) {
+    console.error("Admin reaction error:", err);
+  }
+});
+```
+
+`admin_remove_reaction` is identical with `-1` and a floor-at-0 guard inside the service.
+
+### Auth — reuse the existing path
+
+No new auth code. Just check `socket.isAdmin`, set by [socketHandler.js:99](/Users/arshad/learning/football-chat-backend/socket/socketHandler.js#L99) after `admin_authenticate` validates the JWT. Same check used by `admin_room_message`, `update_user`, `update_views_visibility`, etc. — keeps the convention consistent.
+
+---
+
+## 3. BACKEND — `applyAdminReactionService`
+
+In `modules/chat/service.js`, parallel to `applyReactionService`:
+
+```js
+// Admin reaction batch — per-message per-emoji DELTA since last flush
+// Map<messageId, Map<emoji, number>>
+const adminReactionBatch = new Map();
+// In-memory canonical snapshot of admin counts, used to broadcast and to
+// floor decrements at zero without a DB round-trip
+// Map<messageId, Map<emoji, number>>
+const adminReactionSnapshot = new Map();
+
+async function applyAdminReactionService(messageId, emoji, delta) {
+  if (!mongoose.isValidObjectId(messageId)) return null;
+
+  // Seed the snapshot from DB on first access (same lazy-load pattern as
+  // applyReactionService). This also seeds `reactionBatch` so the combined
+  // broadcast view stays consistent if a real-user reaction has not been
+  // loaded yet for this messageId.
+  if (!adminReactionSnapshot.has(messageId)) {
+    const msg = await MessageModel.findById(messageId)
+      .select("reactions adminReactions")
+      .lean();
+    const snap = new Map();
+    if (msg?.adminReactions) {
+      for (const [e, n] of Object.entries(msg.adminReactions)) {
+        if (n > 0) snap.set(e, n);
+      }
+    }
+    adminReactionSnapshot.set(messageId, snap);
+
+    if (!reactionBatch.has(messageId)) {
+      const rmap = new Map();
+      if (msg?.reactions) {
+        for (const [e, users] of Object.entries(msg.reactions)) {
+          rmap.set(e, new Set(users));
+        }
+      }
+      reactionBatch.set(messageId, rmap);
+    }
+  }
+
+  const snap = adminReactionSnapshot.get(messageId);
+  const current = snap.get(emoji) || 0;
+  let appliedDelta = delta;
+
+  if (delta < 0) {
+    // Floor at 0 — admin pressed minus when count was already 0 (race).
+    appliedDelta = -Math.min(-delta, current);
+    if (appliedDelta === 0) {
+      // No-op: return current state so caller still broadcasts (cheap, keeps
+      // all clients converged if they were out of sync)
+      return serializeCombined(messageId);
+    }
+  }
+
+  snap.set(emoji, current + appliedDelta);
+  if (snap.get(emoji) <= 0) snap.delete(emoji);
+
+  // Accumulate delta for the flush
+  const deltaMap = adminReactionBatch.get(messageId) || new Map();
+  deltaMap.set(emoji, (deltaMap.get(emoji) || 0) + appliedDelta);
+  if (deltaMap.get(emoji) === 0) deltaMap.delete(emoji);
+  if (deltaMap.size === 0) adminReactionBatch.delete(messageId);
+  else adminReactionBatch.set(messageId, deltaMap);
+
+  dirtyMessageIds.add(messageId);
+  return serializeCombined(messageId);
+}
+
+function serializeCombined(messageId) {
+  const reactions = {};
+  const rmap = reactionBatch.get(messageId);
+  if (rmap) {
+    rmap.forEach((users, e) => {
+      if (users.size > 0) reactions[e] = Array.from(users);
+    });
+  }
+  const adminReactions = {};
+  const snap = adminReactionSnapshot.get(messageId);
+  if (snap) {
+    snap.forEach((n, e) => {
+      if (n > 0) adminReactions[e] = n;
+    });
+  }
+  return { reactions, adminReactions };
+}
+```
+
+### Why `$inc` (not `$set`) for `adminReactions`
+
+PM2 multi-instance safety:
+- Real-user `reactions` uses `$set` per-emoji because each instance owns the full Set (one-per-user model) — overwriting its own emoji slot is correct.
+- Admin counters are **shared, additive**. Two instances both flushing `+3` and `+2` simultaneously must result in `+5`, not `+3`. `$inc` is atomic in Mongo and merges naturally.
+
+### Update `flushReactionBatch`
+
+The existing flush handles real-user `reactions` via `$set`/`$unset`. Extend it to also apply `$inc` for `adminReactions` deltas in the **same `updateOne` call** (so each messageId still flushes in one round trip):
+
+```js
+for (const messageId of ids) {
+  const reactions = reactionBatch.get(messageId);
+  const adminDeltas = adminReactionBatch.get(messageId);
+  if (!reactions && !adminDeltas) continue;
+
+  const setFields = {};
+  const unsetFields = {};
+  const incFields = {};
+
+  reactions?.forEach((users, emoji) => {
+    if (users.size > 0) setFields[`reactions.${emoji}`] = Array.from(users);
+    else unsetFields[`reactions.${emoji}`] = "";
+  });
+  adminDeltas?.forEach((delta, emoji) => {
+    if (delta !== 0) incFields[`adminReactions.${emoji}`] = delta;
+  });
+
+  const update = {};
+  if (Object.keys(setFields).length) update.$set = setFields;
+  if (Object.keys(unsetFields).length) update.$unset = unsetFields;
+  if (Object.keys(incFields).length) update.$inc = incFields;
+
+  // ... existing updateOne + matchedCount retry logic, identical to today
+}
+```
+
+### Clear admin delta after successful flush
+
+```js
+if (result.matchedCount > 0) {
+  // ... existing reaction cleanup
+  adminReactionBatch.delete(messageId); // deltas are consumed
+  // Re-read canonical adminReactions so the snapshot reflects merged increments
+  // from other PM2 instances (same reasoning as the existing canonical re-read
+  // for `reactions`)
+  const canonical = await MessageModel.findById(messageId)
+    .select("reactions adminReactions roomId")
+    .lean();
+  if (canonical?.roomId) {
+    // Refresh in-memory snapshot from canonical
+    const snap = new Map();
+    if (canonical.adminReactions) {
+      for (const [e, n] of Object.entries(canonical.adminReactions)) {
+        if (n > 0) snap.set(e, n);
+      }
+    }
+    adminReactionSnapshot.set(messageId, snap);
+    if (snap.size === 0 && !adminReactionBatch.has(messageId)) {
+      adminReactionSnapshot.delete(messageId);
+    }
+    await updateReactionInSortedSet(
+      String(canonical.roomId),
+      messageId,
+      canonical.reactions,
+      canonical.adminReactions,
+    );
+  }
+}
+```
+
+### Floor floor-at-zero on flush
+
+If concurrent `-1`s from two instances over-decrement, the in-memory floor catches it locally but the Mongo `$inc -1` could drive `adminReactions.<emoji>` below zero. After the canonical re-read, if any emoji is `<= 0`, issue a compensating `updateOne` that `$max`s it to 0 — or, simpler, on read every client/admin always treats negative as 0 (defensive). I prefer the defensive read approach since the floor is already enforced at the in-memory layer for the common case.
+
+---
+
+## 4. REDIS SORTED-SET SYNC
+
+The existing Lua script `REACTION_SORTED_SET_SCRIPT` patches `reactions` on the cached message. Extend it to also patch `adminReactions`:
+
+```lua
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+for i, val in ipairs(members) do
+  local ok, decoded = pcall(cjson.decode, val)
+  if ok and tostring(decoded['_id']) == ARGV[1] then
+    local score = redis.call('ZSCORE', KEYS[1], val)
+    local ok2, newReactions = pcall(cjson.decode, ARGV[2])
+    if ok2 then decoded['reactions'] = newReactions end
+    local ok3, newAdmin = pcall(cjson.decode, ARGV[3])
+    if ok3 then decoded['adminReactions'] = newAdmin end
+    redis.call('ZREM', KEYS[1], val)
+    redis.call('ZADD', KEYS[1], tonumber(score), cjson.encode(decoded))
+    return 1
+  end
+end
+return 0
+```
+
+Update `updateReactionInSortedSet(roomId, messageId, reactionsFromDb, adminReactionsFromDb)` to pass the third arg. Atomicity preserved — single `EVAL`, single ZREM/ZADD pair, no cross-instance race on the same message.
+
+### History load — `getChatHistory`
+
+Wherever the API/socket returns message history (the REST endpoint that `chat-table-rows.tsx` and `chatBox.tsx` both call), make sure the `adminReactions` field is included in the projection / lean select. Mongoose `Map<Number>` serializes to a plain object in `.lean()` automatically.
+
+---
+
+## 5. CLIENT — `football-next-score8o8/src/components/chatBox/chatBox.tsx`
+
+Almost zero behavior change. Two surgical edits:
+
+### A. Extend `MessageNew`
+
+```ts
+interface MessageNew {
+  // ...existing...
+  reactions?: Record<string, string[]>;
+  adminReactions?: Record<string, number>;
+}
+```
+
+### B. Inflate the displayed count in the pill render
+
+Currently at [chatBox.tsx:464-498](/Users/arshad/learning/football-next-score8o8/src/components/chatBox/chatBox.tsx#L464-L498):
+
+```ts
+{msg.reactions &&
+  Object.entries(msg.reactions).map(([emoji, users]) =>
+    users.length > 0 ? (
+      // ...
+      <span>{emoji}</span>
+      {users.length > 1 && <span>{users.length}</span>}
+    ) : null,
+  )}
+```
+
+Becomes:
+
+```ts
+{
+  // Compose the set of emojis we need to render: union of real and admin.
+  // Real users iterate first to keep emoji order stable; admin-only emojis
+  // get appended afterwards.
+  const realEntries = Object.entries(msg.reactions || {});
+  const adminEntries = Object.entries(msg.adminReactions || {});
+  const seen = new Set(realEntries.map(([e]) => e));
+  const emojiOrder = [
+    ...realEntries.map(([e]) => e),
+    ...adminEntries.filter(([e]) => !seen.has(e)).map(([e]) => e),
+  ];
+  return emojiOrder.map((emoji) => {
+    const users = msg.reactions?.[emoji] || [];
+    const adminN = msg.adminReactions?.[emoji] || 0;
+    const total = users.length + adminN;
+    if (total === 0) return null;
+    return (
+      <Box key={emoji} /* ... existing styles ... */>
+        <span>{emoji}</span>
+        {total > 1 && <span>{total}</span>}
+      </Box>
+    );
+  });
+}
+```
+
+Highlighting (`users.includes(reactingAs)`) is unchanged — a real client never "owns" any admin reactions. Click-pill-to-toggle stays unchanged — `emitReaction(emoji, msg._id)` only touches the real-user side, and admin counts persist independently.
+
+`message_reaction_updated` listener at [chatBox.tsx:1008-1018](/Users/arshad/learning/football-next-score8o8/src/components/chatBox/chatBox.tsx#L1008-L1018) needs to spread the new field:
+
+```ts
+newSocket.on("message_reaction_updated", (data) => {
+  isReactionUpdateRef.current = true;
+  setMessages((prev) =>
+    prev.map((msg) =>
+      msg._id === data.messageId
+        ? { ...msg, reactions: data.reactions, adminReactions: data.adminReactions }
+        : msg,
+    ),
+  );
+});
+```
+
+Scroll lock — no change needed; `isReactionUpdateRef` already covers it.
+
+### Optimistic update
+
+The optimistic update in `emitReaction` (real-user side) builds a fresh `reactions` object but doesn't touch `adminReactions`. To avoid wiping admin counts during the optimistic window, preserve them:
+
+```ts
+return { ...msg, reactions, adminReactions: msg.adminReactions };
+```
+
+(Spread already handles this — explicit only for clarity.)
+
+---
+
+## 6. ADMIN — `football-admin/src/sections/matches/chat-table-rows.tsx`
+
+This is the only project that gets net-new UI: a picker and a hover-controlled +/- panel.
+
+### Imports — add `Popover` and `Tooltip` (already imported)
+
+```tsx
+import { Popover } from '@mui/material';
+```
+
+### State
+
+```tsx
+const ALLOWED_REACTIONS = ['👍', '👎', '❤️', '😂', '😮', '😢', '😡'];
+
+// Picker (the `+` smiley → emoji-grid Popover, same as client)
+const [pickerAnchor, setPickerAnchor] = useState<{
+  el: HTMLElement;
+  messageId: string;
+} | null>(null);
+
+// Hover panel (existing pill → -/emoji/+ Popover)
+const [hoverPanel, setHoverPanel] = useState<{
+  el: HTMLElement;
+  messageId: string;
+  emoji: string;
+} | null>(null);
+const hoverCloseTimerRef = useRef<NodeJS.Timeout | null>(null);
+```
+
+### Reuse the scroll-lock pattern
+
+`chat-table-rows.tsx` already has `isPopoverOpenRef` for `ChatUserName` ([chat-table-rows.tsx:185](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L185)) and `isReactionUpdateRef` for incoming reaction updates ([chat-table-rows.tsx:187](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L187)). The auto-scroll effect at [chat-table-rows.tsx:351-365](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L351-L365) already bails when either is true.
+
+So when opening the picker OR the hover panel, set `isPopoverOpenRef.current = true`; reset to `false` on close. Same convention as the existing `ChatUserName` integration ([chat-table-rows.tsx:549](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L549)). No new lock primitive.
+
+### Emit helpers
+
+```tsx
+const emitAdminAdd = useCallback((emoji: string, messageId: string) => {
+  if (!socket || !isAuthenticated) return;
+  socket.emit('admin_add_reaction', { roomId, messageId, emoji });
+}, [socket, isAuthenticated, roomId]);
+
+const emitAdminRemove = useCallback((emoji: string, messageId: string) => {
+  if (!socket || !isAuthenticated) return;
+  socket.emit('admin_remove_reaction', { roomId, messageId, emoji });
+}, [socket, isAuthenticated, roomId]);
+```
+
+**No optimistic update on admin side.** Reason: admin clicks can be rapid-fire (the whole point is to spam reactions), and the server-side flush is fast enough (1/3/5s perf mode) that the canonical broadcast feels live. An optimistic counter would diverge from the canonical view when multiple admins react simultaneously, and reconciling that mid-stream is fiddly. The broadcast round-trip is ~50-100ms — fine.
+
+If latency proves visible, add the same optimistic pattern as the client side (`isReactionUpdateRef` gate, increment local state, let server echo confirm).
+
+### Picker button on each message (the smiley `+`)
+
+In the existing message render block ([chat-table-rows.tsx:528-637](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L528-L637)), add an `IconButton` next to the reaction pills row — matching the client's pattern at [chatBox.tsx:499-518](/Users/arshad/learning/football-next-score8o8/src/components/chatBox/chatBox.tsx#L499-L518):
+
+```tsx
+<Tooltip title="Add reaction" arrow disableFocusListener disableInteractive>
+  <IconButton
+    size="small"
+    onClick={(e) => {
+      isPopoverOpenRef.current = true;
+      setPickerAnchor({ el: e.currentTarget, messageId: msg._id! });
+    }}
+  >
+    <Iconify icon="mdi:emoticon-plus-outline" width={18} />
+  </IconButton>
+</Tooltip>
+```
+
+### Picker `Popover` (mounted once at the bottom of the component)
+
+```tsx
+<Popover
+  open={!!pickerAnchor}
+  anchorEl={pickerAnchor?.el}
+  onClose={() => {
+    isPopoverOpenRef.current = false;
+    setPickerAnchor(null);
+  }}
+  anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+  transformOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+>
+  <Stack direction="row" gap={0.25} sx={{ p: 0.5 }}>
+    {ALLOWED_REACTIONS.map((emoji) => (
+      <IconButton
+        key={emoji}
+        size="small"
+        onClick={() => {
+          if (pickerAnchor) emitAdminAdd(emoji, pickerAnchor.messageId);
+          // DO NOT close — admin can spam-click the same emoji
+        }}
+        sx={{ borderRadius: 2, transition: 'background-color 0.15s' }}
+      >
+        <Typography sx={{ fontSize: '1.25rem', lineHeight: 1 }}>{emoji}</Typography>
+      </IconButton>
+    ))}
+  </Stack>
+</Popover>
+```
+
+**Key difference from client picker**: this picker does NOT close on emoji click. Each click on the same emoji emits another `admin_add_reaction`. Admin closes manually by clicking outside (`onClose` fires). The client picker by contrast closes after one selection (toggle semantics, [chatBox.tsx:1235-1242](/Users/arshad/learning/football-next-score8o8/src/components/chatBox/chatBox.tsx#L1235-L1242)).
+
+### Hover panel on existing pills
+
+Wrap the pill rendering in handlers:
+
+```tsx
+const openHoverPanel = (el: HTMLElement, messageId: string, emoji: string) => {
+  if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
+  isPopoverOpenRef.current = true;
+  setHoverPanel({ el, messageId, emoji });
+};
+
+const scheduleHoverClose = () => {
+  if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
+  hoverCloseTimerRef.current = setTimeout(() => {
+    isPopoverOpenRef.current = false;
+    setHoverPanel(null);
+  }, 150);
+};
+
+const cancelHoverClose = () => {
+  if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
+};
+```
+
+Pill (existing render at [chat-table-rows.tsx:610-633](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L610-L633)):
+
+```tsx
+<Box
+  key={emoji}
+  onMouseEnter={(e) => openHoverPanel(e.currentTarget, msg._id!, emoji)}
+  onMouseLeave={scheduleHoverClose}
+  sx={{ /* existing pill styles */ cursor: 'pointer' }}
+>
+  <span>{emoji}</span>
+  {total > 1 && <span>{total}</span>}   {/* total = users.length + adminReactions[emoji] */}
+</Box>
+```
+
+The 150ms close delay is the standard "hover bridge" pattern — gives the user time to move from pill into the panel without it disappearing. The panel itself mirrors `onMouseEnter`/`onMouseLeave` with the same `cancelHoverClose`/`scheduleHoverClose`.
+
+### Hover `Popover` panel
+
+```tsx
+<Popover
+  open={!!hoverPanel}
+  anchorEl={hoverPanel?.el}
+  onClose={() => {
+    isPopoverOpenRef.current = false;
+    setHoverPanel(null);
+  }}
+  anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+  transformOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+  // Crucial — let mouse hover stay registered, don't steal focus
+  disableRestoreFocus
+  sx={{ pointerEvents: 'none' }}
+  PaperProps={{
+    onMouseEnter: cancelHoverClose,
+    onMouseLeave: scheduleHoverClose,
+    sx: { pointerEvents: 'auto' },
+  }}
+>
+  {hoverPanel && (() => {
+    const msg = messages.find((m) => m._id === hoverPanel.messageId);
+    const adminCount = msg?.adminReactions?.[hoverPanel.emoji] || 0;
+    const canMinus = adminCount > 0;
+    return (
+      <Stack direction="row" alignItems="center" gap={0.5} sx={{ p: 0.5 }}>
+        <IconButton
+          size="small"
+          disabled={!canMinus}
+          onClick={() => emitAdminRemove(hoverPanel.emoji, hoverPanel.messageId)}
+        >
+          <Iconify icon="mdi:minus" width={18} />
+        </IconButton>
+        <Typography sx={{ fontSize: '1.25rem', lineHeight: 1, px: 0.5 }}>
+          {hoverPanel.emoji}
+        </Typography>
+        <IconButton
+          size="small"
+          onClick={() => emitAdminAdd(hoverPanel.emoji, hoverPanel.messageId)}
+        >
+          <Iconify icon="mdi:plus" width={18} />
+        </IconButton>
+      </Stack>
+    );
+  })()}
+</Popover>
+```
+
+### Disabling `-` per the spec
+
+> if admin has reacted 0 time of that reaction than minus will not work
+
+`disabled={!canMinus}` where `canMinus = (msg?.adminReactions?.[emoji] || 0) > 0`. The `-` button is greyed out and unclickable when admin's count for that emoji is 0. Since `adminReactions` is the **shared** admin counter (any admin can decrement it as long as the total is > 0), if a different admin had reacted you can still minus. That matches the spec's wording ("admin has reacted one time" — the admin collective, since there's only one shared admin counter per emoji).
+
+### Wire up `message_reaction_updated` to include `adminReactions`
+
+[chat-table-rows.tsx:316-323](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L316-L323):
+
+```tsx
+newSocket.on('message_reaction_updated', (data) => {
+  isReactionUpdateRef.current = true;
+  setMessages((prev) =>
+    prev.map((msg) =>
+      msg._id === data.messageId
+        ? { ...msg, reactions: data.reactions, adminReactions: data.adminReactions }
+        : msg,
+    ),
+  );
+});
+```
+
+### Extend `MessageNew` interface
+
+[chat-table-rows.tsx:34-44](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L34-L44):
+
+```ts
+interface MessageNew {
+  // ...existing...
+  adminReactions?: Record<string, number>;
+}
+```
+
+### Update the pill render to use the combined count
+
+[chat-table-rows.tsx:596-635](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx#L596-L635) — same union-of-emojis pattern as the score8o8 client (see §5.B above). Render only emojis with `total > 0`; show count only when `total > 1`.
+
+### Cleanup on unmount
+
+```tsx
+useEffect(() => () => {
+  if (hoverCloseTimerRef.current) clearTimeout(hoverCloseTimerRef.current);
+}, []);
+```
+
+---
+
+## 7. AUTH / SECURITY
+
+- The only writers are `admin_add_reaction` and `admin_remove_reaction`. Both check `socket.isAdmin` exactly like every other admin event in the file.
+- `socket.isAdmin` is set only inside `admin_authenticate` after `authenticateToken(token)` returns `userRoleFromToken === "admin"` ([socketHandler.js:96-99](/Users/arshad/learning/football-chat-backend/socket/socketHandler.js#L96-L99)). Same JWT path as `admin_room_message`.
+- Banned-user check is **not** applied to admins (admins can't be banned). Skipped here.
+- No emoji outside `ALLOWED_REACTIONS` is accepted; silent reject (no echo, no broadcast) — same as `add_reaction` today.
+
+---
+
+## 8. CROSS-INSTANCE / PERFORMANCE CONSIDERATIONS
+
+| Concern | Handling |
+|---|---|
+| Two PM2 instances flushing admin deltas for same message | `$inc` is atomic in Mongo, deltas merge; canonical re-read after flush refreshes in-memory snapshot |
+| Admin clicks 50 times in 2s during peak mode (5s flush) | All 50 increments live in one in-memory delta; one `$inc: { 'adminReactions.👍': 50 }` flushed once |
+| Admin double-clicks `-` at count=1 | First decrement applied; second decrement floored at 0 (in-memory check) → no broadcast suppression but `appliedDelta=0` so no $inc emitted |
+| Admin reacts to message that's still in another instance's write batch | Same retry-up-to-10-cycles path as `applyReactionService` — the seed-from-DB fails, but in-memory snapshot is empty, increments accumulate, retries fire after Mongo write lands |
+| Redis sorted-set cache and Mongo diverge | After every successful flush, canonical doc is re-read from Mongo and `updateReactionInSortedSet` patches both fields atomically via the Lua script — same convergence guarantee as real reactions today |
+| History endpoint stale during the flush window | Same as today — Redis sorted set is patched after flush, so a history fetch right before flush sees the pre-flush state, right after sees the post-flush state. The in-memory snapshot + live socket broadcast cover the window for any connected user/admin |
+| Memory growth from `adminReactionBatch` / `adminReactionSnapshot` | Same eviction pattern as `reactionBatch` — snapshot is cleared once the message has no pending deltas and the canonical state is empty; otherwise kept warm for fast subsequent reads |
+
+---
+
+## 9. FILES CHANGED
+
+| File | Changes |
+|---|---|
+| `football-chat-backend/modules/chat/messageModel.js` | Add `adminReactions: { type: Map, of: Number, default: {} }` |
+| `football-chat-backend/modules/chat/service.js` | New `applyAdminReactionService`; new `adminReactionBatch` + `adminReactionSnapshot`; extend `flushReactionBatch` with `$inc`; extend `updateReactionInSortedSet` signature + Lua script |
+| `football-chat-backend/socket/socketHandler.js` | New `admin_add_reaction` and `admin_remove_reaction` handlers; extend `message_reaction_updated` payload from existing `add_reaction` handler to also emit `adminReactions` |
+| `football-next-score8o8/src/components/chatBox/chatBox.tsx` | Extend `MessageNew`; combine real + admin counts in pill render; spread `adminReactions` in `message_reaction_updated` listener |
+| `football-admin/src/sections/matches/chat-table-rows.tsx` | Extend `MessageNew`; combined-count pill render; new picker button + Popover; new hover panel Popover with -/+/disabled-minus logic; emit helpers; spread `adminReactions` in `message_reaction_updated` listener |
+
+---
+
+## 10. ROLLOUT ORDER
+
+1. **Backend first** — schema + service + socket handlers + Lua extension. Real-user reactions keep working since the field is additive.
+2. **Verify with a manual `socket.emit` from a console** that `admin_add_reaction` increments and broadcasts `adminReactions`.
+3. **Score8o8 client** — additive render change. Old clients still work (just see fewer reactions).
+4. **Admin UI** — picker + hover panel.
+
+Each step is independently deployable; nothing breaks if step N is shipped before step N+1.

@@ -3,6 +3,8 @@ const mongoose = require("mongoose");
 const {
   saveChatMessageService,
   applyReactionService,
+  applyAdminReactionService,
+  readAdminSnapshot,
 } = require("@project/modules/chat/service");
 const {
   joinRoom,
@@ -402,12 +404,59 @@ function setupSocketHandlers(io) {
           username,
         );
         if (!reactions) return;
+        // Include adminReactions snapshot so listeners that spread the payload
+        // into state don't clobber existing admin counts.
         io.to(roomId).emit("message_reaction_updated", {
           messageId,
           reactions,
+          adminReactions: readAdminSnapshot(messageId),
         });
       } catch (err) {
         console.error("Reaction error:", err);
+      }
+    });
+
+    socket.on("admin_add_reaction", async (data) => {
+      if (!socket.isAdmin) {
+        socket.emit("error", { message: "Admin access required" });
+        return;
+      }
+      const { roomId, messageId, emoji } = data || {};
+      if (!roomId || !messageId || !emoji) return;
+      if (!ALLOWED_REACTIONS.includes(emoji)) return;
+
+      try {
+        const result = await applyAdminReactionService(messageId, emoji, 1);
+        if (!result) return;
+        io.to(roomId).emit("message_reaction_updated", {
+          messageId,
+          reactions: result.reactions,
+          adminReactions: result.adminReactions,
+        });
+      } catch (err) {
+        console.error("Admin add reaction error:", err);
+      }
+    });
+
+    socket.on("admin_remove_reaction", async (data) => {
+      if (!socket.isAdmin) {
+        socket.emit("error", { message: "Admin access required" });
+        return;
+      }
+      const { roomId, messageId, emoji } = data || {};
+      if (!roomId || !messageId || !emoji) return;
+      if (!ALLOWED_REACTIONS.includes(emoji)) return;
+
+      try {
+        const result = await applyAdminReactionService(messageId, emoji, -1);
+        if (!result) return;
+        io.to(roomId).emit("message_reaction_updated", {
+          messageId,
+          reactions: result.reactions,
+          adminReactions: result.adminReactions,
+        });
+      } catch (err) {
+        console.error("Admin remove reaction error:", err);
       }
     });
 

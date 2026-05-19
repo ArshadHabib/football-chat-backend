@@ -176,10 +176,19 @@ const dirtyMessageIds = new Set();
 const reactionRetries = new Map();
 const MAX_REACTION_RETRIES = 10;
 
+// Admin reactions are a shared count per emoji per message (any admin can $inc
+// or $dec it). Two structures keep them flush-safe across PM2 instances:
+//   adminReactionBatch     — Map<messageId, Map<emoji, number>>  deltas pending flush
+//   adminReactionSnapshot  — Map<messageId, Map<emoji, number>>  current totals (seed + applied deltas)
+// The snapshot is what gets broadcast; the batch is what gets $inc'd to Mongo.
+const adminReactionBatch = new Map();
+const adminReactionSnapshot = new Map();
+
 // Lua script: atomically finds the message by _id in the sorted set and
-// patches its reactions field. Running in Lua ensures the ZRANGE → ZREM → ZADD
-// sequence is never interleaved with a concurrent flush from another PM2 instance,
-// which would otherwise produce duplicate entries for the same message.
+// patches its reactions and adminReactions fields. Running in Lua ensures the
+// ZRANGE → ZREM → ZADD sequence is never interleaved with a concurrent flush
+// from another PM2 instance, which would otherwise produce duplicate entries
+// for the same message.
 const REACTION_SORTED_SET_SCRIPT = `
 local members = redis.call('ZRANGE', KEYS[1], 0, -1)
 for i, val in ipairs(members) do
@@ -188,6 +197,8 @@ for i, val in ipairs(members) do
     local score = redis.call('ZSCORE', KEYS[1], val)
     local ok2, newReactions = pcall(cjson.decode, ARGV[2])
     if ok2 then decoded['reactions'] = newReactions end
+    local ok3, newAdmin = pcall(cjson.decode, ARGV[3])
+    if ok3 then decoded['adminReactions'] = newAdmin end
     redis.call('ZREM', KEYS[1], val)
     redis.call('ZADD', KEYS[1], tonumber(score), cjson.encode(decoded))
     return 1
@@ -196,21 +207,49 @@ end
 return 0
 `;
 
-// Accepts canonical reactions from MongoDB (plain object) so the sorted set
+// Accepts canonical reactions + adminReactions from MongoDB so the sorted set
 // always reflects the true merged state, not just one instance's batch.
-async function updateReactionInSortedSet(roomId, messageId, reactionsFromDb) {
+async function updateReactionInSortedSet(
+  roomId,
+  messageId,
+  reactionsFromDb,
+  adminReactionsFromDb,
+) {
   const serialized = {};
   if (reactionsFromDb) {
     for (const [emoji, users] of Object.entries(reactionsFromDb)) {
       if (users.length > 0) serialized[emoji] = users;
     }
   }
+  const serializedAdmin = {};
+  if (adminReactionsFromDb) {
+    for (const [emoji, n] of Object.entries(adminReactionsFromDb)) {
+      if (n > 0) serializedAdmin[emoji] = n;
+    }
+  }
   await redis
     .eval(REACTION_SORTED_SET_SCRIPT, {
       keys: [`${REDIS_MSG_CACHE_PREFIX}${roomId}`],
-      arguments: [String(messageId), JSON.stringify(serialized)],
+      arguments: [
+        String(messageId),
+        JSON.stringify(serialized),
+        JSON.stringify(serializedAdmin),
+      ],
     })
     .catch(() => {});
+}
+
+// Read-only snapshot of admin reactions for broadcasting. Returns {} if the
+// message hasn't been touched yet — the broadcast still happens, clients
+// already have the correct value from history load or a prior broadcast.
+function readAdminSnapshot(messageId) {
+  const snap = adminReactionSnapshot.get(messageId);
+  if (!snap) return {};
+  const out = {};
+  snap.forEach((n, e) => {
+    if (n > 0) out[e] = n;
+  });
+  return out;
 }
 
 async function flushReactionBatch() {
@@ -220,19 +259,36 @@ async function flushReactionBatch() {
 
   for (const messageId of ids) {
     const reactions = reactionBatch.get(messageId);
-    if (!reactions) continue;
+    const adminDeltas = adminReactionBatch.get(messageId);
+    // A messageId may be dirty due to admin-only deltas (no real-user batch
+    // entry) — both must be checked before skipping.
+    if (!reactions && !adminDeltas) continue;
     const setFields = {};
     const unsetFields = {};
-    reactions.forEach((users, emoji) => {
-      if (users.size > 0) {
-        setFields[`reactions.${emoji}`] = Array.from(users);
-      } else {
-        unsetFields[`reactions.${emoji}`] = "";
-      }
-    });
+    const incFields = {};
+    if (reactions) {
+      reactions.forEach((users, emoji) => {
+        if (users.size > 0) {
+          setFields[`reactions.${emoji}`] = Array.from(users);
+        } else {
+          unsetFields[`reactions.${emoji}`] = "";
+        }
+      });
+    }
+    if (adminDeltas) {
+      adminDeltas.forEach((delta, emoji) => {
+        if (delta !== 0) incFields[`adminReactions.${emoji}`] = delta;
+      });
+    }
     const update = {};
     if (Object.keys(setFields).length > 0) update.$set = setFields;
     if (Object.keys(unsetFields).length > 0) update.$unset = unsetFields;
+    if (Object.keys(incFields).length > 0) update.$inc = incFields;
+    // If only zero-deltas were collected, nothing to write — clean up and continue
+    if (Object.keys(update).length === 0) {
+      if (adminDeltas) adminReactionBatch.delete(messageId);
+      continue;
+    }
     try {
       const result = await MessageModel.updateOne({ _id: messageId }, update);
       if (result.matchedCount === 0) {
@@ -241,6 +297,7 @@ async function flushReactionBatch() {
         const retries = (reactionRetries.get(messageId) || 0) + 1;
         if (retries >= MAX_REACTION_RETRIES) {
           reactionBatch.delete(messageId);
+          adminReactionBatch.delete(messageId);
           reactionRetries.delete(messageId);
         } else {
           reactionRetries.set(messageId, retries);
@@ -248,22 +305,41 @@ async function flushReactionBatch() {
         }
       } else {
         reactionRetries.delete(messageId);
-        // Evict from cache only if no new reaction arrived during the flush window
+        // Admin deltas have been consumed (applied via $inc). Always clear them —
+        // the canonical re-read below refreshes the snapshot from Mongo.
+        adminReactionBatch.delete(messageId);
+        // Evict reaction batch from cache only if no new reaction arrived
+        // during the flush window
         if (!dirtyMessageIds.has(messageId)) {
           reactionBatch.delete(messageId);
         }
-        // Re-read from MongoDB to get the canonical merged reactions (all PM2
-        // instances write their own reactions via $set patches; the findById here
-        // sees the combined result). This value — not the in-memory batch — is
-        // what goes into the sorted set, so concurrent flushes converge correctly.
+        // Re-read from MongoDB to get the canonical merged reactions and
+        // adminReactions (all PM2 instances write their own patches; the
+        // findById here sees the combined result). These values — not the
+        // in-memory batches — are what goes into the sorted set, so
+        // concurrent flushes converge correctly.
         const canonical = await MessageModel.findById(messageId)
-          .select("reactions roomId")
+          .select("reactions adminReactions roomId")
           .lean();
         if (canonical?.roomId) {
+          // Refresh the in-memory admin snapshot from canonical so subsequent
+          // broadcasts include merged increments from other PM2 instances.
+          const snap = new Map();
+          if (canonical.adminReactions) {
+            for (const [e, n] of Object.entries(canonical.adminReactions)) {
+              if (n > 0) snap.set(e, n);
+            }
+          }
+          if (snap.size === 0 && !adminReactionBatch.has(messageId)) {
+            adminReactionSnapshot.delete(messageId);
+          } else {
+            adminReactionSnapshot.set(messageId, snap);
+          }
           await updateReactionInSortedSet(
             String(canonical.roomId),
             messageId,
             canonical.reactions,
+            canonical.adminReactions,
           );
         }
       }
@@ -287,30 +363,48 @@ async function flushReactionBatchLoop() {
 }
 flushReactionBatchLoop();
 
+// Lazily seeds both the real-user reaction batch AND the admin snapshot for a
+// message on first access. One DB read covers both — avoids extra round trips
+// when reactions and adminReactions are touched in any order for the same
+// message. Returns true if seeding succeeded (or was already done), false if
+// the messageId is invalid.
+async function seedReactionStateIfNeeded(messageId) {
+  if (reactionBatch.has(messageId) && adminReactionSnapshot.has(messageId)) {
+    return true;
+  }
+  if (!mongoose.isValidObjectId(messageId)) return false;
+
+  const msg = await MessageModel.findById(messageId)
+    .select("reactions adminReactions")
+    .lean();
+
+  if (!reactionBatch.has(messageId)) {
+    const reactionMap = new Map();
+    if (msg?.reactions) {
+      for (const [e, users] of Object.entries(msg.reactions)) {
+        reactionMap.set(e, new Set(users));
+      }
+    }
+    reactionBatch.set(messageId, reactionMap);
+  }
+
+  if (!adminReactionSnapshot.has(messageId)) {
+    const snap = new Map();
+    if (msg?.adminReactions) {
+      for (const [e, n] of Object.entries(msg.adminReactions)) {
+        if (n > 0) snap.set(e, n);
+      }
+    }
+    adminReactionSnapshot.set(messageId, snap);
+  }
+  return true;
+}
+
 // Returns serialized reactions object after applying toggle/switch logic.
 // Loads from DB into batch on first access for a given messageId.
 async function applyReactionService(messageId, emoji, username) {
-  if (!reactionBatch.has(messageId)) {
-    const msg = await MessageModel.findById(messageId)
-      .select("reactions")
-      .lean();
-    if (msg) {
-      const reactionMap = new Map();
-      if (msg.reactions) {
-        for (const [e, users] of Object.entries(msg.reactions)) {
-          reactionMap.set(e, new Set(users));
-        }
-      }
-      reactionBatch.set(messageId, reactionMap);
-    } else {
-      // Message not in DB yet (still in a write batch on some instance).
-      // Seed an empty reaction map so the reaction is applied in memory now.
-      // flushReactionBatch will retry writing reactions to DB until the message
-      // appears — works across all PM2 instances since MongoDB is shared.
-      if (!mongoose.isValidObjectId(messageId)) return null;
-      reactionBatch.set(messageId, new Map());
-    }
-  }
+  const ok = await seedReactionStateIfNeeded(messageId);
+  if (!ok) return null;
 
   const reactions = reactionBatch.get(messageId);
 
@@ -336,6 +430,59 @@ async function applyReactionService(messageId, emoji, username) {
     if (users.size > 0) serialized[e] = Array.from(users);
   });
   return serialized;
+}
+
+// Applies a signed delta (+1 for add, -1 for remove) to the admin counter for
+// (messageId, emoji). The counter is shared across all admins on the message;
+// each admin click increments it. Returns the combined { reactions,
+// adminReactions } view for broadcasting, or null if the messageId is invalid.
+//
+// Floor-at-zero is enforced in memory so a stray decrement when the count is
+// already 0 doesn't drive Mongo's $inc below zero (defensive — clients also
+// guard the minus button when the count is 0).
+async function applyAdminReactionService(messageId, emoji, delta) {
+  const ok = await seedReactionStateIfNeeded(messageId);
+  if (!ok) return null;
+
+  const snap = adminReactionSnapshot.get(messageId);
+  const current = snap.get(emoji) || 0;
+  let appliedDelta = delta;
+
+  if (delta < 0) {
+    appliedDelta = -Math.min(-delta, current);
+  }
+
+  if (appliedDelta !== 0) {
+    snap.set(emoji, current + appliedDelta);
+    if (snap.get(emoji) <= 0) snap.delete(emoji);
+
+    const deltaMap = adminReactionBatch.get(messageId) || new Map();
+    deltaMap.set(emoji, (deltaMap.get(emoji) || 0) + appliedDelta);
+    if (deltaMap.get(emoji) === 0) deltaMap.delete(emoji);
+    if (deltaMap.size === 0) adminReactionBatch.delete(messageId);
+    else adminReactionBatch.set(messageId, deltaMap);
+
+    dirtyMessageIds.add(messageId);
+  }
+
+  return serializeCombinedReactions(messageId);
+}
+
+// Combined view used by both real-user and admin reaction broadcasts. Always
+// includes both fields so a single message_reaction_updated event carries the
+// full state — no listener has to merge deltas.
+function serializeCombinedReactions(messageId) {
+  const reactions = {};
+  const rmap = reactionBatch.get(messageId);
+  if (rmap) {
+    rmap.forEach((users, e) => {
+      if (users.size > 0) reactions[e] = Array.from(users);
+    });
+  }
+  return {
+    reactions,
+    adminReactions: readAdminSnapshot(messageId),
+  };
 }
 
 async function saveChatMessageService(roomId, messageData) {
@@ -590,6 +737,8 @@ module.exports = {
   deleteChatRoomService,
   saveChatMessageService,
   applyReactionService,
+  applyAdminReactionService,
+  readAdminSnapshot,
   retrieveRoomMessagesService,
   deleteAllChatMessagesService,
   deleteAllDBChatRoomService,

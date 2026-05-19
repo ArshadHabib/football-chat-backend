@@ -42,6 +42,11 @@ const messageSchema = new mongoose.Schema(
       of: [String],
       default: {},
     },
+    adminReactions: {
+      type: Map,
+      of: Number,
+      default: {},
+    },
     timestamp: {
       type: Date,
       default: Date.now,

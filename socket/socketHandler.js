@@ -33,7 +33,7 @@ const { validateMessage } = require("@project/utils/messageValidation");
 const { getFlag, FEATURE_VALIDATION } = require("@project/utils/feature_flags");
 
 const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
-const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡"];
+const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡", "🖕"];
 const RECENT_MESSAGES_BUFFER = 5;
 
 // Typing state: Map<roomId, Map<socketId, { username, timer }>>

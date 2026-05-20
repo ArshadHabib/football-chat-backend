@@ -322,6 +322,8 @@ function setupSocketHandlers(io) {
         const key = `${REDIS_RATE_LIMIT_PREFIX}${ip}`;
         pipeline.incr(key); // [2]
         pipeline.expire(key, rateLimitWindowSeconds, "NX"); // [3]
+        pipeline.ttl(key); // [4] — inlined so both rejection and at-cap
+                           //       paths get the cooldown without an extra RTT
       }
       const results = await pipeline.exec();
       const isBanned = results[0];
@@ -330,13 +332,27 @@ function setupSocketHandlers(io) {
       if (!roomStillExists) return;
       if (ip) {
         const count = results[2];
+        const retryAfter = results[4];
         if (count > rateLimitMax) {
-          const retryAfter = await redis.ttl(`${REDIS_RATE_LIMIT_PREFIX}${ip}`);
+          // Rejection path — message dropped.
           socket.emit("server_rate_limit", {
             message: `Limit reached. Retry in ${retryAfter} seconds`,
             retryAfter,
           });
           return;
+        }
+        if (count === rateLimitMax) {
+          // Admit path — message still gets broadcast below, but pre-emptively
+          // tell the client they've hit the cap so the inline countdown shows
+          // and the Send button disables. Eliminates the "ghost message"
+          // problem for the normal case (next send would otherwise hit the
+          // rejection path and the sender's optimistic message would linger
+          // even though the server dropped it).
+          socket.emit("server_rate_limit", {
+            message: `Limit reached. Retry in ${retryAfter} seconds`,
+            retryAfter,
+          });
+          // fall through — broadcast this message normally
         }
       }
 

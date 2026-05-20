@@ -30,7 +30,11 @@ const {
   REDIS_ROOMS_SET,
 } = require("@project/utils/const_config");
 const { validateMessage } = require("@project/utils/messageValidation");
-const { getFlag, FEATURE_VALIDATION } = require("@project/utils/feature_flags");
+const {
+  getFlag,
+  FEATURE_VALIDATION,
+  onFlagChange,
+} = require("@project/utils/feature_flags");
 
 const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
 const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡", "🖕"];
@@ -53,6 +57,18 @@ function clearTypingUser(io, roomId, socketId) {
 
 function setupSocketHandlers(io) {
   setIO(io);
+
+  // Forward validation-flag changes to connected sockets. Each PM2 instance
+  // already receives the __feature_change__ Redis pub/sub message
+  // independently (via featuresSubClient in feature_flags.js), so io.emit()
+  // would fan out cluster-wide via the socket.io Redis adapter and produce
+  // N×N broadcasts. io.local.emit restricts to this instance's sockets —
+  // 1:N per instance, N×1 total. Only the validation flag is exposed to
+  // clients; registration stays server-internal.
+  onFlagChange((name, value) => {
+    if (name !== FEATURE_VALIDATION) return;
+    io.local.emit("validation_changed", { value: !!value });
+  });
 
   // Periodically evict typingUsers entries for rooms that have no connected sockets.
   // Handles the edge case where a room is abandoned without a clean typing_stop/disconnect.
@@ -275,6 +291,9 @@ function setupSocketHandlers(io) {
       const result = await joinRoom(roomId, socket, senderName, websiteName);
 
       if (result.success) {
+        // Surface current validation flag so the client can mirror it as its
+        // non-essential-validation local state. Other flags stay server-internal.
+        result.validation = !!getFlag(FEATURE_VALIDATION);
         socket.emit("join_result", result);
         scheduleUserCountUpdate(roomId);
         // socket.to(roomId).emit("user_joined", {

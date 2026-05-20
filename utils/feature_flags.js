@@ -40,6 +40,27 @@ const DEFAULTS = Object.freeze({
 // by applyFlag() whenever __feature_change__ fires.
 const flags = { ...DEFAULTS };
 
+// Listeners notified on every flag change, regardless of which instance
+// triggered the change. The socket layer registers a listener here to
+// broadcast validation flips to its connected sockets via io.local.emit.
+// Kept module-local so feature_flags.js doesn't import socket.io directly.
+const listeners = new Set();
+
+function onFlagChange(handler) {
+  listeners.add(handler);
+  return () => listeners.delete(handler);
+}
+
+function notifyListeners(name, value) {
+  listeners.forEach((fn) => {
+    try {
+      fn(name, value);
+    } catch (err) {
+      console.error("Feature flag listener error:", err);
+    }
+  });
+}
+
 function applyFlag(name, value) {
   if (!(name in DEFAULTS)) return; // unknown flag, ignore
   flags[name] = !!value;
@@ -85,6 +106,7 @@ async function setFlag(name, value) {
   }
   const normalized = !!value;
   applyFlag(name, normalized);
+  notifyListeners(name, normalized);
   await pubClient.set(`${KEY_PREFIX}${name}`, normalized ? "true" : "false");
   await pubClient.publish(CHANNEL, JSON.stringify({ name, value: normalized }));
 }
@@ -97,6 +119,7 @@ async function subscribeToChanges() {
     try {
       const { name, value } = JSON.parse(message);
       applyFlag(name, value);
+      notifyListeners(name, !!value);
     } catch (err) {
       console.error("Feature flag pub/sub message error:", err, message);
     }
@@ -111,4 +134,5 @@ module.exports = {
   getFlag,
   getAllFlags,
   setFlag,
+  onFlagChange,
 };

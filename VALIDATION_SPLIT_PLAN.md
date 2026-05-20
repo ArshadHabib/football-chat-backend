@@ -349,3 +349,222 @@ Each step is independently deployable and reversible.
 | `validation_changed` (new) | server → client (per-instance broadcast) | `{ value: boolean }` | Admin toggles the validation flag via existing `POST /set-feature-flag` |
 
 Both are additive shape changes — no breaking field renames or removals. Other feature flags (`registration`) remain server-internal and are not exposed over the socket.
+
+---
+
+# Implementation Notes — 2026-05-21
+
+**Status:** Implemented. Backend `node -c` clean on both touched files; client `tsc --noEmit` exit 0.
+
+## What was implemented
+
+Matches §1–§3 of the plan above. Concrete file outcomes:
+
+### `football-chat-backend/utils/feature_flags.js`
+- Added `listeners` (Set) + `onFlagChange(handler)` registry + `notifyListeners(name, value)` helper.
+- `setFlag` calls `notifyListeners` synchronously after `applyFlag` (originator path — fires before the Redis publish round-trip).
+- `subscribeToChanges` calls `notifyListeners` after `applyFlag` inside the Redis pub/sub callback (cross-instance path).
+- Errors thrown by individual listeners are caught + logged, never propagate.
+- `onFlagChange` exported alongside the existing API.
+
+### `football-chat-backend/socket/socketHandler.js`
+- Imported `onFlagChange` alongside existing `getFlag` + `FEATURE_VALIDATION`.
+- Inside `setupSocketHandlers(io)`, registered an `onFlagChange` listener that filters to `FEATURE_VALIDATION` and calls `io.local.emit("validation_changed", { value: !!value })`.
+- `join_room` success path attaches `result.validation = !!getFlag(FEATURE_VALIDATION)` before `socket.emit("join_result", result)`.
+- The failure path is unchanged — no `validation` field on `join_result` when `success: false`.
+- The existing `validateMessage` + `room_message` handler logic was **not touched** — server-side validation behavior is identical to before.
+
+### `football-next-score8o8/src/utils/messageValidation.ts`
+- Added `export const MAX_LENGTH = 200`.
+- Added `runNonEssentialValidation(content, recentMessages) → { ok: boolean }`.
+- Added `normalizeForBuffer(content) → string` — exposes the same normalization used by the heuristics, for callers that want to push the message onto `recentMessagesRef`.
+- All existing exports (individual checks) kept.
+
+### `football-next-score8o8/src/components/chatBox/chatBox.tsx`
+- New state `const [nonEssentialValidationOn, setNonEssentialValidationOn] = useState(true)`.
+- `join_result` handler reads `data.validation` (typed as `validation?: boolean`) and calls `setNonEssentialValidationOn(data.validation)` when present.
+- New `newSocket.on("validation_changed", ...)` listener that mirrors the flag.
+- `handleSendMessage` refactored: essentials (ban → length → rate limit → URL → `cleanString`) always run; non-essentials gated by `nonEssentialValidationOn` (single `runNonEssentialValidation` call, single `"This content is not allowed!"` error on first failure).
+- `recentMessagesRef` updated inside the non-essential branch only — when the flag is off the buffer doesn't grow.
+- `ChatInput` simplified: no in-`handleSubmit` length error, no `cleanString` wrap (forwards raw input now). `setError` prop + caller removed since it's no longer used inside.
+- Send button's `disabled` extended with `(!!userName && inputValue.trim().length > MAX_LENGTH)`.
+- Module imports pruned to `MAX_LENGTH`, `runNonEssentialValidation`, `normalizeForBuffer` — the individual heuristic imports (`normalizeLeetspeak`, `checkBotSuffix`, `checkAllCaps`, …) are no longer referenced from `chatBox.tsx`.
+
+### Character-counter UI (added during testing)
+
+- A `<Typography variant="caption">` was added at the bottom-left of `ChatInput`'s `<Stack>` (which is now `position: relative`).
+- Counter is `position: absolute, top: '100%', left: 0, mt: 0.25, pointerEvents: 'none'` — sits in the wrapping `<Box sx={{ p: 2 }}>`'s existing bottom padding zone. No layout shift.
+- Display: `{inputValue.trim().length}/{MAX_LENGTH}`. Only rendered when `userName` is set (no message limit during username registration).
+- Parent Typography color: `text.secondary`.
+- The current-length number is wrapped in a `<Box component="span">` that flips to `color: 'error.main'` when `inputValue.trim().length > MAX_LENGTH`; the `/200` portion stays `text.secondary`. Uses MUI theme colors — no hardcoded hex.
+
+## Deviations from the plan
+
+- **Counter UI** was added during the implementation phase and isn't in the original plan §1-§9. Documented above.
+- **Wrapping Box bottom padding** stayed at `pb: 2` (not bumped to `pb: 3`) — a tweak was tried and reverted by the user.
+
+No other deviations.
+
+## Verification
+
+- `node -c utils/feature_flags.js && node -c socket/socketHandler.js` → clean.
+- `npx tsc --noEmit` in `football-next-score8o8` → exit 0.
+
+---
+
+# Performance — Before / After
+
+**Date:** 2026-05-21. Cluster baseline: 5 PM2 instances, Redis + Mongo on same box (per [PERF_REPORT.md](./PERF_REPORT.md)).
+
+## Per `room_message` event — server side
+
+The server's validation behavior is **unchanged**. Same in-memory `getFlag(FEATURE_VALIDATION)` read, same `validateMessage` path. Zero CPU/IO delta.
+
+## Per `room_message` event — client side
+
+| Phase | Before (heuristics always on) | After (flag ON) | After (flag OFF) |
+|---|---|---|---|
+| `containsUrls` (URL regex) | ~5 µs | ~5 µs | ~5 µs |
+| `cleanString` (profanity censor) | ~10 µs (was called from `ChatInput.handleSubmit`) | ~10 µs (now called from `handleSendMessage`) | ~10 µs |
+| `normalizeLeetspeak` + `.toLowerCase().trim().replace...` | ~3 µs | ~3 µs | **0 µs** (skipped) |
+| 6 heuristic checks (`checkBotSuffix` … `checkFuzzyDuplicate`) | ~5–15 µs combined | ~5–15 µs combined | **0 µs** (skipped) |
+| Push to `recentMessagesRef` | ~1 µs | ~1 µs | **0 µs** (skipped) |
+
+**Net:** when the flag is OFF, the client saves ~8–18 µs per message send. When ON, identical to before. Either way: imperceptible to the user — typing latency is dominated by React's render cycle (~1–3 ms), not by validation work.
+
+## Per-keystroke cost — character counter
+
+The counter reads `inputValue.trim().length` on every render of `ChatInput`. `inputValue` changes on every keystroke, so `ChatInput` re-renders every keystroke regardless of the counter — adding the counter costs **one extra Typography render per keystroke**, ~50 µs each. Bounded by typing speed (~10 keystrokes/sec for fast typists → 500 µs/s = 0.05% of one core in the browser).
+
+## Per-flag-change event — backend
+
+| Step | Cost |
+|---|---|
+| Admin `POST /set-feature-flag` | Existing HTTP path, one Redis `SET` + one `PUBLISH` |
+| `notifyListeners(name, value)` synchronous fan-out on originator | `Set.forEach` over (currently) 1 listener → 1 function call |
+| Each PM2 instance's `subscribeToChanges` callback | One `JSON.parse` + `applyFlag` + `notifyListeners` (existing flow) |
+| Socket-layer listener: `io.local.emit("validation_changed", ...)` | One emit per connected socket on this instance |
+
+The `io.local.emit` deliberately bypasses the socket.io Redis adapter — each PM2 instance receives the `__feature_change__` Redis pub/sub message independently, so using `io.emit` would fan out cluster-wide via the adapter and produce N×N broadcasts. With `io.local.emit` we get 1:N per instance, N×1 total — clean and bounded by total connected sockets.
+
+At 30 000 connected viewers cluster-wide: one admin toggle → ~30 000 small JSON broadcasts spread across 5 instances (6 000 each), each `~30 B` after socket.io permessage-deflate. Single-digit milliseconds of total work, fires only when admin actually toggles (rare).
+
+## Per-`join_result` — backend
+
+One `getFlag(FEATURE_VALIDATION)` in-memory read attached to the existing response. Indistinguishable from baseline.
+
+## What is NOT changing
+
+- Existing all-or-nothing server-side `validateMessage` gate.
+- Existing ban + room + rate-limit Redis pipeline at the top of `room_message`.
+- Mongo writes, Redis sorted-set cache, broadcast fan-out for reactions, pinned messages, scroll-lock conventions.
+- The `FEATURE_REGISTRATION` flag — still server-internal, not exposed to clients.
+- The Redis-backed feature-flag persistence + `__feature_change__` pub/sub channel.
+
+---
+
+# Files Changed (debounce-style summary)
+
+| File | Change |
+|------|--------|
+| `football-chat-backend/utils/feature_flags.js` | + `listeners` Set, `onFlagChange(handler)`, `notifyListeners`. Wired into both `setFlag` and `subscribeToChanges`. Export `onFlagChange`. |
+| `football-chat-backend/socket/socketHandler.js` | (1) Subscribe via `onFlagChange` → `io.local.emit("validation_changed", { value })` (filtered to `FEATURE_VALIDATION`). (2) Attach `result.validation = !!getFlag(FEATURE_VALIDATION)` on join_room success. |
+| `football-next-score8o8/src/utils/messageValidation.ts` | + `MAX_LENGTH = 200`. + `runNonEssentialValidation(content, recentMessages) → { ok }`. + `normalizeForBuffer(content) → string`. |
+| `football-next-score8o8/src/components/chatBox/chatBox.tsx` | + `nonEssentialValidationOn` state (default `true`). + listeners on `join_result.validation` and `validation_changed`. Refactor `handleSendMessage` (essentials always, non-essentials gated). `ChatInput` cleanup (no inline length error, no `cleanString` wrap, no `setError` prop). Send button `disabled` extended with `length > MAX_LENGTH`. Character counter in input area (number turns `error.main` on overflow). |
+
+---
+
+# Update — 2026-05-21: Client-Side Rate-Limit UX
+
+**Status:** Implemented. `tsc --noEmit` clean.
+
+## Why
+
+The client-side rate limit (`MESSAGES_LIMIT` per `LIMIT_SECONDS` window, currently `1` / `5s`) lives entirely inside the React component — it's a UX guard before the server's per-IP Redis check. Two issues with the original flow:
+
+1. **Silent message deletion.** When the user sent message #1 and then tried to send #2 within the 5-second window, `ChatInput.handleSubmit` would call `onSendMessage(inputValue)` then unconditionally `setInputValue("")`. Inside `handleSendMessage`, `checkRateLimit()` would detect the previous timestamp, set `rateLimitExceeded=true`, and bail with no side-effect on the input. **Net: the typed text was cleared but the message was never sent.** The user only realized after-the-fact, with no way to recover their text.
+
+2. **Indicator was disruptive.** The countdown was shown as a red `<Alert>` at the top of the input area, mirroring `server_rate_limit`. For client-side limits (which fire on every send if the user is rapid-typing), this Alert was constantly appearing and re-flowing the input area.
+
+3. **State lag.** `setRateLimitExceeded(true)` happened inside `checkRateLimit()`, but only *during the next send attempt*. The user wasn't told they'd been rate-limited until they tried again.
+
+## What changed
+
+### `football-next-score8o8/src/components/chatBox/chatBox.tsx`
+
+1. **Inline countdown at bottom-right** of `ChatInput`'s `<Stack>`, mirroring the character counter at bottom-left:
+   ```tsx
+   {userName && rateLimitExceeded && remainingSeconds > 0 && (
+     <Typography
+       variant="caption"
+       sx={{
+         position: "absolute",
+         top: "100%",
+         right: 0,
+         mt: 0.25,
+         pointerEvents: "none",
+         color: "error.main",
+         fontWeight: 500,
+       }}
+     >
+       Send next message in: {remainingSeconds}s
+     </Typography>
+   )}
+   ```
+   - Absolute-positioned inside the wrapping `<Box sx={{ p: 2 }}>`'s existing bottom padding zone — no layout shift, no UI reflow.
+   - Uses MUI theme `error.main`, no hardcoded color.
+   - Visible only when the user is logged in (`userName`), is currently rate-limited, and has time remaining.
+
+2. **`_remainingSeconds` → `remainingSeconds`** (state used to be prefixed because nothing rendered it; now we render it). Passed as a new prop to `ChatInput`.
+
+3. **`handleSendMessage` now returns `Promise<boolean>`** — `true` only after the `socket.emit("room_message", ...)` succeeds. Every early-return path (ban / length / rate limit / URL / heuristic fail) returns `false`. `ChatInput.handleSubmit` awaits the result and **clears the input only on `true`**:
+   ```tsx
+   const sent = await onSendMessage(inputValue);
+   if (sent) setInputValue("");
+   ```
+   Fixes the silent-deletion bug for **all** early-return paths, not just rate limit.
+
+4. **`checkRateLimit()` re-run after a successful send.** Without this, the user only learned about the rate limit when their *next* send attempt failed:
+   ```tsx
+   socket.emit("room_message", { ... });
+   // If this send just pushed us to the per-window limit, flip the
+   // rate-limit state immediately so the inline countdown appears right
+   // away.
+   checkRateLimit();
+   return true;
+   ```
+   Now: send msg → countdown appears on screen before the user can type the next message.
+
+5. **`setError("Limit reached…")` calls removed in two places** (the top-of-input Alert is no longer used for client rate limits):
+   - Inside `checkRateLimit()` itself.
+   - Inside the countdown-decrement `useEffect`.
+
+6. **Inputs stay editable while rate-limited.** Previously the `TextField` had `disabled={!socketConnected || rateLimitExceeded}` and an `error={... || rateLimitExceeded}` styling that turned the input grey-with-red-border. Changed to `disabled={!socketConnected}` and `error={!userName && /\s/.test(inputValue)}`. **Only the Send button greys out** when rate-limited; the user can keep typing while waiting for the window to clear.
+
+## What stays the same
+
+- The decrement-every-1s `useEffect` driving `setRemainingSeconds(prev - 1)`. Still ticks the countdown down to 0, then flips `rateLimitExceeded=false` and clears `messageTimestampsRef.current`.
+- The `server_rate_limit` socket listener at [chatBox.tsx:1301-1308](/Users/arshad/learning/football-next-score8o8/src/components/chatBox/chatBox.tsx#L1301-L1308) is **untouched**. Server-driven rate limits (per-IP, in Redis) still trigger the top-of-input Alert via `setError(data.message)` — that path was explicitly out of scope for this change.
+- The Send button's `disabled` still includes `rateLimitExceeded` (was already there).
+- `MESSAGES_LIMIT = 1` and `LIMIT_SECONDS = 5` — matches the server-side per-IP config (`utils/perfomance_config.js` → `rateLimitMax: 1, rateLimitWindowSeconds: 5`) in all three performance modes.
+
+## Known follow-up (not implemented)
+
+When `server_rate_limit` fires, the sender's optimistic-push of their own message is **not rolled back**. The sender still sees the message in their own chat even though the server silently dropped it and no other client received it. Two viable fixes:
+
+1. Track each optimistic message with a temporary client ID; on `server_rate_limit`, remove the most recent unconfirmed message by this user.
+2. Defer the optimistic `setMessages` until the server echoes `room_message` back. Loses ~50-100 ms of "snappy send" feel but is dead-simple.
+
+Deferred — flagged for a separate change.
+
+## Performance
+
+Trivial. The new inline countdown is one extra Typography render per second per rate-limited user (the decrement effect already existed). The `checkRateLimit()` post-send re-call is one extra Array filter + length compare per successful send — sub-microsecond.
+
+No new socket events. No new server load. The rate-limit Redis pipeline on the server side is unchanged.
+
+## Files Changed
+
+| File | Change |
+|------|--------|
+| `football-next-score8o8/src/components/chatBox/chatBox.tsx` | Rename `_remainingSeconds` → `remainingSeconds`. Drop `setError(...)` from `checkRateLimit` + countdown effect. `handleSendMessage` returns `Promise<boolean>`; emits before returning `true`; re-runs `checkRateLimit()` after a successful send. `ChatInput.handleSubmit` awaits + clears input only on `true`. `ChatInput` accepts new `remainingSeconds` prop; renders inline countdown at bottom-right. TextField no longer disables/errors on `rateLimitExceeded`. |

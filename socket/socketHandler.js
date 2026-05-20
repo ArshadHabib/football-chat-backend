@@ -421,12 +421,15 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
-      const { roomId, messageId, emoji } = data || {};
+      const { roomId, messageId, emoji, delta } = data || {};
       if (!roomId || !messageId || !emoji) return;
       if (!ALLOWED_REACTIONS.includes(emoji)) return;
 
+      // Accept a delta from a debounced client. Default 1, no upper cap.
+      const n = Math.max(parseInt(delta, 10) || 1, 1);
+
       try {
-        const result = await applyAdminReactionService(messageId, emoji, 1);
+        const result = await applyAdminReactionService(messageId, emoji, n);
         if (!result) return;
         io.to(roomId).emit("message_reaction_updated", {
           messageId,
@@ -443,12 +446,14 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
-      const { roomId, messageId, emoji } = data || {};
+      const { roomId, messageId, emoji, delta } = data || {};
       if (!roomId || !messageId || !emoji) return;
       if (!ALLOWED_REACTIONS.includes(emoji)) return;
 
+      const n = Math.max(parseInt(delta, 10) || 1, 1);
+
       try {
-        const result = await applyAdminReactionService(messageId, emoji, -1);
+        const result = await applyAdminReactionService(messageId, emoji, -n);
         if (!result) return;
         io.to(roomId).emit("message_reaction_updated", {
           messageId,

@@ -1058,3 +1058,79 @@ Mongo write rate is **decoupled from click rate** — bounded by flush window. T
 | `football-chat-backend/socket/socketHandler.js` | + `admin_add_reaction`, `admin_remove_reaction` handlers; existing `add_reaction` broadcast now includes `adminReactions` |
 | `football-next-score8o8/src/components/chatBox/chatBox.tsx` | `MessageNew` extended; combined-count pill render; defensive listener; optimistic update preserves `adminReactions` |
 | `football-admin/src/sections/matches/chat-table-rows.tsx` | `MessageNew` extended; combined-count pill render; smiley `+` button; picker `Popover` (closes on click); hover panel `Popover` with `-`/emoji/`+` and disabled-minus-at-zero; auto-close-on-empty effect; defensive listener |
+
+---
+
+# Update — 2026-05-20: Client-Side Debouncing of Admin Reactions
+
+**Status:** Implemented. Backend syntax clean, admin TypeScript clean.
+
+## Why
+
+In the initial implementation every admin click on the picker emoji / hover-panel `+` / `-` fired one `socket.emit` immediately, which the server translated into one in-memory increment **and one `message_reaction_updated` broadcast to every viewer in the room**. With 10,000 viewers per room and 10 clicks/sec, that's **100,000 downstream emits per second** for a single admin's spam. The Mongo writes were already coalesced via the flush window (§11), but the broadcast amplification was not.
+
+## What changed
+
+### Client side ([`football-admin/src/sections/matches/chat-table-rows.tsx`](/Users/arshad/learning/football-admin/src/sections/matches/chat-table-rows.tsx))
+
+- **Per-`(messageId, emoji)` accumulator** — `adminDeltasRef: Map<"messageId|emoji", signed_int>` tracks net pending delta per pill.
+- **`lodash/debounce`** (300 ms, created once via `useMemo`) wraps `flushAdminReactions`. Every click resets the timer; the flush only fires after the burst stops.
+- **On flush**, the accumulator is walked once: for each non-zero key, **one** `admin_add_reaction` (if delta > 0) or `admin_remove_reaction` (if delta < 0) is emitted with `{ roomId, messageId, emoji, delta: |n| }`.
+- **Optimistic local update** — `setMessages` bumps `msg.adminReactions[emoji]` synchronously on every click (clamped at 0). The admin sees the count tick immediately while the server emit is pending. Server echo overwrites this with the canonical value when it arrives.
+- **Stable refs** for `socket`, `isAuthenticated`, `roomId` — the debounced function reads through refs so its identity stays stable across re-renders, otherwise React would re-create the debounce and cancel pending bursts.
+- **Unmount cleanup** calls `flushAdminReactions.flush()` so any in-flight delta still hits the server before the component disappears.
+- **No cap.** A reconsidered decision — `socket.isAdmin` is already the trust boundary, Mongo `$inc` handles any 64-bit int, and a cap doesn't prevent sustained spam (just shifts it to multiple bursts). The cap added friction without real safety.
+
+### Backend side ([`football-chat-backend/socket/socketHandler.js`](/Users/arshad/learning/football-chat-backend/socket/socketHandler.js))
+
+Three-line change on each of `admin_add_reaction` and `admin_remove_reaction`:
+
+```js
+const { roomId, messageId, emoji, delta } = data || {};
+// ...validation...
+const n = Math.max(parseInt(delta, 10) || 1, 1);
+const result = await applyAdminReactionService(messageId, emoji, +n /* or -n */);
+```
+
+- Reads `delta` from the payload; defaults to `1` if omitted (so any pre-debounce-rollout client still works).
+- Floor of 1 prevents zero or negative values from inverting the operation.
+- No upper cap — the admin is already trusted.
+- `applyAdminReactionService` already accepted arbitrary signed integers; no service-layer change.
+
+## Performance — before / after debounce
+
+### Worst-case admin spam: 50 clicks in 2 s on one (`messageId`, `emoji`)
+
+| Vector | Before debounce | After debounce | Δ |
+|--------|----------------|----------------|---|
+| Socket emits (admin → server) | 50 | **1** | −98% |
+| `applyAdminReactionService` calls | 50 | **1** | −98% |
+| Server broadcasts (`message_reaction_updated`) | 50 | **1** | −98% |
+| Total downstream emits at 10K viewers | 500,000 | **10,000** | −98% |
+| Mongo `$inc` ops per flush window (peak mode, 5 s flush) | 1 (already coalesced) | 1 | — |
+| Optimistic count visible to admin | Lags by ~50 ms × 50 echoes | **Instant on every click** | — |
+
+### Realistic burst: 5 admins each clicking 5×/s for 10 s = 250 total clicks
+
+| Vector | Before | After (each admin debounces individually) | Δ |
+|--------|--------|------------------------------------------|---|
+| Total admin emits | 250 | ~10 (one per ~300 ms quiet pause per admin) | −96% |
+| Total `message_reaction_updated` broadcasts | 250 | ~10 | −96% |
+| Viewer client re-renders at 10K viewers | 2.5 M | ~100K | −96% |
+| Mongo `$inc` ops over the 10 s window | 2 per messageId (coalesced) | Same | — |
+
+The Mongo write count was already decoupled from click rate (§11). Debouncing closes the gap by also decoupling the **broadcast** count from click rate.
+
+### What is NOT changing
+
+- Optimistic admin UI reconciles with server echoes — same shape, same listener.
+- Backwards compat: server still accepts old-style emits without `delta` (defaults to 1), so a partially-rolled-out admin keeps working.
+- All §10 no-regression guarantees still hold (no extra Mongo round trips, no extra Redis EVALs, scroll-lock conventions unchanged).
+- Anonymous and real-user `add_reaction` events are **not** debounced — per-user one-per-message toggle/switch semantics are unchanged. Only the admin-multi path debounces, because only it can produce rapid same-pill repeats.
+
+## Files Changed (debounce update)
+
+| File | Change summary |
+|------|----------------|
+| `football-admin/src/sections/matches/chat-table-rows.tsx` | + `lodash/debounce` import; + `adminDeltasRef` accumulator; + `flushAdminReactions` debounced flush (300 ms); + `applyOptimisticAdminDelta` for instant local UI; refactored `emitAdminAdd`/`emitAdminRemove` into a shared `queueAdminReaction`; unmount cleanup |
+| `football-chat-backend/socket/socketHandler.js` | `admin_add_reaction` and `admin_remove_reaction` now read `data.delta` (default 1, floor 1); no upper cap |

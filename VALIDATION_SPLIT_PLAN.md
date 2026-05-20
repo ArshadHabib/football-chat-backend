@@ -568,3 +568,55 @@ No new socket events. No new server load. The rate-limit Redis pipeline on the s
 | File | Change |
 |------|--------|
 | `football-next-score8o8/src/components/chatBox/chatBox.tsx` | Rename `_remainingSeconds` → `remainingSeconds`. Drop `setError(...)` from `checkRateLimit` + countdown effect. `handleSendMessage` returns `Promise<boolean>`; emits before returning `true`; re-runs `checkRateLimit()` after a successful send. `ChatInput.handleSubmit` awaits + clears input only on `true`. `ChatInput` accepts new `remainingSeconds` prop; renders inline countdown at bottom-right. TextField no longer disables/errors on `rateLimitExceeded`. |
+
+---
+
+## Follow-up — Server-Side Rate-Limit UX Unified
+
+**Status:** Implemented. `tsc --noEmit` clean.
+
+## Regression discovered after deploy
+
+After collapsing the top-of-input Alert for client-side rate limit, the `server_rate_limit` socket listener was left calling `setError(data.message)`. With the surrounding decrement effect no longer updating `error`, two regressions surfaced:
+
+1. **Static text.** The Alert displayed `"Limit reached. Retry in 5 seconds"` and **never decremented** — the original decrement effect used to re-call `setError(...)` every tick, which I had removed.
+2. **Never auto-cleared.** When the countdown reached 0, `setRateLimitExceeded(false)` fired but `setError(null)` did not — the stale Alert stayed visible indefinitely.
+
+Send-button disable was actually working (via `rateLimitExceeded` in `disabled`), but with a stale Alert hanging around it appeared unrelated to the limit.
+
+## Fix
+
+Drop `setError(data.message)` from the `server_rate_limit` listener. Now both client- and server-side rate limits use the **same inline bottom-right countdown** ("Send next message in: Ns"). No top-of-input Alert for either case:
+
+```ts
+newSocket.on("server_rate_limit", (data) => {
+  // Unified UX: server-side rate limit uses the same inline bottom-right
+  // countdown as client-side. setRateLimitExceeded drives the Send-button
+  // disable; setRemainingSeconds + the existing decrement effect tick it
+  // down. No top-of-input Alert (was static + never auto-cleared).
+  setRateLimitExceeded(true);
+  setRemainingSeconds(data.retryAfter);
+});
+```
+
+The existing decrement effect already handles the tick-down + cleanup for any `rateLimitExceeded=true` state — it doesn't care whether the source was client (`checkRateLimit()`) or server (`server_rate_limit`).
+
+## What this gives us
+
+| Source | Send button disabled | Inline countdown visible | Top-of-input Alert |
+|--------|----------------------|-------------------------|--------------------|
+| Client `checkRateLimit()` | ✓ | ✓ | ✗ (gone) |
+| `server_rate_limit` socket event | ✓ | ✓ | ✗ (gone) |
+| Banned / URL / heuristic fail | n/a | n/a | ✓ (still uses `setError`) |
+
+Single UX rule: **a non-zero `remainingSeconds` with `rateLimitExceeded=true` means there's a pending rate-limit cooldown — show the inline countdown and disable Send.** Origin is irrelevant.
+
+## Why this isn't reverting an earlier scope decision
+
+Earlier I said the `server_rate_limit` listener was "untouched" because the client UX for it was conventional (the Alert). After my client-side changes turned the Alert into a stale ghost, that statement no longer held — the regression forced revisiting that scope. The unification simplifies the contract for future reviewers: there's exactly one rate-limit indicator on the client, regardless of which side detected it.
+
+## Files Changed
+
+| File | Change |
+|------|--------|
+| `football-next-score8o8/src/components/chatBox/chatBox.tsx` | Drop `setError(data.message)` from the `server_rate_limit` listener. Update the decrement-effect comment to reflect the unified UX. |

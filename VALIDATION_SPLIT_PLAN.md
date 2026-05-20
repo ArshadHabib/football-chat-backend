@@ -620,3 +620,111 @@ Earlier I said the `server_rate_limit` listener was "untouched" because the clie
 | File | Change |
 |------|--------|
 | `football-next-score8o8/src/components/chatBox/chatBox.tsx` | Drop `setError(data.message)` from the `server_rate_limit` listener. Update the decrement-effect comment to reflect the unified UX. |
+
+---
+
+## Follow-up — Pre-emptive At-Cap Rate-Limit Signal (Server-Side)
+
+**Status:** Implemented. `node -c` clean.
+
+## The remaining issue
+
+After unifying client + server rate-limit UX, one bug was still open: when the server rejected a `room_message` (`count > rateLimitMax`), the sender's **optimistic message stayed visible** in their own chat even though the server dropped it and no other viewer ever received it. Sender thinks the message went through; nobody else saw it.
+
+Two options were considered (see the conversation transcript) — rollback-on-rejection, or wait-for-server-echo. Both have downsides. The chosen fix is a different shape entirely: make the rejection branch **unreachable** in the normal case.
+
+## The idea
+
+The instant a user's message *exactly hits* the per-IP cap (the message that **was** admitted but the next will be rejected), the server pre-emptively emits a `server_rate_limit` signal to that socket — same event the client already listens for. The current message broadcasts normally. The Send button disables and the inline countdown appears **before** the user can try to send another message.
+
+Mirrors how the client already handles its own post-send `checkRateLimit()` re-check — just moves the responsibility to the server when the server is the source of truth (per-IP, multi-tab, multi-instance).
+
+Normal flow:
+1. Client sends msg #1 → server admits + broadcasts + emits `server_rate_limit { retryAfter }`.
+2. Client's existing listener: `setRateLimitExceeded(true)` + `setRemainingSeconds(retryAfter)` → Send disables, countdown appears.
+3. Client physically cannot send msg #2 for `retryAfter` seconds.
+4. After cooldown, Redis counter has expired anyway. Fresh send works.
+
+The rejection branch (`count > rateLimitMax`) is now only reachable when the client bypasses the JS layer or when two browser tabs from the same IP race past the at-cap signal — both edge cases.
+
+## What changed
+
+### `football-chat-backend/socket/socketHandler.js` — `room_message` handler
+
+Two changes in one block:
+
+1. **Inlined `pipeline.ttl(key)`** as the 5th pipeline command, so both rate-limit branches (rejection + at-cap) get the cooldown without an extra Redis round trip.
+2. **Added an `if (count === rateLimitMax)` branch** between the rejection and the broadcast: emits `server_rate_limit` and **falls through** to the normal broadcast path.
+
+```js
+const pipeline = redis.multi();
+pipeline.sIsMember(BANNED_USERS_KEY, senderName); // [0]
+pipeline.sIsMember(REDIS_ROOMS_SET, roomId);      // [1]
+if (ip) {
+  const key = `${REDIS_RATE_LIMIT_PREFIX}${ip}`;
+  pipeline.incr(key);                              // [2]
+  pipeline.expire(key, rateLimitWindowSeconds, "NX"); // [3]
+  pipeline.ttl(key);                               // [4] — inlined
+}
+const results = await pipeline.exec();
+// ...
+if (ip) {
+  const count = results[2];
+  const retryAfter = results[4];
+  if (count > rateLimitMax) {
+    socket.emit("server_rate_limit", {
+      message: `Limit reached. Retry in ${retryAfter} seconds`,
+      retryAfter,
+    });
+    return;
+  }
+  if (count === rateLimitMax) {
+    // Admit + pre-emptive at-cap signal. No return — broadcast below.
+    socket.emit("server_rate_limit", {
+      message: `Limit reached. Retry in ${retryAfter} seconds`,
+      retryAfter,
+    });
+  }
+}
+// ... existing broadcast + save
+```
+
+### Client side — **zero changes**
+
+The existing `server_rate_limit` listener already does exactly the right thing:
+
+```ts
+newSocket.on("server_rate_limit", (data) => {
+  setRateLimitExceeded(true);
+  setRemainingSeconds(data.retryAfter);
+});
+```
+
+It treats both "this message was rejected" and "you've now hit the cap" identically — semantically, both mean *"you're in a cooldown for retryAfter seconds, don't send."* Send button disables, countdown appears, decrement effect ticks it down to zero.
+
+## Performance
+
+- **No extra Redis round trips** in any path — `ttl` is inlined into the existing pipeline. The rejection path actually loses its previous `await redis.ttl(...)` call, so it's net **one fewer RTT** in that branch.
+- **One extra socket emit** on the at-cap path (was already one emit on rejection). At rateLimitMax = 1 per 5 s window, this is at most 1 emit per IP per window — negligible.
+
+## Coverage
+
+| Scenario | Pre-fix | Post-fix |
+|---|---|---|
+| Normal single-tab user hits limit | Sender sees ghost on msg #2 (rejected) | Sender disabled before they can try msg #2 → no ghost |
+| Bot bypasses JS layer | Sees rejection signal | Sees same signal (rejection still works) |
+| Two tabs from same IP, race past cap | Both could see ghosts | Tab A admitted gets at-cap signal; Tab B (if it sends within ~100 ms) hits rejection → still a brief ghost on Tab B |
+
+The two-tab race is a narrow gap — covered later only if it becomes a real complaint.
+
+## What is NOT changing
+
+- The three other silent-drop paths on the server (`isBanned`, `!roomStillExists`, `!verdict.ok`) still drop without signaling the client. Ghost messages on those paths remain a known issue, but those drops are extremely rare in practice and weren't in scope here.
+- Client `checkRateLimit()` and the inline countdown logic — unchanged.
+- The `server_rate_limit` event payload shape — unchanged.
+
+## Files Changed
+
+| File | Change |
+|------|--------|
+| `football-chat-backend/socket/socketHandler.js` | (1) Inlined `pipeline.ttl(key)` as index `[4]` of the existing rate-limit pipeline. (2) Rejection branch now reads `retryAfter` from `results[4]` instead of an extra `await redis.ttl(...)`. (3) New `if (count === rateLimitMax)` branch emits a pre-emptive `server_rate_limit` then falls through to broadcast. |

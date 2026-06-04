@@ -322,14 +322,16 @@ The reason there's nothing to do here: `saveChatMessageService` already takes th
 | Choice | Decision |
 |---|---|
 | Reply icon placement | Bottom-right of each message, absolute-positioned (mirrors the reaction `+` at bottom-left). See §5.3. |
+| Reply icon Tooltip | **Controlled** with per-message `replyTooltipOpen` state. Force-closed on click so the scroll lock releases immediately and the outgoing reply auto-scrolls into view. Mirrors the existing reaction-picker Tooltip pattern in `MessageItem`. See §5.3. |
 | Scroll-lock | Hover-only (Tooltip onOpen/onClose). Click does NOT lock scroll. See §5.10. |
 | Quote-preview placement (composer) | Directly above the textbox, anchored to the input area. See §5.5. |
 | Cancel reply | X button + Escape key. See §5.5, §5.6. |
-| Quote block in replied messages | Inserted between message header and body. Vertical accent bar (`primary.main` for user parents, `error.main` for admin parents) + bold sender name on top (with `mdi:crown` if admin) + snippet below. See §5.8. |
+| Quote block in replied messages | Inserted between message header and body. Vertical accent bar + bold sender name color follow the **same rules as the outer sender header**: admin → `error.main` (red + crown), self → `primary.main` (blue + `(me)` suffix), others → `warning.main` (orange). Snippet text always `text.secondary`. See §5.8. |
 | Quote snippet truncation | **Single line, ellipsis** (`whiteSpace: 'nowrap', textOverflow: 'ellipsis'`). Bounded vertical height ~36 px. Matches Telegram / iMessage. |
 | Parent timestamp in quote | **Not shown** — keeps the quote compact. Matches WhatsApp / Telegram / Slack. The reply's own timestamp is still in the message header above. |
-| Click on quote | **Clickable** — scrolls chat list to parent + 1.5 s yellow background pulse on the parent message. If parent is older than `STORE_MESSAGES_LIMIT = 300` (no longer in `messages` state), click is a silent no-op. See §5.9. |
+| Click on quote | **Clickable** — scrolls chat list to parent + 1.5 s yellow background pulse on the parent message. Uses **manual `container.scrollTo()`** (not `Element.scrollIntoView`) so only the chat's internal scrollbar moves — the surrounding page stays put. If parent is older than `STORE_MESSAGES_LIMIT = 300` (no longer in `messages` state), click is a silent no-op. See §5.9. |
 | Pinned banner | Intentionally does NOT render the quote even if the pinned message is a reply (v1 non-goal — see §13). |
+| Message body color | Explicit `color: text.primary` on the body Typography — without it, wrapping the `secondary` content in a Fragment changed the inheritance chain and dimmed the body to `text.secondary`. |
 
 ### 5.1 Extend `MessageNew`
 
@@ -611,12 +613,34 @@ Inserted inside `ListItemText.secondary` above the existing message-content Typo
 
 ```ts
 const onQuoteClick = useCallback((parentMessageId: string) => {
-  const target = messagesContainerRef.current?.querySelector(
+  const container = messagesContainerRef.current;
+  if (!container) return;
+  const target = container.querySelector(
     `[data-msg-id="${parentMessageId}"]`,
   ) as HTMLElement | null;
   if (!target) return;  // parent older than STORE_MESSAGES_LIMIT or never loaded
+
+  // ⚠ Do NOT use Element.scrollIntoView — it walks up the DOM and scrolls
+  // every ancestor scroll container, including the surrounding page. The
+  // chat box lives inside the score8o8 match page which has its own scroll;
+  // scrollIntoView would jerk the entire page to bring the chat into view,
+  // not just the parent message inside the chat list.
+  //
+  // Instead, compute the target's offset within the messages container and
+  // call scrollTo on the container directly — this only moves the chat's
+  // internal scrollbar.
+  const containerRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const targetOffsetTop =
+    targetRect.top - containerRect.top + container.scrollTop;
+  const desiredScrollTop =
+    targetOffsetTop - (container.clientHeight - target.clientHeight) / 2;
+
   isProgrammaticScrollRef.current = true;
-  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  container.scrollTo({
+    top: Math.max(0, desiredScrollTop),
+    behavior: "smooth",
+  });
   setHighlightedMessageId(parentMessageId);
   setTimeout(() => setHighlightedMessageId(null), 1500);
 }, []);
@@ -1002,3 +1026,229 @@ Frontend reverts are independent — score8o8 and admin can each roll back their
 No Redis cleanup needed — old sorted-set entries with `replyTo` keys deserialise cleanly into the post-revert codepath (which just ignores the field).
 
 No schema migration, no socket event rename, no Redis key removal.
+
+---
+
+# Implementation Notes — 2026-06-02
+
+**Status:** Implemented end-to-end across `football-chat-backend`, `football-next-score8o8`, `football-admin`. Backend `node -c` clean on all three touched files. `npx tsc --noEmit` exit 0 on score8o8. Admin tsc only reports the pre-existing unrelated `react-day-picker` error in `date-range-picker.tsx`.
+
+## What was implemented
+
+Matches §1–§13 of the plan above. Concrete file outcomes:
+
+### `football-chat-backend/modules/chat/messageModel.js`
+- Added `replyTo` subdocument: `{ messageId, senderName, contentSnippet, isAdmin }` with `maxlength` 50/140, `required: false`, `default: undefined`.
+
+### `football-chat-backend/utils/messageValidation.js`
+- Added `sanitizeReplyTo(raw, { shouldClean })` and exported it. Pure synchronous JS. Includes `REPLY_SNIPPET_MAX`, `REPLY_SENDER_MAX`, `OBJECT_ID_REGEX` constants.
+- Validates `raw` is an object, `messageId` is a 24-hex string, `senderName` and `contentSnippet` are non-empty strings.
+- Truncates `senderName` to 50 chars and `contentSnippet` to 140 chars.
+- When `shouldClean` is true, runs `cleanString(snippet)` (which uses the existing module-level shared `profanityFilter` singleton). On unicode edge cases the existing `cleanString` falls back to the raw value, so reply messages are never dropped due to library quirks.
+
+### `football-chat-backend/socket/socketHandler.js`
+- Imported `sanitizeReplyTo`.
+- `room_message` destructures `replyTo` from payload, sanitises with `shouldClean: validationOn` (gated on the existing `FEATURE_VALIDATION` flag), and conditionally spreads `replyTo` into both the broadcast `messageData` and the persisted `saveChatMessageService` payload.
+- `admin_room_message` destructures `replyTo`, sanitises **without** `shouldClean` (admins are not gated by `FEATURE_VALIDATION`), spreads the same way.
+
+### `football-next-score8o8/src/components/chatBox/chatBox.tsx`
+- Added `MessageReplyTo` interface and extended `MessageNew` with `replyTo?`.
+- Added `replyHighlightPulse` keyframe (transparent → gold @ 30% → transparent) for the click-to-scroll highlight.
+- Top-level state: `replyTarget`, `highlightedMessageId`. Top-level ref: `composerInputRef`.
+- Top-level callbacks: `onReplyClick` (focuses composer via `composerInputRef.current?.focus()`), `onCancelReply`, `onQuoteClick` (manual `scrollTo` — see §11.1 below).
+- `MessageItem` accepts new props: `onReplyClick`, `onQuoteClick`, `highlighted`. Has its own `replyTooltipOpen` state for the controlled reply Tooltip (see §11.2 below).
+- ListItem gets `data-msg-id={msg._id}` for the click-to-scroll lookup and a conditional `animation: highlighted ? replyHighlightPulse 1.5s ease : none`.
+- Quote block rendered inside `ListItemText.secondary`, above the body Typography — colour logic matches the outer sender header (see §11.3 below).
+- Reply IconButton mounted as an absolute-positioned sibling Box at `right: 8, zIndex: 2`. Controlled Tooltip.
+- Pills row now uses `right: 36` (was 8) to leave room for the reply icon.
+- Composer wrapper now contains the quote-preview banner conditionally between the error Alert and `ChatInput`. Same colour rules as the in-message quote.
+- `ChatInput` extended with three new optional props: `inputRef`, `replyActive`, `onCancelReply`. Escape handler clears reply mode.
+- `handleSendMessage`: optimistic local push includes `replyTo`; emit spreads `replyTo`; `replyTarget` cleared after.
+- Incoming `room_message` listener reads `replyTo` from the payload.
+- Message body Typography got an explicit `color: "text.primary"` (see §11.4 below).
+
+### `football-admin/src/sections/matches/chat-table-rows.tsx`
+- Same `MessageReplyTo` interface, `replyHighlightPulse` keyframe.
+- State + refs at `ChatTableRows` level: `replyTarget`, `highlightedMessageId`, `composerInputRef`. Callbacks: `onReplyClick`, `onCancelReply`, `onQuoteClick`.
+- `AdminChatInput` extended with `inputRef`, `replyActive`, `onCancelReply` props. Escape handler clears reply mode.
+- **New component:** `ReplyIconButton` (memoised) — owns its own `open` state for the controlled Tooltip. Used in the messages map. See §11.5 below for the rationale.
+- Quote block rendered inside `ListItemText.secondary` above the body Typography (below the `ChatUserName` header in `primary`). Admin perspective uses simpler colour rules (admin → red, else → orange) — see §11.3.
+- Pills row uses `right: 36` to leave room for the reply icon.
+- Composer wrapper contains the reply-preview banner above `AdminChatInput`. Typing indicator stays in its existing `position: absolute, top: -22` layer — no overlap.
+- `handleSendMessage`: emits `replyTo`, clears `replyTarget`. Admin doesn't do optimistic local push (sees own messages via server echo).
+- Incoming `room_message` listener reads `replyTo` from the payload.
+
+---
+
+## Deviations from the plan (with reasoning)
+
+### 11.1 `Element.scrollIntoView` replaced with manual `scrollTo`
+
+**Plan said:** `target.scrollIntoView({ behavior: "smooth", block: "center" })`.
+
+**What shipped:** Manual offset calculation + `container.scrollTo()`.
+
+**Why:** `Element.scrollIntoView` walks up the DOM and scrolls **every** ancestor scroll container — including the surrounding page on score8o8 (which has its own page scroll above the chat box) and the admin shell on football-admin. Clicking a reply quote was jerking the entire page to bring the chat into view, not just the chat's internal scroll bringing the parent message into view.
+
+The fix computes the target's offset relative to `messagesContainerRef` and calls `scrollTo` on the container directly:
+
+```ts
+const containerRect = container.getBoundingClientRect();
+const targetRect = target.getBoundingClientRect();
+const targetOffsetTop = targetRect.top - containerRect.top + container.scrollTop;
+const desiredScrollTop = targetOffsetTop - (container.clientHeight - target.clientHeight) / 2;
+container.scrollTo({ top: Math.max(0, desiredScrollTop), behavior: "smooth" });
+```
+
+`Math.max(0, …)` clamps to zero so we never request a negative scroll. The target gets vertically centred; near the list top, clamping just shows the top with the target near it.
+
+Applied to both score8o8 ([chatBox.tsx onQuoteClick](src/components/chatBox/chatBox.tsx)) and admin ([chat-table-rows.tsx onQuoteClick](src/sections/matches/chat-table-rows.tsx)) with the same shape.
+
+The §5.9 code block in the plan now matches this implementation with a `⚠ Do NOT use Element.scrollIntoView` warning comment.
+
+### 11.2 Reply icon Tooltip is **controlled**, force-closed on click
+
+**Plan said:** Plain Tooltip with `onOpen`/`onClose` hooks. (§5.3 Option B.)
+
+**What shipped:** Controlled Tooltip with per-message `open` state, force-closed in the `onClick` handler.
+
+**Why:** With an uncontrolled Tooltip, this sequence broke autoscroll:
+
+1. User scrolls up (`isUserAtBottomRef = false`, scroll-down button visible).
+2. User hovers reply icon → Tooltip `onOpen` fires → `isPopoverOpenRef.current = true`.
+3. User clicks reply → `onReplyClick(msg)` runs. Cursor stays on the icon, MUI's Tooltip stays visible, `onClose` has NOT fired, ref is still `true`.
+4. User types + sends → `handleSendMessage` sets `isUserAtBottomRef.current = true` and `setShowScrollDown(false)` (button disappears).
+5. Auto-scroll effect runs → bails on `if (isPopoverOpenRef.current) return;` because the Tooltip is technically still open.
+6. Result: scroll-down button gone, but the message didn't scroll into view.
+
+The fix mirrors the existing reaction-picker Tooltip pattern in `MessageItem`. The reply Tooltip is controlled by `replyTooltipOpen` state; the click handler does:
+
+```tsx
+onClick={(e) => {
+  e.stopPropagation();
+  setReplyTooltipOpen(false);          // visually close
+  isPopoverOpenRef.current = false;    // release scroll lock
+  onReplyClick(msg);                   // enter reply mode + focus composer
+}}
+```
+
+Both effects fire synchronously, so by the time `handleSendMessage` runs later, the lock has long been released and auto-scroll works normally.
+
+- score8o8: `replyTooltipOpen` state lives inside `MessageItem`.
+- admin: see §11.5 below — extracted into a dedicated `ReplyIconButton` component.
+
+### 11.3 Quote sender colour follows the **outer-header colour logic** (not a fixed admin/non-admin binary)
+
+**Plan said:** Quote sender colour was `isAdmin ? "error.main" : "primary.main"`.
+
+**What shipped:** Quote sender colour follows the same rules as the outer sender header so the quoted person's identity is visually consistent throughout the chat.
+
+**score8o8 client rules** (from the user's perspective):
+
+| Quoted person | Colour | Suffix |
+|---|---|---|
+| Admin | `error.main` (red) | crown icon |
+| The viewer themselves | `primary.main` (blue) | ` (me)` |
+| Anyone else | `warning.main` (orange) | — |
+
+The same rules apply to both:
+- The quote block rendered **inside** a replied message (§5.8)
+- The composer's "Replying to X" preview banner (§5.5)
+
+Concretely, inside `MessageItem`:
+
+```tsx
+const isSelf =
+  !msg.replyTo!.isAdmin &&
+  !!userName &&
+  msg.replyTo!.senderName === userName;
+const quoteColor = msg.replyTo!.isAdmin
+  ? "error.main"
+  : isSelf ? "primary.main" : "warning.main";
+```
+
+Both the sender-name Typography and the accent-bar `borderColor` use `quoteColor`.
+
+**Admin rules** (admin doesn't have a "this is me" concept — every non-admin is "another user"):
+
+| Quoted person | Colour |
+|---|---|
+| Admin | `error.main` (red) |
+| Non-admin user | `warning.main` (orange) |
+
+No `(me)` suffix in the admin view.
+
+**Why:** With the original `primary.main` fallback, a reply quote of a regular user (e.g. `nnnn`) rendered in blue inside the message, but `nnnn`'s actual sender header above rendered in orange (`warning.main`). The two didn't match, which made the quoted identity visually disconnect from the same user's other messages. Matching the outer-header rules makes the chat read coherently regardless of who's being quoted.
+
+### 11.4 Explicit `color: "text.primary"` on the message-body Typography
+
+**Plan said:** Body Typography unchanged.
+
+**What shipped:** Body Typography in score8o8 now sets `color: "text.primary"` explicitly.
+
+**Why:** Before the reply feature, `ListItemText.secondary` was a single Typography element, and MUI rendered it as-is — the Typography inherited `text.primary` from its parent's default rendering. After the feature, `secondary` became a Fragment wrapping the quote `<Box>` + body `<Typography>`. The Fragment changed the inheritance chain enough that the body text rendered in a dimmer shade.
+
+Adding `color: "text.primary"` to the body Typography's `sx` forces the original colour regardless of how MUI wraps the surrounding content. The admin side didn't need this fix because its body Typography already had an explicit `color: msg.isAdmin ? 'primary.contrastText' : 'text.primary'`.
+
+The body Typography now includes a comment explaining the rationale so a future reader doesn't strip the explicit colour thinking it's redundant.
+
+### 11.5 Admin's reply icon extracted into a `ReplyIconButton` component
+
+**Plan said:** Reply icon rendered inline inside the `messages.map(...)` block.
+
+**What shipped:** A dedicated `ReplyIconButton` component owns the per-message Tooltip state.
+
+**Why:** §11.2 made the Tooltip controlled. score8o8 already has a `MessageItem` component to hold per-message state, but admin renders messages directly inline. Storing per-message Tooltip state at the `ChatTableRows` level (e.g., `openReplyTooltipMsgId`) would force a re-render of the entire message list on every hover transition. Extracting `ReplyIconButton` (memoised with `React.memo`) keeps each button's hover state local to that button — only the hovered icon re-renders.
+
+The component lives in the same file as `AdminChatInput`, follows the same memoised pattern, and exposes the same prop shape as the inline version it replaced.
+
+### 11.6 `sanitizeReplyTo` uses `{ shouldClean }` flag, NOT the plumbed `Filter` instance
+
+**Plan said:** Extend `validateMessage`'s return shape with a `filter` field pointing at the shared `profanityFilter`, then pass it into `sanitizeReplyTo(raw, { profanityFilter })`.
+
+**What shipped:** `sanitizeReplyTo(raw, { shouldClean = false })` calls the existing `cleanString` directly. The shared `profanityFilter` singleton is reached via `cleanString` (same module), no parameter plumbing.
+
+**Why:** The plan's stated goal was "reuse the same `Filter` instance without a second instantiation per message". That goal is achieved either way — `cleanString` already uses the module-level singleton. The boolean flag is simpler, doesn't change `validateMessage`'s public API, and is one less coupling point. Same end behaviour, less surface area.
+
+---
+
+## What was unchanged from the plan
+
+- §1 schema layout: `replyTo` subdocument exact shape ✓
+- §2 socket events: no new events; `replyTo` extends `room_message` + `admin_room_message` payloads only ✓
+- §4 service.js + roomManager.js + Redis keys: zero changes ✓
+- §7 auth/security: all risks handled by existing pipeline (ban check, rate limit, length caps) ✓
+- §10 no-regression guarantees: all 10 verified post-implementation ✓
+- §11 perf: no extra Redis or Mongo round trips on the hot path ✓
+- §13 non-goals: pinned-banner quote, reply count badge, threading, notifications, server-side parent verification, edit/delete, replyTo on reactions — none implemented ✓
+
+---
+
+## Files Changed (final)
+
+| File | Lines added | Lines removed |
+|---|---|---|
+| `football-chat-backend/modules/chat/messageModel.js` | +10 | 0 |
+| `football-chat-backend/utils/messageValidation.js` | +34 | 0 |
+| `football-chat-backend/socket/socketHandler.js` | +23 | -5 |
+| `football-next-score8o8/src/components/chatBox/chatBox.tsx` | +335 | -11 |
+| `football-admin/src/sections/matches/chat-table-rows.tsx` | +307 | -17 |
+
+No changes to:
+- `modules/chat/service.js`
+- `socket/roomManager.js`
+- `utils/const_config.js`
+- `utils/feature_flags.js`
+- `package.json` (no new deps)
+- Any Redis key, sorted set, hash, or pub/sub channel
+- nginx config, ecosystem.config.js, OS tuning
+
+---
+
+## Verification done
+
+- `node -c modules/chat/messageModel.js && node -c utils/messageValidation.js && node -c socket/socketHandler.js` — exit 0
+- `npx tsc --noEmit -p tsconfig.json` in `football-next-score8o8` — exit 0
+- `npx tsc --noEmit -p tsconfig.json` in `football-admin` — only pre-existing `react-day-picker` error in unrelated `date-range-picker.tsx`
+- Manual code review of every edit confirmed against the no-regression guarantees in §10
+- Cross-check against the plan section by section (every numbered subsection in §1–§13)

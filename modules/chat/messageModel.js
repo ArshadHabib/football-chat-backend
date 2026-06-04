@@ -47,6 +47,16 @@ const messageSchema = new mongoose.Schema(
       of: Number,
       default: {},
     },
+    replyTo: {
+      type: {
+        messageId: { type: String, required: true },
+        senderName: { type: String, required: true, maxlength: 50 },
+        contentSnippet: { type: String, required: true, maxlength: 140 },
+        isAdmin: { type: Boolean, default: false },
+      },
+      required: false,
+      default: undefined,
+    },
     timestamp: {
       type: Date,
       default: Date.now,

@@ -163,11 +163,45 @@ function validateMessage(content, recentMessages = []) {
   return { ok: true, normalized, cleaned: cleanString(content) };
 }
 
+// Reply quote sanitiser. Called on every room_message / admin_room_message
+// payload (cost ~50 ns when replyTo is absent — the first guard returns null
+// immediately). Never touches Redis or Mongo — bounding lengths and types is
+// sufficient because the snapshot is display-only metadata; the surrounding
+// message still goes through ban + rate-limit + content validation, and a
+// bot impersonating an admin in the quote header gains no new attack
+// surface (they could already write "Admin: …" in their message body).
+const REPLY_SNIPPET_MAX = 140;
+const REPLY_SENDER_MAX = 50;
+const OBJECT_ID_REGEX = /^[a-f0-9]{24}$/i;
+
+function sanitizeReplyTo(raw, { shouldClean = false } = {}) {
+  if (!raw || typeof raw !== "object") return null;
+  const { messageId, senderName, contentSnippet, isAdmin } = raw;
+
+  if (typeof messageId !== "string" || !OBJECT_ID_REGEX.test(messageId)) {
+    return null;
+  }
+  if (typeof senderName !== "string" || senderName.length === 0) return null;
+  if (typeof contentSnippet !== "string" || contentSnippet.length === 0)
+    return null;
+
+  let snippet = contentSnippet.slice(0, REPLY_SNIPPET_MAX);
+  if (shouldClean) snippet = cleanString(snippet);
+
+  return {
+    messageId,
+    senderName: senderName.slice(0, REPLY_SENDER_MAX),
+    contentSnippet: snippet,
+    isAdmin: !!isAdmin,
+  };
+}
+
 module.exports = {
   MAX_LENGTH,
   validateMessage,
   cleanString,
   isProfane,
+  sanitizeReplyTo,
   // Exported for unit testing if needed
   normalizeLeetspeak,
   checkBotSuffix,

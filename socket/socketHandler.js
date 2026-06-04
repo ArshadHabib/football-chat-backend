@@ -29,7 +29,10 @@ const {
   BANNED_USERS_KEY,
   REDIS_ROOMS_SET,
 } = require("@project/utils/const_config");
-const { validateMessage } = require("@project/utils/messageValidation");
+const {
+  validateMessage,
+  sanitizeReplyTo,
+} = require("@project/utils/messageValidation");
 const {
   getFlag,
   FEATURE_VALIDATION,
@@ -166,7 +169,7 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
-      const { roomId, messageContent, isPinned } = data;
+      const { roomId, messageContent, isPinned, replyTo } = data;
       if (!socket.rooms.has(roomId)) {
         socket.emit("error", {
           message: "You must join the room first before sending messages",
@@ -177,8 +180,11 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Room does not exist" });
         return;
       }
+      // Admin messages aren't gated by FEATURE_VALIDATION (admins aren't bots),
+      // so the reply snippet is sanitised without profanity cleaning — only
+      // length + type bounds are enforced.
+      const sanitizedReply = sanitizeReplyTo(replyTo);
       const msgId = new mongoose.Types.ObjectId();
-      // Use senderName from admin data
       const messageData = {
         _id: msgId.toString(),
         senderName: "Admin",
@@ -187,6 +193,7 @@ function setupSocketHandlers(io) {
         isAdmin: true,
         isPinned: !!isPinned,
         timestamp: new Date().toISOString(),
+        ...(sanitizedReply && { replyTo: sanitizedReply }),
       };
       io.to(roomId).emit("room_message", messageData);
       // Save message asynchronously
@@ -198,6 +205,7 @@ function setupSocketHandlers(io) {
         messageType: "room_message",
         isAdmin: true,
         isPinned: !!isPinned,
+        ...(sanitizedReply && { replyTo: sanitizedReply }),
       }).catch(console.error);
     });
 
@@ -308,7 +316,7 @@ function setupSocketHandlers(io) {
 
     // Messages - senderName comes from frontend
     socket.on("room_message", async (data) => {
-      const { roomId, messageContent, senderName } = data;
+      const { roomId, messageContent, senderName, replyTo } = data;
       // Ban + room existence + rate limit — single pipeline round trip
       const ip = socket.clientIp;
       const { rateLimitMax, rateLimitWindowSeconds } =
@@ -365,7 +373,8 @@ function setupSocketHandlers(io) {
       // silent — no error emit, gives bots no feedback to tune against.
       // Strike counter / auto-ban deferred to Phase 2.3.
       let outputContent;
-      if (getFlag(FEATURE_VALIDATION)) {
+      const validationOn = getFlag(FEATURE_VALIDATION);
+      if (validationOn) {
         socket.recentMessages = socket.recentMessages || [];
         const verdict = validateMessage(messageContent, socket.recentMessages);
         if (!verdict.ok) return;
@@ -378,6 +387,13 @@ function setupSocketHandlers(io) {
         outputContent = messageContent;
       }
 
+      // Reply snippet sanitisation. Cleans profanity only when FEATURE_VALIDATION
+      // is on — same contract as the message body. Returns null for absent /
+      // malformed replyTo, in which case the spread below omits the field.
+      const sanitizedReply = sanitizeReplyTo(replyTo, {
+        shouldClean: validationOn,
+      });
+
       const msgId = new mongoose.Types.ObjectId();
       const messageData = {
         _id: msgId.toString(),
@@ -385,6 +401,7 @@ function setupSocketHandlers(io) {
         messageContent: outputContent,
         roomId,
         timestamp: new Date().toISOString(),
+        ...(sanitizedReply && { replyTo: sanitizedReply }),
       };
       // Broadcast immediately — message is already live
       io.to(roomId).emit("room_message", messageData);
@@ -397,6 +414,7 @@ function setupSocketHandlers(io) {
         senderId: socket.id,
         messageContent: outputContent,
         messageType: "room_message",
+        ...(sanitizedReply && { replyTo: sanitizedReply }),
       }).catch((error) => console.error("Failed to save message:", error));
     });
 

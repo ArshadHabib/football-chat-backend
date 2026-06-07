@@ -17,6 +17,8 @@ const {
   getServerModeController,
   setFeatureFlagController,
   getFeatureFlagsController,
+  setRateLimitConfigController,
+  getRateLimitConfigController,
 } = require("./controller");
 
 router.get(
@@ -60,5 +62,15 @@ router.post(
 router.post("/get-server-mode", isAdminKeyCorrect, getServerModeController);
 router.post("/set-feature-flag", isAdminKeyCorrect, setFeatureFlagController);
 router.post("/get-feature-flags", isAdminKeyCorrect, getFeatureFlagsController);
+router.post(
+  "/set-rate-limit-config",
+  isAdminKeyCorrect,
+  setRateLimitConfigController
+);
+router.post(
+  "/get-rate-limit-config",
+  isAdminKeyCorrect,
+  getRateLimitConfigController
+);
 
 module.exports = router;

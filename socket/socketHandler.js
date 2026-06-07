@@ -21,9 +21,6 @@ const {
 } = require("./roomManager");
 const { authenticateToken } = require("@project/middleware");
 const { pubClient: redis } = require("@project/config/redis");
-const {
-  getCurrentPerformanceMode,
-} = require("@project/utils/perfomance_config");
 const { findUserByName } = require("@project/modules/user/service");
 const {
   BANNED_USERS_KEY,
@@ -38,6 +35,10 @@ const {
   FEATURE_VALIDATION,
   onFlagChange,
 } = require("@project/utils/feature_flags");
+const {
+  getConfig: getRateLimitConfig,
+  onConfigChange: onRateLimitChange,
+} = require("@project/utils/rate_limit_config");
 
 const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
 const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡", "🖕"];
@@ -71,6 +72,15 @@ function setupSocketHandlers(io) {
   onFlagChange((name, value) => {
     if (name !== FEATURE_VALIDATION) return;
     io.local.emit("validation_changed", { value: !!value });
+  });
+
+  // Forward message rate-limit config changes to connected sockets. Same
+  // io.local.emit reasoning as validation_changed above: each PM2 instance
+  // independently receives the __rate_limit_change__ Redis pub/sub message, so
+  // io.emit() would fan out cluster-wide via the adapter and produce N×N
+  // broadcasts. io.local.emit keeps it 1:N per instance, N×1 total.
+  onRateLimitChange((cfg) => {
+    io.local.emit("rate_limit_changed", cfg); // { enabled, max, windowSeconds }
   });
 
   // Periodically evict typingUsers entries for rooms that have no connected sockets.
@@ -302,6 +312,9 @@ function setupSocketHandlers(io) {
         // Surface current validation flag so the client can mirror it as its
         // non-essential-validation local state. Other flags stay server-internal.
         result.validation = !!getFlag(FEATURE_VALIDATION);
+        // Surface the current message rate-limit config so the client mirrors
+        // it (enable/disable + the two numbers). Old clients ignore this field.
+        result.rateLimit = getRateLimitConfig(); // { enabled, max, windowSeconds }
         socket.emit("join_result", result);
         scheduleUserCountUpdate(roomId);
         // socket.to(roomId).emit("user_joined", {
@@ -319,17 +332,21 @@ function setupSocketHandlers(io) {
       const { roomId, messageContent, senderName, replyTo } = data;
       // Ban + room existence + rate limit — single pipeline round trip
       const ip = socket.clientIp;
-      const { rateLimitMax, rateLimitWindowSeconds } =
-        getCurrentPerformanceMode().settings;
+      // Message rate-limit config is admin-controlled + cluster-synced
+      // (utils/rate_limit_config.js). When disabled, the per-IP counter isn't
+      // touched at all — the incr/expire/ttl commands are never queued, so
+      // toggling off is a clean no-op (and 3 fewer Redis ops per message).
+      const rl = getRateLimitConfig(); // { enabled, max, windowSeconds }
+      const rateLimitActive = rl.enabled && !!ip;
       const pipeline = redis.multi();
       // When socket.senderName fix is enabled, replace the line below with:
       // pipeline.sIsMember(BANNED_USERS_KEY, socket.senderName ?? senderName);
       pipeline.sIsMember(BANNED_USERS_KEY, senderName); // [0]
       pipeline.sIsMember(REDIS_ROOMS_SET, roomId); // [1]
-      if (ip) {
+      if (rateLimitActive) {
         const key = `${REDIS_RATE_LIMIT_PREFIX}${ip}`;
         pipeline.incr(key); // [2]
-        pipeline.expire(key, rateLimitWindowSeconds, "NX"); // [3]
+        pipeline.expire(key, rl.windowSeconds, "NX"); // [3]
         pipeline.ttl(key); // [4] — inlined so both rejection and at-cap
                            //       paths get the cooldown without an extra RTT
       }
@@ -338,10 +355,10 @@ function setupSocketHandlers(io) {
       if (isBanned) return;
       const roomStillExists = results[1];
       if (!roomStillExists) return;
-      if (ip) {
+      if (rateLimitActive) {
         const count = results[2];
         const retryAfter = results[4];
-        if (count > rateLimitMax) {
+        if (count > rl.max) {
           // Rejection path — message dropped.
           socket.emit("server_rate_limit", {
             message: `Limit reached. Retry in ${retryAfter} seconds`,
@@ -349,7 +366,7 @@ function setupSocketHandlers(io) {
           });
           return;
         }
-        if (count === rateLimitMax) {
+        if (count === rl.max) {
           // Admit path — message still gets broadcast below, but pre-emptively
           // tell the client they've hit the cap so the inline countdown shows
           // and the Send button disables. Eliminates the "ghost message"

@@ -218,6 +218,54 @@ async function getFeatureFlagsController(req, res) {
   }
 }
 
+const rateLimitConfig = require("@project/utils/rate_limit_config");
+
+async function setRateLimitConfigController(req, res) {
+  const { enabled, max, windowSeconds } = req.body;
+  try {
+    if (enabled !== undefined && typeof enabled !== "boolean") {
+      return sendError(res, "'enabled' must be a boolean", 400);
+    }
+    if (max !== undefined && !Number.isFinite(Number(max))) {
+      return sendError(res, "'max' must be a number", 400);
+    }
+    if (windowSeconds !== undefined && !Number.isFinite(Number(windowSeconds))) {
+      return sendError(res, "'windowSeconds' must be a number", 400);
+    }
+    // setConfig merges onto the current config, clamps numbers to [1,100] /
+    // [1,3600], ignores absent fields, persists, and broadcasts cluster-wide.
+    const result = await rateLimitConfig.setConfig({
+      enabled,
+      max,
+      windowSeconds,
+    });
+    return sendResponse(res, result, "Rate-limit config updated", 200);
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in setting rate-limit config",
+      500
+    );
+  }
+}
+
+async function getRateLimitConfigController(req, res) {
+  try {
+    return sendResponse(
+      res,
+      rateLimitConfig.getConfig(),
+      "Success in getting rate-limit config!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in getting rate-limit config",
+      500
+    );
+  }
+}
+
 module.exports = {
   getUsersPerRoomController,
   getRoomMessagesController,
@@ -230,4 +278,6 @@ module.exports = {
   getServerModeController,
   setFeatureFlagController,
   getFeatureFlagsController,
+  setRateLimitConfigController,
+  getRateLimitConfigController,
 };

@@ -11,6 +11,8 @@ let CACHE_TTL = 2000; //How long room data is cached before recalculation (ms)
 const performanceMode = {
   level: "normal", // 'normal', 'peak', 'extreme'
   settings: {
+    // Message rate-limit (max / windowSeconds) is no longer a per-mode setting.
+    // It is admin-controlled + cluster-synced via utils/rate_limit_config.js.
     normal: {
       batchFlush: 1000,
       maxBatchSize: 50,
@@ -18,8 +20,6 @@ const performanceMode = {
       adminDebounce: 500,
       userCountUpdateDebounce: 1000,
       cacheTTL: 2000,
-      rateLimitMax: 1,
-      rateLimitWindowSeconds: 5,
     },
     peak: {
       batchFlush: 3000,
@@ -28,8 +28,6 @@ const performanceMode = {
       adminDebounce: 2000,
       userCountUpdateDebounce: 3000,
       cacheTTL: 10000,
-      rateLimitMax: 1,
-      rateLimitWindowSeconds: 5,
     },
     extreme: {
       batchFlush: 5000,
@@ -38,8 +36,6 @@ const performanceMode = {
       adminDebounce: 5000,
       userCountUpdateDebounce: 5000,
       cacheTTL: 30000,
-      rateLimitMax: 1,
-      rateLimitWindowSeconds: 5,
     },
   },
 };

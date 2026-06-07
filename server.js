@@ -27,6 +27,7 @@ const { validateCounts } = require("@project/socket/roomManager");
 const { warmBanCaches } = require("@project/modules/user/warmup");
 const { startDrainLoop } = require("@project/modules/chat/service");
 const featureFlags = require("@project/utils/feature_flags");
+const rateLimitConfig = require("@project/utils/rate_limit_config");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -101,6 +102,11 @@ app.get("/", (req, res) => {
     await featureFlags.loadFromRedis();
     await featureFlags.subscribeToChanges();
 
+    // Same Redis-source-of-truth lifecycle for the dynamic message rate-limit
+    // config. Must run before accepting traffic — room_message reads it.
+    await rateLimitConfig.loadFromRedis();
+    await rateLimitConfig.subscribeToChanges();
+
     // Startup sweep — reconciles __socket_website__ and __room_counts__ against
     // the live socket state across all instances. Catches stale entries left by
     // a previously crashed/restarted instance within seconds of this process
@@ -124,14 +130,16 @@ app.get("/", (req, res) => {
         .then((m) => {
           if (m) setPerformanceMode(m);
         })
-        .catch((err) =>
-          console.error("Perf mode re-hydrate failed:", err),
-        );
+        .catch((err) => console.error("Perf mode re-hydrate failed:", err));
       // Re-hydrate feature flags too, mirroring the same pattern.
       featureFlags
         .loadFromRedis()
+        .catch((err) => console.error("Feature flags re-hydrate failed:", err));
+      // Re-hydrate rate-limit config, same pattern.
+      rateLimitConfig
+        .loadFromRedis()
         .catch((err) =>
-          console.error("Feature flags re-hydrate failed:", err),
+          console.error("Rate-limit config re-hydrate failed:", err),
         );
     });
 

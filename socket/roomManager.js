@@ -69,7 +69,13 @@ async function createRoom(roomId, showViews = true) {
   const createPipeline = redis.multi();
   createPipeline.sAdd(REDIS_ROOMS_SET, roomId);
   createPipeline.hSet(REDIS_ROOM_COUNTS, roomId, "0");
-  createPipeline.hSet(REDIS_ROOM_SHOW_VIEWS, roomId, showViews ? "true" : "false");
+  // hSetNX, not hSet: only seed a default if no value exists yet. An admin can
+  // toggle showViews OFF before the match goes live (the room doesn't exist
+  // yet), and updateViewsVisibility writes "false" to this hash directly. If
+  // this used hSet, room creation would clobber that "false" back to the stale
+  // showViews captured at scrape-schedule time. hSetNX preserves the admin's
+  // choice; the toggle path (updateViewsVisibility) still uses hSet and always wins.
+  createPipeline.hSetNX(REDIS_ROOM_SHOW_VIEWS, roomId, showViews ? "true" : "false");
   await createPipeline.exec();
 
   console.log(`Room created: ${roomId}`);

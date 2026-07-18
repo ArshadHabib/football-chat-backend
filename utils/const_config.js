@@ -32,6 +32,17 @@ const REDIS_ROOMS_SET = "__rooms__";
 // Website-level user counter — one entry per distinct websiteName (replaces hGetAll on socket map)
 const REDIS_WEBSITE_COUNTS = "__website_counts__";
 
+// --- AI moderation (Gemini) tuning — see AI_MODERATION_PLAN.md.
+// Behavior constants (committed, identical on every instance — no env drift).
+// The API KEY is intentionally NOT here: it's a secret and lives in .env.
+const GEMINI_MODEL = "gemini-3.1-flash-lite"; // gemini-2.5-flash-lite 404s for new keys
+const AIMOD_CONFIDENCE_THRESHOLD = 0.85; // min confidence (0..1) to auto-ban
+const AIMOD_TIMEOUT_MS = 10000; // Gemini call timeout (10s) — on timeout: no ban (fail-safe)
+const AIMOD_MAX_REPORTS_PER_USER = 3; // reports allowed per reporter per window
+const AIMOD_REPORTER_WINDOW_SECONDS = 300; // that window (5 min) → "3 reports / 5 min"
+const AIMOD_GLOBAL_RPM = 12; // cluster Gemini calls/minute (free-tier 3.1-flash-lite = 15)
+const AIMOD_GLOBAL_RPD = 450; // cluster Gemini calls/day (free-tier 3.1-flash-lite = 500)
+
 module.exports = {
   ADMIN_KEY,
   MINUTES_BEFORE_MATCH_TO_SCRAP,
@@ -51,4 +62,11 @@ module.exports = {
   PINNED_MSG_CACHE_TTL,
   REDIS_ROOMS_SET,
   REDIS_WEBSITE_COUNTS,
+  GEMINI_MODEL,
+  AIMOD_CONFIDENCE_THRESHOLD,
+  AIMOD_TIMEOUT_MS,
+  AIMOD_MAX_REPORTS_PER_USER,
+  AIMOD_REPORTER_WINDOW_SECONDS,
+  AIMOD_GLOBAL_RPM,
+  AIMOD_GLOBAL_RPD,
 };

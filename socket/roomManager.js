@@ -665,6 +665,7 @@ module.exports = {
   getUsersPerWebsite,
   updateViewsVisibility,
   setIO,
+  getIO,
   scheduleUserCountUpdate,
   validateCounts,
   broadcastBanToAllRooms,

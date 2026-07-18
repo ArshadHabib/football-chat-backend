@@ -25,6 +25,9 @@ const { pubClient, featuresSubClient } = require("@project/config/redis");
 
 const FEATURE_REGISTRATION = "registration";
 const FEATURE_VALIDATION = "validation";
+// AI auto-moderation master switch ("AI Ban") — gates the whole @admin
+// reply-report → Gemini → auto-ban pipeline (AI_MODERATION_PLAN.md).
+const FEATURE_AIMOD = "aimod";
 
 const KEY_PREFIX = "feature:";
 const CHANNEL = "__feature_change__";
@@ -34,6 +37,7 @@ const CHANNEL = "__feature_change__";
 const DEFAULTS = Object.freeze({
   [FEATURE_REGISTRATION]: true,
   [FEATURE_VALIDATION]: false,
+  [FEATURE_AIMOD]: false,
 });
 
 // Hot in-memory cache. Populated by loadFromRedis() at startup and updated
@@ -87,7 +91,10 @@ async function loadFromRedis() {
     const raw = values[i];
     if (raw === null || raw === undefined) {
       flags[name] = DEFAULTS[name];
-      seedPipeline.set(`${KEY_PREFIX}${name}`, DEFAULTS[name] ? "true" : "false");
+      seedPipeline.set(
+        `${KEY_PREFIX}${name}`,
+        DEFAULTS[name] ? "true" : "false",
+      );
       needsSeed = true;
     } else {
       flags[name] = raw === "true";
@@ -129,6 +136,7 @@ async function subscribeToChanges() {
 module.exports = {
   FEATURE_REGISTRATION,
   FEATURE_VALIDATION,
+  FEATURE_AIMOD,
   loadFromRedis,
   subscribeToChanges,
   getFlag,

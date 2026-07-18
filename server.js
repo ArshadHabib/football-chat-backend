@@ -7,6 +7,7 @@ moduleAlias.addAlias("@project", path.resolve(__dirname));
 const express = require("express");
 const chatRoutes = require("@project/modules/chat");
 const userRoutes = require("@project/modules/user");
+const moderationRoutes = require("@project/modules/moderation");
 const connectDB = require("@project/config/connection");
 const cors = require("cors");
 const bodyParser = require("body-parser");
@@ -54,6 +55,7 @@ app.use(
 );
 app.use("/api/next/chat", chatRoutes);
 app.use("/api/next/user", userRoutes);
+app.use("/api/next/moderation", moderationRoutes);
 
 app.use(
   "/api",
@@ -73,6 +75,7 @@ app.use(
 
 app.use("/api/chat/chat", chatRoutes);
 app.use("/api/chat/user", userRoutes);
+app.use("/api/chat/moderation", moderationRoutes);
 app.get("/", (req, res) => {
   res.send("Chat API is running");
 });

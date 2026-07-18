@@ -33,12 +33,14 @@ const {
 const {
   getFlag,
   FEATURE_VALIDATION,
+  FEATURE_AIMOD,
   onFlagChange,
 } = require("@project/utils/feature_flags");
 const {
   getConfig: getRateLimitConfig,
   onConfigChange: onRateLimitChange,
 } = require("@project/utils/rate_limit_config");
+const moderationService = require("@project/modules/moderation/service");
 
 const REDIS_RATE_LIMIT_PREFIX = "ratelimit:";
 const ALLOWED_REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡", "🖕"];
@@ -379,6 +381,48 @@ function setupSocketHandlers(io) {
           });
           // fall through — broadcast this message normally
         }
+      }
+
+      // AI moderation report (AI_MODERATION_PLAN.md): a reply that mentions
+      // @admin is a report — Gemini judges the ORIGINAL message and auto-bans
+      // on a confirmed violation. Detected on the RAW inbound payload here,
+      // BEFORE the FEATURE_VALIDATION drop below — a report is a control
+      // signal and must not be silently swallowed just because its text trips
+      // a spam heuristic. Runs after the ban/room/rate-limit gates (banned or
+      // rate-limited senders don't get to report). Flag-gated first so a
+      // disabled feature adds zero regex/allocation cost to the reply path.
+      // Fire-and-forget; the full guard chain (cooldown, budget, cluster
+      // dedupe, target checks) lives inside handleReport. Only messageId is
+      // consumed (already ObjectId-validated by sanitizeReplyTo), so the
+      // report is independent of whether the reply itself gets broadcast.
+      // Fully isolated from the message flow: the whole detection block is
+      // wrapped so NO moderation error (sync throw or otherwise) can ever
+      // abort the reply's broadcast/persist below. handleReport is also
+      // fire-and-forget with its own .catch. Chat keeps running no matter what
+      // the moderation path does.
+      try {
+        if (getFlag(FEATURE_AIMOD) && replyTo) {
+          const reportReply = sanitizeReplyTo(replyTo);
+          if (
+            reportReply &&
+            moderationService.detectAdminReport({
+              messageContent,
+              replyTo: reportReply,
+            })
+          ) {
+            moderationService
+              .handleReport({
+                io,
+                roomId,
+                reporterName: senderName,
+                reporterIp: ip,
+                replyTo: reportReply,
+              })
+              .catch((err) => console.error("aimod handleReport error:", err));
+          }
+        }
+      } catch (err) {
+        console.error("aimod detection error (chat unaffected):", err);
       }
 
       // Server-side content handling — gated entirely on the

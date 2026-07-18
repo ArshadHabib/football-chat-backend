@@ -1,6 +1,6 @@
 const userService = require("./service");
+const { banUserEverywhere } = require("./banService");
 const { sendResponse, sendError, generateToken } = require("@project/utils");
-const { broadcastBanToAllRooms } = require("@project/socket/roomManager");
 const { pubClient: redis } = require("@project/config/redis");
 const { REG_RATE_LIMIT_PREFIX, REG_RATE_LIMIT_TTL, BANNED_USERS_KEY, BANNED_IPS_KEY } = require("@project/utils/const_config");
 const { getFlag, FEATURE_REGISTRATION } = require("@project/utils/feature_flags");
@@ -72,22 +72,12 @@ async function updateUser(req, res) {
       return sendError(res, "User not found!", 404);
     }
 
-    await userService.updateUser(name, { isBanned });
-
     if (isBanned === true) {
-      if (user.ipAddress) {
-        const bannedNames = await userService.banAllUsersByIp(user.ipAddress);
-        if (bannedNames.length > 0) {
-          const pipeline = redis.multi();
-          pipeline.sAdd(BANNED_USERS_KEY, bannedNames);
-          pipeline.sAdd(BANNED_IPS_KEY, user.ipAddress);
-          await pipeline.exec();
-          await broadcastBanToAllRooms(bannedNames);
-        }
-      } else {
-        await redis.sAdd(BANNED_USERS_KEY, name);
-      }
+      // Shared ban orchestration (name + IP cascade + Redis + real-time
+      // broadcast) — single source of truth, same path the AI moderation uses.
+      await banUserEverywhere(name);
     } else {
+      await userService.updateUser(name, { isBanned: false });
       await redis.sRem(BANNED_USERS_KEY, name);
       // Do NOT remove from BANNED_IPS_KEY — other accounts on the same IP may
       // still be banned. IP removal requires an explicit IP-level ban action.

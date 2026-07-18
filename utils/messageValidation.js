@@ -198,6 +198,7 @@ function sanitizeReplyTo(raw, { shouldClean = false } = {}) {
 
 module.exports = {
   MAX_LENGTH,
+  OBJECT_ID_REGEX,
   validateMessage,
   cleanString,
   isProfane,

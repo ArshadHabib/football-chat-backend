@@ -7,6 +7,7 @@
 const { sendResponse, sendError } = require("@project/utils");
 const { pubClient: redis } = require("@project/config/redis");
 const { BANNED_USERS_KEY } = require("@project/utils/const_config");
+const racismPolicy = require("@project/utils/racism_policy");
 const ModerationLog = require("./model");
 const { applyAdminBan } = require("./service");
 
@@ -137,8 +138,45 @@ async function setUserBanController(req, res) {
   }
 }
 
+// GET /get-racism-mode → { mode, options }
+async function getRacismModeController(req, res) {
+  try {
+    return sendResponse(
+      res,
+      { mode: racismPolicy.getMode(), options: racismPolicy.VALID },
+      "Racism mode retrieved successfully",
+      200,
+    );
+  } catch (error) {
+    console.error("getRacismMode error:", error.message);
+    return sendError(res, "Internal server error", 500);
+  }
+}
+
+// POST /set-racism-mode { mode: "strict" | "moderate" | "minimal" }
+// Cluster-synced (Redis persist + pub/sub) — every instance picks it up.
+async function setRacismModeController(req, res) {
+  try {
+    const { mode } = req.body || {};
+    if (!racismPolicy.VALID.includes(mode)) {
+      return sendError(
+        res,
+        `'mode' must be one of: ${racismPolicy.VALID.join(", ")}`,
+        400,
+      );
+    }
+    const applied = await racismPolicy.setMode(mode);
+    return sendResponse(res, { mode: applied }, "Racism mode updated", 200);
+  } catch (error) {
+    console.error("setRacismMode error:", error.message);
+    return sendError(res, "Internal server error", 500);
+  }
+}
+
 module.exports = {
   getModerationLogsController,
   getModerationStatsController,
   setUserBanController,
+  getRacismModeController,
+  setRacismModeController,
 };

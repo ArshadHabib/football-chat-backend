@@ -36,6 +36,7 @@ const { getIO } = require("@project/socket/roomManager");
 const { saveChatMessageService } = require("@project/modules/chat/service");
 const MessageModel = require("@project/modules/chat/messageModel");
 const { OBJECT_ID_REGEX } = require("@project/utils/messageValidation");
+const racismPolicy = require("@project/utils/racism_policy");
 const ModerationLog = require("./model");
 const aiModerator = require("./aiModerator");
 
@@ -209,6 +210,10 @@ function notifyAdminsNeedsReview(io, roomId, original, verdict) {
 // cache path deliberately does NOT re-act — see handleReport), so a manual
 // unban is never reverted by a stale cached verdict.
 // ---------------------------------------------------------------------------
+// Returns true if the verdict should be cached (the action completed), false
+// if it must NOT be cached so a later report retries — currently only when the
+// ban itself failed (transient Mongo/Redis error): we don't want to serve a
+// cached "violation" for 24h while the offender is actually still unbanned.
 async function actOnVerdict({ io, roomId, original, verdict, logBase }) {
   if (verdict.violation && verdict.confidence >= CONFIDENCE_THRESHOLD) {
     try {
@@ -216,18 +221,19 @@ async function actOnVerdict({ io, roomId, original, verdict, logBase }) {
     } catch (err) {
       console.error("aimod ban error:", err.message);
       logModeration({ ...logBase, verdict, action: "ERROR", error: `ban_failed: ${err.message}` });
-      return;
+      return false; // ban failed → do NOT cache → next report retries
     }
     announceBan(io, roomId, original, verdict);
     logModeration({ ...logBase, verdict, action: "BANNED" });
-    return;
+    return true;
   }
   if (verdict.violation) {
     notifyAdminsNeedsReview(io, roomId, original, verdict);
     logModeration({ ...logBase, verdict, action: "NEEDS_REVIEW" });
-    return;
+    return true;
   }
   logModeration({ ...logBase, verdict, action: "DISMISSED" });
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,12 +245,21 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
   if (!aiModerator.isAvailable()) return;
 
   const messageId = replyTo.messageId.toLowerCase();
+  // Snapshot the racism strictness once for this whole report — used for the
+  // verdict cache key AND recorded on every audit row (so the log shows which
+  // policy was active when the report was judged). Verdict cache is keyed by
+  // this mode so switching the mode makes previously-cached verdicts miss →
+  // messages get re-judged under the new policy instead of serving a stale
+  // verdict for up to 24h. Old-mode keys expire naturally via TTL.
+  const racismMode = racismPolicy.getMode();
+  const verdictKey = `${VERDICT_PREFIX}${racismMode}:${messageId}`;
   const logBase = {
     roomId,
     reportedMessageId: messageId,
     reporterName: reporterName || "",
     reporterIp: reporterIp || "",
     model: aiModerator.MODEL,
+    racismMode,
   };
 
   // Reporter cooldown — stops one client from spamming reports. Keyed by IP
@@ -299,7 +314,7 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
   // We deliberately do NOT re-run actOnVerdict, so a manual admin unban is
   // never reverted by a stale cached violation, and NEEDS_REVIEW alerts don't
   // re-fire on every repeat report.
-  const cachedRaw = await redis.get(`${VERDICT_PREFIX}${messageId}`);
+  const cachedRaw = await redis.get(verdictKey);
   if (cachedRaw) {
     logModeration({ ...logBase, action: "DISMISSED", fromCache: true });
     return;
@@ -363,21 +378,26 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
       return;
     }
 
-    // Cache the verdict BEFORE acting — presence of the cache entry (not the
-    // lock) is what makes repeat reports a no-op after the lock expires.
-    await redis
-      .set(`${VERDICT_PREFIX}${messageId}`, JSON.stringify(result.verdict), {
-        EX: VERDICT_TTL_SECONDS,
-      })
-      .catch(() => {});
-
-    await actOnVerdict({
+    // Act first, then cache — but only if the action completed. A failed ban
+    // returns false so we do NOT cache, letting a later report retry instead
+    // of serving a 24h "violation" verdict while the user is still unbanned.
+    // The cache is written before the finally releases the lock, so there is
+    // no window where the lock is gone but the verdict isn't cached; repeat
+    // reports either lose the lock (in-flight) or hit the cache (after).
+    const shouldCache = await actOnVerdict({
       io,
       roomId,
       original,
       verdict: result.verdict,
       logBase: { ...logBase, latencyMs },
     });
+    if (shouldCache) {
+      await redis
+        .set(verdictKey, JSON.stringify(result.verdict), {
+          EX: VERDICT_TTL_SECONDS,
+        })
+        .catch(() => {});
+    }
   } finally {
     await redis.del(`${LOCK_PREFIX}${messageId}`).catch(() => {});
   }

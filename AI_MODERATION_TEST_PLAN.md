@@ -34,12 +34,13 @@ Work top-to-bottom. Each case has **Steps → Expected → Verify (backend) → 
 ```bash
 # Redis
 redis-cli GET feature:aimod                 # "true" when AI Ban is ON
+redis-cli GET __aimod_racism_mode__          # strict | moderate | minimal (default strict)
 redis-cli SMEMBERS __banned_users__          # banned usernames
 redis-cli SMEMBERS __banned_ips__            # banned IPs (empty on localhost)
 redis-cli KEYS "aimod:*"                     # locks / verdicts / counters
 redis-cli GET  aimod:global_rpd              # calls used today
-redis-cli TTL  aimod:verdict:<messageId>     # ~86400 after a judgment
-redis-cli GET  aimod:verdict:<messageId>     # cached verdict JSON
+redis-cli TTL  aimod:verdict:<mode>:<messageId>   # ~86400 after a judgment (key is mode-prefixed)
+redis-cli GET  aimod:verdict:<mode>:<messageId>   # cached verdict JSON
 
 # Mongo (mongosh)
 use sports
@@ -170,13 +171,13 @@ The admin **shield icon** on the Matches dashboard opens the AI Moderation Logs 
 ### TC-16 — Many users report the same message → one ban, one call
 - **Steps:** Fresh offender `troll1` sends a slur. Rapidly, from 3+ different reporter sessions, all reply `@admin` to it.
 - **Expected:** Exactly **one** ban, **one** announcement, **one** Gemini call.
-- **Verify:** only one `aimod:verdict:<id>` key; `aimod:global_rpd` incremented by 1 for this message; multiple `moderationlogs` rows but only one `BANNED` (others `DISMISSED fromCache` / `SKIPPED_ALREADY_BANNED`).
+- **Verify:** only one `aimod:verdict:<mode>:<id>` key; `aimod:global_rpd` incremented by 1 for this message; multiple `moderationlogs` rows but only one `BANNED` (others `DISMISSED fromCache` / `SKIPPED_ALREADY_BANNED`).
 - Actual: ___  | Pass/Fail: ___
 
 ### TC-17 — Verdict cache (repeat report is free)
 - **Steps:** Note `aimod:global_rpd` value. Re-report an already-judged message.
 - **Expected:** No new Gemini call; `aimod:global_rpd` unchanged; response is a no-op.
-- **Verify:** `redis-cli GET aimod:global_rpd` same before/after; `redis-cli TTL aimod:verdict:<id>` ~86400.
+- **Verify:** `redis-cli GET aimod:global_rpd` same before/after; `redis-cli TTL aimod:verdict:<mode>:<id>` ~86400.
 - Actual: ___  | Pass/Fail: ___
 
 ### TC-18 — Reporter cooldown (3 per 5 min per reporter)
@@ -325,6 +326,56 @@ The admin **shield icon** on the Matches dashboard opens the AI Moderation Logs 
 
 ---
 
+## 14. Homophobia policy (threats-only) — see AI_MODERATION_PLAN.md §13.6
+
+### TC-36 — Homophobic joke / insult / opinion → NO ban
+- **Steps:** Offender sends one of: `ronaldo is gay` / `gay people are bad` / `being gay is disgusting`. Report via `@admin`.
+- **Expected:** **No ban.** Log `DISMISSED` (category `none`). No announcement, offender can keep chatting. (Homophobia bans only on threats.)
+- Actual: ___  | Pass/Fail: ___
+
+### TC-37 — Homophobic threat / violence → BAN
+- **Steps:** Offender sends `gay people should be killed` (or `kill all gays`). Report.
+- **Expected:** **Banned**, `category:"hate_speech"`. Announcement posted.
+- Actual: ___  | Pass/Fail: ___
+
+---
+
+## 15. Racism strictness modes (admin radio) — see AI_MODERATION_PLAN.md §18
+
+Open the **AI Moderation Logs** dialog → the **Racism strictness** radio (default **Strict (A)**). The `(i)` tooltip lists what each mode bans/allows.
+
+### TC-38 — Strict (A, default): exclusion bans
+- **Steps:** With mode = **Strict**, offender sends `indians should go back` (or `black people should go back to africa`). Report.
+- **Expected:** **Banned**, `category:"racism"`. Logs row **Strictness column = "Strict (A)"**.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-39 — Switch to Moderate (B): exclusion allowed, slurs/dehumanization still ban
+- **Steps:** In the dialog, click **Moderate (B)** (snackbar "Racism strictness: Moderate (B)"). Then report a fresh `indians should go back` message, and separately a dehumanization message (`black people are monkeys`).
+- **Expected:** `indians should go back` → **no ban** (DISMISSED); `black people are monkeys` → **BAN**. New rows show **Strictness = "Moderate (B)"**. (Religion/homophobia unaffected.)
+- **Verify:** `redis-cli GET __aimod_racism_mode__` → `"moderate"`.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-40 — Switch to Minimal (C): only slurs + threats ban
+- **Steps:** Click **Minimal (C)**. Report `indians should go back` (exclusion) and `kill all indians` (threat) and `all muslims are terrorists` (religion control).
+- **Expected:** exclusion → **no ban**; `kill all indians` → **BAN**; religion → **BAN** (unaffected by racism mode). Rows show **Strictness = "Minimal (C)"**.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-41 — Mode is cluster-synced + persists (return to Strict when done)
+- **Steps:** Change the mode; on a *different* PM2 instance (or after a chat-backend restart), report an exclusion message.
+- **Expected:** the other instance / post-restart uses the chosen mode (read from Redis) — not the default. `redis-cli GET __aimod_racism_mode__` matches the UI. Reload the admin dialog → radio reflects the persisted mode. **Set it back to Strict (A) after testing.**
+- Actual: ___  | Pass/Fail: ___
+
+### TC-42 — Mode change re-judges cached messages (no stale verdict)
+- **Steps:** Under **Strict**, report `indians should go back` → banned. Unban the user (logs Unban). Switch to **Moderate**. Re-report the SAME message.
+- **Expected:** now **no ban** (re-judged under Moderate — the verdict cache is keyed by mode, so the old Strict verdict isn't reused).
+- Actual: ___  | Pass/Fail: ___
+
+### TC-43 — (conceptual) Failed ban is retried, not cached
+- **Steps:** Not easily forced manually. Confirm design: if `banUserEverywhere` errors (transient Mongo/Redis), the row logs `ERROR` and the verdict is **not** cached, so a later report re-judges and retries; the ERROR row also has a working **Ban** button.
+- Actual: ___  | Pass/Fail: ___
+
+---
+
 ## Summary sheet
 
 | # | Case | Pass/Fail | Notes |
@@ -364,3 +415,11 @@ The admin **shield icon** on the Matches dashboard opens the AI Moderation Logs 
 | TC-33 🌐 | IP cascade (prod) | | |
 | TC-34 | Cross-room forged | | |
 | TC-35 | Prompt injection | | |
+| TC-36 | Homophobic joke/opinion (no ban) | | |
+| TC-37 | Homophobic threat (ban) | | |
+| TC-38 | Strict (A): exclusion bans | | |
+| TC-39 | Moderate (B): exclusion allowed, dehumanization bans | | |
+| TC-40 | Minimal (C): only slurs+threats ban | | |
+| TC-41 | Racism mode cluster-synced + persists | | |
+| TC-42 | Mode change re-judges cached | | |
+| TC-43 | Failed ban retried (conceptual) | | |

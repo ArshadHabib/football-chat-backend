@@ -1,8 +1,9 @@
 # AI Auto-Moderation Plan — `@admin` Reply-Reports Judged by Gemini
 
-**Date:** 2026-07-18
-**Status:** ✅ **IMPLEMENTED — backend + admin panel complete (2026-07-18), see §12 & §14.** Decisions locked in §11. Backend cluster-safety/persistence audited clean (§14.1). Pending: local E2E with live server, one-tap report button in user chat (v2)
-**Scope:** `football-chat-backend` (primary) + `football-admin` (AI Ban toggle + moderation logs) + optional user-chat polish (`chatBox.tsx`, v2)
+**Date:** 2026-07-18 (last updated 2026-07-19)
+**Status:** 🚀 **DEPLOYED (owner, 2026-07-19)** — backend + admin live, reviewed clean (§19), including racism strictness modes (§18), homophobia policy (§13.6), the strictness audit column, and the failed-ban-retry fix. **The feature is DORMANT in production: `aimod` flag defaults OFF and racism mode defaults `strict` (= prior behavior), so deploying changed nothing user-facing.** Decisions locked in §11; cluster-safety/persistence audited clean (§14.1).
+**⚠️ Before enabling `aimod` in production:** ship the `socket.senderName` binding fix (§13.4 #1) and rotate the API key. Then enable on one low-traffic site and watch the logs.
+**Scope:** `football-chat-backend` (primary) + `football-admin` (AI Ban toggle + moderation logs + racism-strictness radio) + optional user-chat one-tap report button (`chatBox.tsx`, v2 — not built)
 
 ---
 
@@ -189,7 +190,7 @@ Why hook **after** broadcast? The hot path measured in `PERF_REPORT.md` stays by
 ```
 modules/moderation/
 ├── index.js         REST router (moderation logs for admin panel)
-├── controller.js    getModerationLogsController, getAiModStatsController
+├── controller.js    getModerationLogsController, getModerationStatsController (+ setUserBan, get/setRacismMode — §14, §18)
 ├── service.js       handleReport(), autoBanUser(), announceBan(), guards
 ├── aiModerator.js   Gemini client wrapper: classify(text, context) → verdict
 └── model.js         ModerationLog mongoose model
@@ -648,7 +649,7 @@ Data: `GET /get-moderation-logs` + `/get-moderation-stats`; toggle uses existing
 | 2 | Report visibility | ✅ **Visible** — the `@admin` reply stays in chat as a normal message (no hot-path interception) |
 | 3 | Ban plan + feature flag | ✅ AI bans execute the full existing ban plan — **name AND IP banned together, always** (cascade via `banAllUsersByIp` + `BANNED_IPS_KEY`, identical to manual admin ban in `IP_BAN.md`). No separate IP toggle. The only flag is **`aimod` ("AI Ban")** — default **OFF**, following the existing `feature_flags.js` architecture (Redis-persisted `feature:aimod`, `__feature_change__` pub/sub synced across all 5 instances, boot + reconnect hydration, toggled via existing `set-feature-flag`) so changes persist exactly like other flags |
 | 4 | NEEDS_REVIEW admin heads-up | ✅ **Yes** — emit `admin_custom_event {eventType:"system_alert", alertType:"aimod_needs_review", …}` to the `__admins__` room (see `notifyAdminsNeedsReview` in §5.3) |
-| 5 | Billing | ✅ **Free tier, no billing** — RPM (12) + RPD (800) cluster budgets mandatory; `BLOCK_NONE` fallback to `BLOCK_ONLY_HIGH` if restricted; blocked verdicts fail-safe to NEEDS_REVIEW, never auto-ban. Attach billing later only if the audit log shows quota pain — zero code changes needed |
+| 5 | Billing | ✅ **Free tier, no billing** — RPM (12) + RPD (450) cluster budgets mandatory (under the verified free-tier 15 RPM / 500 RPD, see §17); `BLOCK_NONE` fallback to `BLOCK_ONLY_HIGH` if restricted; blocked verdicts fail-safe to NEEDS_REVIEW, never auto-ban. Attach billing later only if the audit log shows quota pain — zero code changes needed |
 | 6 | Trigger syntax | ✅ **Option B** — `@admin` mentioned ANYWHERE in the reply text triggers a report (`/@admin\b/i`, word-boundary so `email@administrator.com` / `@adminfake` do NOT match). Must be a **reply** (`replyTo` present) — a loose `@admin` in chat is inert. Natural usage like "@admin ban this guy" works. Over-trigger risk absorbed by the guard chain (flag → cooldown → budgets → verdict cache → cluster lock → target checks); Gemini is called at most ONCE per reported message |
 
 ---
@@ -666,7 +667,7 @@ Data: `GET /get-moderation-logs` + `/get-moderation-stats`; toggle uses existing
 | `modules/moderation/model.js` | `ModerationLog` mongoose model (collection `moderationlogs`), indexes on roomId / reportedMessageId / reportedUser / action / createdAt |
 | `modules/moderation/controller.js` | `GET /get-moderation-logs` (filters: action, roomId, reportedUser, limit ≤500) + `GET /get-moderation-stats` (24h/7d action counts) |
 | `modules/moderation/index.js` | Router — both endpoints behind `isUserLoggedIn` + `isAdmin` (same as `/get-users-per-room`) |
-| `modules/moderation/bench.js` | Standalone live-API classifier bench: 18 labeled samples (8 violations incl. leetspeak/evasion, 10 banter), reports precision/recall vs threshold, paced for free-tier 15 RPM |
+| `modules/moderation/bench.js` | Standalone live-API classifier bench: labeled samples (violations incl. leetspeak/evasion, banter, and username cases), reports precision/recall vs threshold, paced for free-tier 15 RPM |
 
 ### 12.2 Files modified
 
@@ -879,6 +880,17 @@ When **flag ON + the message is a reply**, `sanitizeReplyTo(replyTo)` runs **twi
 
 **Conclusion:** enabling the feature will not move the ~25–30K user capacity ceiling — it adds no per-message work. It is as performance-efficient as the other chat features.
 
+### 15.9 Racism-strictness mode — performance addendum (2026-07-19)
+
+The admin-selectable racism mode (§18) adds **no hot-path cost**:
+- **Hot path (`room_message`):** untouched — `getMode()` is never called there. Detection is still just the `@admin` regex.
+- **Report path:** two extra **in-memory property reads** of `racismPolicy.getMode()` per report (one for the verdict cache key in `service.js`, one in `aiModerator.classify`) + one per-Gemini-call **string build** of the system instruction. All free; reports are rare (~0.01/s) and off the hot path. (The two reads could be one — a sub-second mode-flip between them is harmless and TTL-self-corrects; left as documented.)
+- **Boot:** one extra Redis `duplicate()` subscriber (`racismSubClient`) + `loadFromRedis`/`subscribe` — same one-time cost as the existing rate-limit/perf-mode clients.
+- **Redis:** the setting is one small string key (`__aimod_racism_mode__`) + one pub/sub channel; verdict-cache keys gain a short `<mode>:` prefix (a mode change re-namespaces them; old keys expire via the 24h TTL — no leak, no growth).
+- **Mode change:** SET + publish once per admin click (admin-frequency), fanned to 5 instances via the adapter — negligible.
+
+Net: the racism mode is a control-plane setting read from memory once per rare report — **zero measurable impact** on throughput or the capacity ceiling.
+
 ---
 
 ## 16. DRY Refactor (2026-07-18)
@@ -930,3 +942,79 @@ Re-verified after fixes: `node --check` + module graph (no cycles) on the backen
 **If staying on free tier:** treat it as pilot-grade. Keep the 12 RPM / 450 RPD caps, enable on **one** site, and watch `SKIPPED_GLOBAL_BUDGET` frequency in `moderationlogs` — frequent skips during matches = the signal to turn on billing.
 
 > Note: the red "reached a rate limit" banner seen in the dashboard on 2026-07-18 was **Gemini 2.5 Flash Lite (11/10 RPM)** — leftover from the initial bench run against the now-retired 2.5 model, not our production `3.1-flash-lite` path (which showed 10/15 RPM, 29/500 RPD, all from testing). Not a production signal.
+
+---
+
+## 18. Admin-selectable Racism Strictness (2026-07-19)
+
+Admins can pick how strictly racism is judged, live, via a radio in the AI Moderation dialog — cluster-synced, default **Strict (A)**. Only racism scrutiny changes; **religious hatred stays strict, homophobia stays threats-only** (§13.6).
+
+### 18.1 The three modes
+| Mode | Bans | Allows |
+|---|---|---|
+| **strict (A)** — default | all racism: slurs, dehumanization, violence, **exclusion** ("go back", "don't belong"), stereotypes, jokes | — |
+| **moderate (B)** | slurs, dehumanization, calls for violence | exclusion, stereotypes, jokes |
+| **minimal (C)** | explicit slurs + threats/violence only | dehumanization-without-slur, exclusion, stereotypes, jokes |
+
+### 18.2 Infrastructure (reuses the proven config-sync pattern)
+Cloned from `utils/rate_limit_config.js` / the `__perf_mode__` setting — Redis-persisted + pub/sub-synced + boot/reconnect hydration, read from an in-memory copy **once per report** (never per message → zero hot-path cost).
+
+**Backend**
+- `utils/racism_policy.js` (new) — `loadFromRedis` / `subscribeToChanges` / `getMode` / `setMode` / `VALID` / `DEFAULT`. Redis key `__aimod_racism_mode__`, channel `__aimod_racism_change__`, default `strict`.
+- `config/redis.js` — new `racismSubClient` (duplicate) for the channel.
+- `server.js` — load + subscribe at boot + re-hydrate on Redis `ready` (mirrors rate-limit config).
+- `aiModerator.js` — `SYSTEM_INSTRUCTION` is now `buildSystemInstruction(mode)`; only the injected **RACISM SCRUTINY** line changes per `RACISM_RULES[mode]` (read via `racismPolicy.getMode()` at classify-time). Religion/homophobia/username/evasion rules unchanged.
+- `service.js` — verdict cache key now includes the mode (`aimod:verdict:<mode>:<messageId>`), so switching modes makes old verdicts miss → messages get re-judged under the new policy instead of serving a ≤24h stale verdict. Old-mode keys expire naturally. Also snapshots the mode once per report (reused for the cache key) and records it on every audit row.
+- `model.js` — `ModerationLog` gains a `racismMode` field (the strictness active when the report was judged; empty on pre-feature rows).
+- `modules/moderation/{controller,index}.js` — `GET /get-racism-mode`, `POST /set-racism-mode` (isUserLoggedIn + isAdmin), direct-to-CHAT_URL (no football-backend change).
+
+**Admin**
+- `axios.ts` — `endpoints.chat.getRacismMode` / `setRacismMode`.
+- `ai-moderation-logs.tsx` — a `RadioGroup` (Strict/Moderate/Minimal) at the top of the dialog, loaded on open, optimistic set + revert-on-error, disabled until loaded, info tooltip (reuses the exact Chat-Server-Mode radio pattern). Plus a **"Strictness" column** in the logs table showing the mode recorded on each row (`—` on pre-feature rows) — so the audit shows which policy produced each verdict.
+
+### 18.3 Cluster-safety / performance
+Same guarantees as Chat Server Mode: change on one instance → Redis persist + publish → all 5 instances update their in-memory copy; hydrated at boot + on reconnect; only a full Redis flush reverts to default. Judge-time cost is one in-memory property read per report + a per-call string build of the system prompt — negligible, off the hot path.
+
+### 18.4 Verified live (2026-07-19)
+Mode-switching confirmed changing behavior on the same inputs:
+- **strict:** `black people should go back to africa` → BAN; `black people are monkeys` → BAN.
+- **moderate:** `…go back to africa` → **no ban** (0.95); `monkeys` → BAN.
+- **minimal:** `…go back to africa` → **no ban** (0.90); `all muslims are terrorists` → **BAN** (religion unaffected); `ronaldo is gay` → **no ban** (homophobia unaffected).
+- Nuance: in every mode `black people are monkeys` bans, because the model reads "monkeys" as a racial **slur** (not abstract dehumanization) — minimal still bans slurs, so this is correct.
+
+Verified: `node --check` all touched files + module-graph (no cycles) on the backend; `npx tsc --noEmit` exit 0 on `football-admin`.
+
+### 18.5 Deploy note
+This edits the already-deployed chat backend (`aiModerator.js`, `service.js`, `server.js`, `config/redis.js`, new `racism_policy.js`) + admin — needs a redeploy (`git pull` + `pm2 reload`) + admin build. Feature is still gated by the `aimod` flag; default racism mode is `strict` (matches prior behavior), so nothing changes until an admin picks a looser mode.
+
+### 18.6 Review (2026-07-19) — passed
+Two parallel review agents (backend correctness/cluster/perf/regression + admin UI parity/regression). **Both SOUND — no regressions, no bugs.**
+- **Backend:** racism_policy correctly clones the rate-limit pattern; cluster-safe (dedicated `racismSubClient`, boot + reconnect hydration, SET+publish fan-out); prompt fallback-to-strict + all constant rules intact + same instruction on both BLOCK_NONE/BLOCK_ONLY_HIGH calls; verdict key computed once and used for GET+SET; hot path untouched (`getMode` never called there); no circular imports.
+- **Admin UI:** faithful clone of the Chat Server Mode radio (controlled, disabled-while-loading, optimistic + rollback, snackbars) + a correctly-wired extra in-flight disable (`racismPending`, reset in `finally`); load-on-open effect keyed on `open` only (no double-fetch); endpoint contract matches.
+- **Two non-blocking micro-nuances noted, left as-is (self-documented, TTL-self-correcting):** (1) `getMode()` read twice per report — a sub-second mode flip between the two could cache a verdict under the prior mode's key (harmless, expires in 24h); (2) the cluster lock isn't mode-namespaced (pre-existing lock behavior, not introduced here).
+- Re-verified: `node --check` all files + module graph (no cycles); `npx tsc --noEmit` exit 0 on `football-admin`.
+
+---
+
+## 19. Final Holistic Review (2026-07-19) — PASSED, safe to deploy
+
+A final holistic agent reviewed the entire feature across both repos + this doc after all increments (base pipeline → DRY refactor → real-time ban/unban → homophobia policy → cluster-synced racism strictness → audit column → richer tooltip). **Verdict: coherent and safe to deploy behind the `aimod` flag (default OFF). No blockers, bugs, or regressions.** Plus a mechanical sweep: 17/17 backend files `node --check`, zero dangling references, module graph loads (no cycles), admin `tsc --noEmit` exit 0.
+
+Confirmed sound: no dangling refs (old `autoBanUser`/`SYSTEM_INSTRUCTION`/`process.env.AIMOD_*` live only in this doc's design sections); all 5 admin endpoints have matching backend routes behind admin auth; racism mode snapshotted once and used for both the verdict key and the audit row; layered safety (flag-gate → try/catch hook → fire-and-forget → fail-safe classify → ban only on ok:true) intact; cluster-safety (flag/rate-limit/racism all Redis-persisted + pub/sub + hydrated) intact; existing chat + manual ban/unban + boot unaffected.
+
+**One substantive edge FIXED after the review:** the verdict was cached *before* the ban ran, so a transient Mongo/Redis error during `banUserEverywhere` would log `ERROR` yet leave a 24h "violation" cached → repeat reports served the cache and never retried the ban. Fixed in `service.js`: `actOnVerdict` now returns whether the action completed, and the verdict is cached **only on success** (BANNED/NEEDS_REVIEW/DISMISSED). A failed ban now caches nothing → the next report re-judges and retries. (Cache still written before the lock releases → no gap.)
+
+Doc-drift fixed: §11 Q5 RPD 800→450; §12.1 bench sample count generalized. Remaining doc notes are self-disclaimed design-section names (§4/§5, superseded by §16/§18) and one pre-existing unused import (`findUserByName` in socketHandler, predates this feature) — both out of scope.
+
+**Deploy prerequisite unchanged:** ship the `socket.senderName` binding fix (§13.4 #1) before enabling the flag in production.
+
+---
+
+## 20. Deployment record
+
+- **Initial deploy (2026-07-18, owner):** admin panel, then chat backend — base feature (report → Gemini → ban → announce), flag OFF.
+- **Deploy (2026-07-19, owner):** chat backend + admin, shipping everything since: DRY refactor (§16), real-time admin ban/unban (§14.3), homophobia policy (§13.6), config moved to `const_config.js`, cluster-synced racism strictness modes + audit column + richer tooltip (§18), and the failed-ban-retry fix (§19). No new npm deps; only `GEMINI_API_KEY` in the server `.env`.
+- **Live state:** `feature:aimod` = OFF (default), `__aimod_racism_mode__` = `strict` (default). Feature is dormant — no reports are judged and no bans occur until an admin turns AI Ban ON.
+- **Reviews:** base feature, DRY refactor, config move, racism-mode (backend + admin), existing-chat regression (×2), and a final holistic pass (§19) — all passed, no blockers/regressions.
+- **Enable-gates (must clear before flipping `aimod` ON in prod):** (1) `socket.senderName` binding fix (§13.4 #1); (2) rotate the API key (shared in plaintext). Then enable on one low-traffic site, watch `moderationlogs` + `aimod:global_rpd`, tune, widen.
+- **Not built (deferred):** v2 one-tap "🚩 Report to admin" button in the user chat (`chatBox.tsx`) — reporting works today via reply + `@admin`.

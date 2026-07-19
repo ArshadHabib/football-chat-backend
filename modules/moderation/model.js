@@ -43,6 +43,10 @@ const moderationLogSchema = new mongoose.Schema(
       index: true,
     },
     model: { type: String, default: "" }, // gemini model used (empty on skips)
+    // Racism strictness active when this report was judged (strict/moderate/
+    // minimal) — recorded per row so the audit shows which policy produced the
+    // verdict. Absent on pre-feature rows.
+    racismMode: { type: String, default: "" },
     latencyMs: { type: Number, default: 0 },
     error: { type: String, default: "" },
     // True when the verdict came from the 24h Redis cache instead of a live call

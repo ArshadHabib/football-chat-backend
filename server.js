@@ -29,6 +29,7 @@ const { warmBanCaches } = require("@project/modules/user/warmup");
 const { startDrainLoop } = require("@project/modules/chat/service");
 const featureFlags = require("@project/utils/feature_flags");
 const rateLimitConfig = require("@project/utils/rate_limit_config");
+const racismPolicy = require("@project/utils/racism_policy");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -110,6 +111,11 @@ app.get("/", (req, res) => {
     await rateLimitConfig.loadFromRedis();
     await rateLimitConfig.subscribeToChanges();
 
+    // Same lifecycle for the AI-moderation racism-strictness mode (read once
+    // per report by the classifier). Cheap; load before traffic for determinism.
+    await racismPolicy.loadFromRedis();
+    await racismPolicy.subscribeToChanges();
+
     // Startup sweep — reconciles __socket_website__ and __room_counts__ against
     // the live socket state across all instances. Catches stale entries left by
     // a previously crashed/restarted instance within seconds of this process
@@ -143,6 +149,12 @@ app.get("/", (req, res) => {
         .loadFromRedis()
         .catch((err) =>
           console.error("Rate-limit config re-hydrate failed:", err),
+        );
+      // Re-hydrate AI racism mode, same pattern.
+      racismPolicy
+        .loadFromRedis()
+        .catch((err) =>
+          console.error("Racism mode re-hydrate failed:", err),
         );
     });
 

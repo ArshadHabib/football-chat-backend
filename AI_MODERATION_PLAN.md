@@ -709,6 +709,14 @@ Requirement added after review: offensive **usernames** (`nigge5s`, `muhammadpdf
 - `announceBan` / ban plan / audit log unchanged — a username-triggered ban reads *`🚫 User "muhammadpdf" has been banned from chat due to religious hatred.`* (public message shows the brief category; the confidence and full `reason` stating whether the message, username, or both triggered it are recorded in the audit log).
 - **Live-verified 5/5:** `nigge5s`+clean-msg → racism 1.00; `muhammadpdf`+clean-msg → religious_hatred 0.95; `kill_all_jews` → hate_speech 1.00; `muhammad_fan` → not banned; `cristiano7` → not banned.
 
+## 13.6 Addendum — Homophobia policy: threats-only (2026-07-19)
+
+Policy decision (owner): homophobic **jokes / insults / opinions are NOT bannable** (common football banter); only **threats, calls for/celebration of violence, or eliminationist** content against gay people bans. This leniency is **scoped ONLY to sexual orientation** — racism and religious hatred remain strict (ban even as "jokes"/slurs), unchanged.
+
+- **Prompt-only change** in `aiModerator.js` `SYSTEM_INSTRUCTION`: a dedicated "SEXUAL ORIENTATION — TREAT NARROWLY" rule (flag only threats/violence/elimination; explicitly do NOT flag `"ronaldo is gay"`, `"gay people are bad"`, `"being gay is disgusting"`, `"I hate gays"`, `"faggot"`-as-taunt), plus an explicit reminder that racism/religious-hatred are **not** covered by this leniency. No code/flow change.
+- **Live-verified 8/8:** `ronaldo is gay`, `gay people are bad`, `messi son is gay`, `being gay is disgusting` → **no ban** (`none`, conf 1.00); `gay people should be killed`, `gay people should not exist` → **BAN** (hate_speech 1.00); `black players should go back to the jungle` → **BAN** (racism 1.00); `all muslims are terrorists` → **BAN** (religious_hatred 1.00).
+- Rationale: before this change all four homophobic lines (incl. `ronaldo is gay` at 0.90) auto-banned — too aggressive for football banter. Now the classifier draws the line at violence/threats.
+
 ---
 
 ## 13. Self-Review & Fixes (2026-07-18)

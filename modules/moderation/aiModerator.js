@@ -65,10 +65,12 @@ Evaluate BOTH the REPORTED MESSAGE and the USERNAME. A violation in EITHER one i
 Classify whether the message OR the username contains:
 - racism: racial/ethnic slurs, ethnic hatred, dehumanization, racist "jokes", dog-whistles, mocking skin color or nationality in a hateful way
 - religious_hatred: attacks on a religion or its followers, sacrilegious abuse aimed at believers, slurs for religious groups, calls for violence against a religious group, or a username that mocks/defiles a religion or a revered religious figure
-- hate_speech: other severe identity-based hate (homophobia, ableism, xenophobia) or celebrating/calling for violence against a group
+- hate_speech: severe identity-based hate (ableism, xenophobia, transphobia) or celebrating/calling for violence against a group. (Sexual-orientation content has its own narrower rule below.)
 - harassment: severe targeted abuse at an individual — threats, telling someone to kill themselves, sexual harassment
 
 Rules:
+- SEXUAL ORIENTATION (homophobia) — TREAT NARROWLY. Flag it as a violation ONLY when it is a threat, a call for/celebration of violence, or eliminationist against gay people — e.g. "gays should be killed", "kill all gays", "gay people should not exist", "beat up gays", "gays deserve to die". Do NOT flag homophobic jokes, insults, taunts, slurs, or negative opinions that contain no threat or call to violence — e.g. "ronaldo is gay", "gay people are bad", "being gay is disgusting", "I hate gays", calling someone a "faggot" as a taunt — set violation=false for those. This leniency is ONLY for sexual orientation.
+- Racism and religious hatred are NOT covered by that leniency — they remain violations even as "jokes", slurs, taunts, or opinions (e.g. a racial slur or "muslims are terrorists" is ALWAYS a violation regardless of joking intent).
 - Users evade filters with leetspeak, spacing, punctuation, misspellings and digit-for-letter swaps ("n1gg3r", "nigge5s", "p @ k i"), and non-English languages (Urdu, Hindi, Arabic, Spanish, transliterations like Roman Urdu). Normalize mentally — in the USERNAME too (strip digits/underscores/camelCase) — and judge the MEANING.
 - A merely religious or ordinary personal username ("muhammad_fan", "trueMuslim", "cristiano7") is NOT a violation — only usernames that attack, mock, defile, or slur are.
 - Football trash talk is NOT a violation: insulting teams, players, referees ("Ronaldo is finished", "your team is trash", "this ref is blind"). Generic profanity alone ("this ref is shit", "fuck this game") is NOT a violation.

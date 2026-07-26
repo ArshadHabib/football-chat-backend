@@ -2,6 +2,7 @@
 
 **Date:** 2026-07-18 (last updated 2026-07-19)
 **Status:** 🚀 **DEPLOYED (owner, 2026-07-19)** — backend + admin live, reviewed clean (§19), including racism strictness modes (§18), homophobia policy (§13.6), the strictness audit column, and the failed-ban-retry fix. **The feature is DORMANT in production: `aimod` flag defaults OFF and racism mode defaults `strict` (= prior behavior), so deploying changed nothing user-facing.** Decisions locked in §11; cluster-safety/persistence audited clean (§14.1).
+> **§21 (2026-07-19) — Admin-editable Reporter Limit: 🚀 DEPLOYED (owner, 2026-07-26).** Reviewed clean (backend + admin, ×3 passes), cluster-sync + persistence verified live (two-process test). Default 3/300 unchanged; verdict "chat cannot break".
 **⚠️ Before enabling `aimod` in production:** ship the `socket.senderName` binding fix (§13.4 #1) and rotate the API key. Then enable on one low-traffic site and watch the logs.
 **Scope:** `football-chat-backend` (primary) + `football-admin` (AI Ban toggle + moderation logs + racism-strictness radio) + optional user-chat one-tap report button (`chatBox.tsx`, v2 — not built)
 
@@ -102,8 +103,8 @@ GEMINI_API_KEY=***                      # required — feature disables itself i
 GEMINI_MODEL = "gemini-3.1-flash-lite"  // swappable without touching logic (2.5-flash-lite 404s on new keys)
 AIMOD_CONFIDENCE_THRESHOLD = 0.85       // min confidence to auto-ban
 AIMOD_TIMEOUT_MS = 10000                // Gemini call timeout (fail-safe: no ban on timeout)
-AIMOD_MAX_REPORTS_PER_USER = 3          // reports per reporter per window
-AIMOD_REPORTER_WINDOW_SECONDS = 300     // that window (5 min)
+AIMOD_MAX_REPORTS_PER_USER = 3          // DEFAULT reports per reporter per window — now admin-editable & cluster-synced (§21)
+AIMOD_REPORTER_WINDOW_SECONDS = 300     // DEFAULT window (5 min) — seeds utils/aimod_reporter_config.js (§21)
 AIMOD_GLOBAL_RPM = 12                   // cluster Gemini calls/min cap (free-tier 3.1-flash-lite = 15)
 AIMOD_GLOBAL_RPD = 450                  // cluster Gemini calls/day cap (free-tier 3.1-flash-lite = 500)
 ```
@@ -489,7 +490,8 @@ Mounted at `/api/next/moderation` + `/api/chat/moderation` (same dual-mount conv
 |---|---|---|---|
 | `aimod:lock:<messageId>` | String NX | PX 120000 | one Gemini call per message across cluster |
 | `aimod:verdict:<messageId>` | String JSON | EX 86400 | verdict cache — repeat reports cost $0 |
-| `aimod:reporter:<ip-or-name>` | Counter | EX 300 (NX) | reporter cooldown (3/5min default) |
+| `aimod:reporter:<ip-or-name>` | Counter | EX = windowSeconds (NX) | reporter cooldown (default 3/5min; window now admin-editable, §21) |
+| `__aimod_reporter_config__` | JSON string | none (persistent) | admin-editable reporter limit `{maxReports,windowSeconds}` — cluster-synced (§21) |
 | `aimod:global_rpm` | Counter | EX 60 (NX) | cluster-wide Gemini RPM budget (free tier: 15 RPM) |
 | `aimod:global_rpd` | Counter | EX 86400 (NX) | cluster-wide Gemini daily budget (free-tier 3.1-flash-lite = 500 RPD; cap 450) |
 | `feature:aimod` | String | none | "AI Ban" master switch (existing flag system, default off, persistent) |
@@ -1014,7 +1016,48 @@ Doc-drift fixed: §11 Q5 RPD 800→450; §12.1 bench sample count generalized. R
 
 - **Initial deploy (2026-07-18, owner):** admin panel, then chat backend — base feature (report → Gemini → ban → announce), flag OFF.
 - **Deploy (2026-07-19, owner):** chat backend + admin, shipping everything since: DRY refactor (§16), real-time admin ban/unban (§14.3), homophobia policy (§13.6), config moved to `const_config.js`, cluster-synced racism strictness modes + audit column + richer tooltip (§18), and the failed-ban-retry fix (§19). No new npm deps; only `GEMINI_API_KEY` in the server `.env`.
-- **Live state:** `feature:aimod` = OFF (default), `__aimod_racism_mode__` = `strict` (default). Feature is dormant — no reports are judged and no bans occur until an admin turns AI Ban ON.
+- **Deploy (2026-07-26, owner):** admin-editable reporter limit (§21) — chat backend + admin. New Redis key `__aimod_reporter_config__` (default 3/300, dormant behavior identical to the prior constants). Reviewed clean ×3; cluster-sync + persistence verified live. No new npm deps.
+- **Live state:** `feature:aimod` = OFF (default), `__aimod_racism_mode__` = `strict` (default), `__aimod_reporter_config__` = `{3,300}` (default). Feature is dormant — no reports are judged and no bans occur until an admin turns AI Ban ON.
 - **Reviews:** base feature, DRY refactor, config move, racism-mode (backend + admin), existing-chat regression (×2), and a final holistic pass (§19) — all passed, no blockers/regressions.
 - **Enable-gates (must clear before flipping `aimod` ON in prod):** (1) `socket.senderName` binding fix (§13.4 #1); (2) rotate the API key (shared in plaintext). Then enable on one low-traffic site, watch `moderationlogs` + `aimod:global_rpd`, tune, widen.
 - **Not built (deferred):** v2 one-tap "🚩 Report to admin" button in the user chat (`chatBox.tsx`) — reporting works today via reply + `@admin`.
+
+---
+
+## 21. Admin-editable Reporter Limit (authored 2026-07-19 · deployed 2026-07-26)
+
+**Goal.** Make the reporter throttle (how many times a single reporter can trigger the AI per rolling window) **admin-editable, cluster-synced, and persistent** — exactly like the racism strictness mode (§18) and the message rate-limit. Previously the two values were fixed constants in `const_config.js`. Default stays **3 reports / 300 s** (unchanged behavior).
+
+**Design — reuses two proven patterns.** New module `utils/aimod_reporter_config.js` is a `rate_limit_config.js` clone carrying `{maxReports, windowSeconds}`, **minus** the socket-listener machinery (dropped exactly as `racism_policy.js` does — the value is read **once per report** by the pipeline, never per message, and never pushed to chat clients).
+
+- **Source of truth:** Redis key `__aimod_reporter_config__` (single JSON string, **no TTL** → survives restart). Change channel `__aimod_reporter_change__` on a dedicated `aimodReporterSubClient` (`config/redis.js`).
+- **Hot copy:** each worker keeps an in-memory `config`, initialized to `DEFAULTS` at require-time (fail-safe: valid even if Redis never loaded). `service.js` reads it via `reporterConfig.getConfig()` — a pure in-memory read that cannot throw.
+- **Defaults:** seeded from `const_config` (`AIMOD_MAX_REPORTS_PER_USER` / `AIMOD_REPORTER_WINDOW_SECONDS`) so the committed default lives in one place.
+- **Server-authoritative clamping:** `normalize()` clamps `maxReports` to **1–20** and `windowSeconds` to **1–3600**; malformed/out-of-range input can never persist a bad limit. `windowSeconds ≥ 1` guarantees `EXPIRE` always gets a valid TTL.
+- **Lifecycle** (wired in `server.js`, mirrors racism mode): boot `loadFromRedis()` + `subscribeToChanges()`; reconnect `ready` re-hydrate.
+
+**Semantics (all CONFIRMED by review + live tests 2026-07-19):**
+- **(a)** Persists across full restart (no-TTL key + boot load).
+- **(b)** Propagates to all 5 workers in real time (dedicated subClient + pub/sub) — proven by a two-process test: a `setConfig` in process A reached process B's in-memory copy in **~125 ms**.
+- **(c)** Changing **maxReports** takes effect on the very next report (plain integer compare).
+- **(d)** Changing **windowSeconds** affects only **new** counters — existing `aimod:reporter:<id>` keys keep their stamped TTL because of `EXPIRE … NX`, converging within one old window (same fixed-window behavior as the message limit).
+- **(e)** Loosening `maxReports` **cannot** blow the Gemini budget — the global RPM/RPD gate is downstream and unchanged; a higher reporter limit only lets more reports *reach* that cap.
+
+**One implementation note.** `setConfig()` returns `{...next}` (the just-persisted value) rather than `getConfig()`: the `await set`/`await publish` yield to the event loop, during which the same process can receive an earlier self-published message and transiently overwrite the in-memory copy (harmless — pub/sub is ordered, so it converges to the last write). Returning `next` makes the HTTP response reflect exactly what was persisted regardless of that timing. The admin UI always sends **both** fields, so partial-merge-onto-stale-base never occurs on the real path.
+
+**Endpoints** (admin-JWT, `modules/moderation`): `GET /get-reporter-config` → `{config, bounds}`; `POST /set-reporter-config {maxReports?, windowSeconds?}` → clamped `{config}`.
+
+**Admin UI** (`ai-moderation-logs.tsx`). In the logs dialog, next to the strictness radios: a read-only chip `Reports limit: 3 per user / 300s` + a **pencil** icon → **"Edit Reports Limit"** `ConfirmDialog` with two Yup-validated number fields (**"Reports allowed per user"**, **"Per window (seconds)"**) and a caption clarifying the limit is per a single reporter (by IP, username fallback) — a 1:1 mirror of "Edit Message Limit". Submit-then-confirm (not optimistic): posts both fields, adopts the server's clamped response, snackbar + close. Pencil is gated on `loaded` so it can't open before current values arrive; failed load degrades to a disabled pencil + `…` chip (no crash).
+
+**Performance / blast radius.** Zero hot-path cost. The value is read via `getConfig()` — a pure in-memory object read **measured at ~14 ns/call** (5M-call microbench) — **once per report, not per message**. Reports run ~4–5 orders of magnitude rarer than messages (§15) and each already costs ~6 Redis RTTs + a 0.5–2 s Gemini call, so the config read is a rounding-error fraction (~10⁻⁸) of a report. No new **per-message** work and no new **per-report** Redis op (the reporter-cooldown INCR+EXPIRE pipeline already existed; only the `windowSeconds` value feeding `EXPIRE` changed from a constant to a variable — same op count). Boot adds one Redis `GET` + one subscriber connection (a `pubClient.duplicate()`), one-time. Memory: one ~2-number object per worker. A config change costs 1 `SET` + 1 `PUBLISH` on the admin action only (never on user traffic), fanned to workers in **~125 ms** (measured, two-process test). Review verdict: **"CHAT CANNOT BREAK FROM THIS CHANGE"** — moderation is flag-gated, `try/catch`-wrapped, and fire-and-forget; the config read can't throw; behavior is identical to the old constants when left at 3/300.
+
+**Verification done (2026-07-19), before owner testing:**
+- `node --check` on all 7 touched backend files → clean; full module-graph require (alias-resolved) → no cycles/crashes.
+- Live Redis test: `normalize()` clamps (`999→20`, `0→1`), persistence to `__aimod_reporter_config__`, pub/sub round-trip.
+- **Two-process cross-instance test** (two Node processes, one Redis = two PM2 workers): change on A reached B in **~125 ms**; B's `getConfig()` converged to the new value.
+- Microbench: `getConfig()` destructure **~14 ns/call** over 5M calls.
+- Admin `npx tsc --noEmit` → **exit 0**.
+- Two independent review agents (backend correctness+regression; admin+semantics) → **no blockers/majors/minors**, only optional NITs; backend verdict **"CHAT CANNOT BREAK FROM THIS CHANGE"**, all 5 semantics claims confirmed in code.
+- Found + fixed during testing: `setConfig` returning a stale value under the self-publish race (now returns `{...next}`).
+
+**Files touched:** `utils/aimod_reporter_config.js` (new), `config/redis.js`, `server.js`, `modules/moderation/service.js`, `modules/moderation/controller.js`, `modules/moderation/index.js`, `utils/const_config.js` (comments), `football-admin/src/utils/axios.ts`, `football-admin/src/sections/matches/ai-moderation-logs.tsx`. No new npm deps.

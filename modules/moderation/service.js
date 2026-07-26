@@ -24,8 +24,6 @@ const {
   BANNED_USERS_KEY,
   REDIS_MSG_CACHE_PREFIX,
   AIMOD_CONFIDENCE_THRESHOLD: CONFIDENCE_THRESHOLD,
-  AIMOD_MAX_REPORTS_PER_USER: MAX_REPORTS_PER_USER,
-  AIMOD_REPORTER_WINDOW_SECONDS: REPORTER_WINDOW_SECONDS,
   AIMOD_GLOBAL_RPM: GLOBAL_RPM,
   AIMOD_GLOBAL_RPD: GLOBAL_RPD,
 } = require("@project/utils/const_config");
@@ -37,13 +35,16 @@ const { saveChatMessageService } = require("@project/modules/chat/service");
 const MessageModel = require("@project/modules/chat/messageModel");
 const { OBJECT_ID_REGEX } = require("@project/utils/messageValidation");
 const racismPolicy = require("@project/utils/racism_policy");
+const reporterConfig = require("@project/utils/aimod_reporter_config");
 const ModerationLog = require("./model");
 const aiModerator = require("./aiModerator");
 
-// Config constants (CONFIDENCE_THRESHOLD, MAX_REPORTS_PER_USER,
-// REPORTER_WINDOW_SECONDS, GLOBAL_RPM, GLOBAL_RPD) come from
+// Config constants (CONFIDENCE_THRESHOLD, GLOBAL_RPM, GLOBAL_RPD) come from
 // utils/const_config.js — committed + identical on every instance. Only the
 // Gemini API KEY is env-sourced (secret). See AI_MODERATION_PLAN.md §3.3.
+// The reporter limit (maxReports / windowSeconds) is NOT a constant here: it's
+// a cluster-synced, admin-editable value read once per report from
+// utils/aimod_reporter_config.js (defaults still seeded from const_config).
 
 // Redis keys (plan §5.8). Prefixed "aimod:" — distinct from the "__x__"
 // infra keys and the "ratelimit:"/"reg_ratelimit:" per-IP counters.
@@ -265,13 +266,21 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
   // Reporter cooldown — stops one client from spamming reports. Keyed by IP
   // when available (rename-proof), username otherwise. INCR + EXPIRE NX in a
   // single pipeline so the counter can never end up without a TTL.
+  //
+  // maxReports / windowSeconds are read once here from the cluster-synced,
+  // admin-editable reporter config (in-memory copy — no Redis round-trip).
+  // Changing maxReports takes effect on the next report; changing windowSeconds
+  // only affects NEW counters (existing keys keep their stamped TTL because of
+  // EXPIRE ... NX), converging within one old window — same fixed-window
+  // behavior as rate_limit_config.
+  const { maxReports, windowSeconds } = reporterConfig.getConfig();
   const reporterKey = `${REPORTER_PREFIX}${reporterIp || reporterName || "unknown"}`;
   const [reportCount] = await redis
     .multi()
     .incr(reporterKey)
-    .expire(reporterKey, REPORTER_WINDOW_SECONDS, "NX")
+    .expire(reporterKey, windowSeconds, "NX")
     .exec();
-  if (reportCount > MAX_REPORTS_PER_USER) {
+  if (reportCount > maxReports) {
     logModeration({ ...logBase, action: "SKIPPED_REPORTER_LIMIT" });
     return;
   }

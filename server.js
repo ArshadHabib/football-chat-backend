@@ -30,6 +30,7 @@ const { startDrainLoop } = require("@project/modules/chat/service");
 const featureFlags = require("@project/utils/feature_flags");
 const rateLimitConfig = require("@project/utils/rate_limit_config");
 const racismPolicy = require("@project/utils/racism_policy");
+const reporterConfig = require("@project/utils/aimod_reporter_config");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -116,6 +117,11 @@ app.get("/", (req, res) => {
     await racismPolicy.loadFromRedis();
     await racismPolicy.subscribeToChanges();
 
+    // Same lifecycle for the AI-moderation reporter-limit config (read once per
+    // report by the pipeline). Cheap; load before traffic for determinism.
+    await reporterConfig.loadFromRedis();
+    await reporterConfig.subscribeToChanges();
+
     // Startup sweep — reconciles __socket_website__ and __room_counts__ against
     // the live socket state across all instances. Catches stale entries left by
     // a previously crashed/restarted instance within seconds of this process
@@ -155,6 +161,12 @@ app.get("/", (req, res) => {
         .loadFromRedis()
         .catch((err) =>
           console.error("Racism mode re-hydrate failed:", err),
+        );
+      // Re-hydrate AI reporter-limit config, same pattern.
+      reporterConfig
+        .loadFromRedis()
+        .catch((err) =>
+          console.error("Reporter-limit config re-hydrate failed:", err),
         );
     });
 

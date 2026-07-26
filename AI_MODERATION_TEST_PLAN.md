@@ -35,6 +35,7 @@ Work top-to-bottom. Each case has **Steps → Expected → Verify (backend) → 
 # Redis
 redis-cli GET feature:aimod                 # "true" when AI Ban is ON
 redis-cli GET __aimod_racism_mode__          # strict | moderate | minimal (default strict)
+redis-cli GET __aimod_reporter_config__      # {"maxReports":3,"windowSeconds":300} (admin-editable, no TTL)
 redis-cli SMEMBERS __banned_users__          # banned usernames
 redis-cli SMEMBERS __banned_ips__            # banned IPs (empty on localhost)
 redis-cli KEYS "aimod:*"                     # locks / verdicts / counters
@@ -376,6 +377,37 @@ Open the **AI Moderation Logs** dialog → the **Racism strictness** radio (defa
 
 ---
 
+## 16. Admin-editable Reporter Limit (pencil + dialog) — see AI_MODERATION_PLAN.md §21
+
+> Default is **3 reports / 300 s**. The pencil sits next to the strictness radios in the AI Moderation Logs dialog. **Return it to 3 / 300 after testing.**
+
+### TC-44 — Read + edit round-trip (clamping)
+- **Steps:** Open the logs dialog. The chip reads **`Reports limit: 3 per user / 300s`**. Click the **pencil** → set `maxReports = 5`, `windowSeconds = 60` → **Save**.
+- **Expected:** snackbar "Reports limit updated", dialog closes, chip now reads **`5 per user / 60s`**. `redis-cli GET __aimod_reporter_config__` → `{"maxReports":5,"windowSeconds":60}`. Try to save `maxReports = 999` → the field/Save is bounded to **20** (Yup + server clamp); `windowSeconds = 0` → bounded to **1**.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-45 — New limit actually enforced (maxReports takes effect immediately)
+- **Steps:** With `aimod` ON, set the limit to **2 / 300**. As ONE reporter (same IP/name), send 3 `@admin` replies to (distinct) messages within 300 s.
+- **Expected:** the **3rd** report logs **`SKIPPED_REPORTER_LIMIT`** (with `maxReports=2`); at the old default it would have taken 4. The Reason column shows `Reporter: <name/ip>`.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-46 — Cluster-synced + persists across restart
+- **Steps:** Set the limit to **4 / 120** in the admin. On a *different* PM2 instance (or after a full chat-backend restart), reopen the dialog / inspect Redis.
+- **Expected:** the other instance / post-restart reflects **4 / 120** (read from `__aimod_reporter_config__`, no TTL) — not the 3/300 default. Reopen dialog → chip shows the persisted value. **Set back to 3 / 300 when done.**
+- Actual: ___  | Pass/Fail: ___
+
+### TC-47 — windowSeconds change is fixed-window (existing counters keep their TTL)
+- **Steps (conceptual / TTL inspection):** As a reporter, fire 1 report (creates `aimod:reporter:<id>` with TTL≈300). Change window to **60**. `redis-cli TTL aimod:reporter:<id>`.
+- **Expected:** the EXISTING key still shows a TTL near its original ~300 (unchanged — `EXPIRE … NX` won't shorten it). Only a NEW counter (after the old one expires) uses 60. No key is left without a TTL.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-48 — Graceful load failure (no crash)
+- **Steps:** Conceptual: if `get-reporter-config` fails when the dialog opens, the chip shows **`…`** and the pencil is **disabled**.
+- **Expected:** no crash, no broken dialog; strictness + logs still work. (Values still enforce the last-loaded/default limit server-side.)
+- Actual: ___  | Pass/Fail: ___
+
+---
+
 ## Summary sheet
 
 | # | Case | Pass/Fail | Notes |
@@ -423,3 +455,8 @@ Open the **AI Moderation Logs** dialog → the **Racism strictness** radio (defa
 | TC-41 | Racism mode cluster-synced + persists | | |
 | TC-42 | Mode change re-judges cached | | |
 | TC-43 | Failed ban retried (conceptual) | | |
+| TC-44 | Reporter limit read + edit + clamp | | |
+| TC-45 | New reporter limit enforced immediately | | |
+| TC-46 | Reporter limit cluster-synced + persists | | |
+| TC-47 | windowSeconds fixed-window (TTL kept) | | |
+| TC-48 | Graceful reporter-config load failure | | |

@@ -63,7 +63,9 @@ async function loadFromRedis() {
 // Applies locally first so the originating instance reacts immediately.
 async function setMode(next) {
   if (!isValid(next)) {
-    throw new Error(`Invalid racism mode: ${next}. Expected one of ${VALID.join(", ")}`);
+    throw new Error(
+      `Invalid racism mode: ${next}. Expected one of ${VALID.join(", ")}`,
+    );
   }
   mode = next;
   await pubClient.set(KEY, next);

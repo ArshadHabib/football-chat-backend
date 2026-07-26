@@ -7,6 +7,8 @@ const {
   setUserBanController,
   getRacismModeController,
   setRacismModeController,
+  getReporterConfigController,
+  setReporterConfigController,
 } = require("./controller");
 
 // Admin JWT auth (same as /get-users-per-room in the chat router) — these
@@ -26,5 +28,17 @@ router.get(
 router.post("/set-user-ban", isUserLoggedIn, isAdmin, setUserBanController);
 router.get("/get-racism-mode", isUserLoggedIn, isAdmin, getRacismModeController);
 router.post("/set-racism-mode", isUserLoggedIn, isAdmin, setRacismModeController);
+router.get(
+  "/get-reporter-config",
+  isUserLoggedIn,
+  isAdmin,
+  getReporterConfigController,
+);
+router.post(
+  "/set-reporter-config",
+  isUserLoggedIn,
+  isAdmin,
+  setReporterConfigController,
+);
 
 module.exports = router;

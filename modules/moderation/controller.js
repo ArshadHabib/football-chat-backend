@@ -8,6 +8,7 @@ const { sendResponse, sendError } = require("@project/utils");
 const { pubClient: redis } = require("@project/config/redis");
 const { BANNED_USERS_KEY } = require("@project/utils/const_config");
 const racismPolicy = require("@project/utils/racism_policy");
+const reporterConfig = require("@project/utils/aimod_reporter_config");
 const ModerationLog = require("./model");
 const { applyAdminBan } = require("./service");
 
@@ -173,10 +174,51 @@ async function setRacismModeController(req, res) {
   }
 }
 
+// GET /get-reporter-config → { config: { maxReports, windowSeconds }, bounds }
+async function getReporterConfigController(req, res) {
+  try {
+    return sendResponse(
+      res,
+      {
+        config: reporterConfig.getConfig(),
+        bounds: {
+          maxReports: reporterConfig.MAX_REPORTS_BOUND,
+          windowSeconds: reporterConfig.WINDOW_BOUND,
+        },
+      },
+      "Reporter config retrieved successfully",
+      200,
+    );
+  } catch (error) {
+    console.error("getReporterConfig error:", error.message);
+    return sendError(res, "Internal server error", 500);
+  }
+}
+
+// POST /set-reporter-config { maxReports?, windowSeconds? }
+// Cluster-synced (Redis persist + pub/sub) — every instance picks it up. Values
+// are clamped server-side by aimod_reporter_config.normalize(), so an
+// out-of-range or malformed input can never persist a bad limit.
+async function setReporterConfigController(req, res) {
+  try {
+    const { maxReports, windowSeconds } = req.body || {};
+    if (maxReports === undefined && windowSeconds === undefined) {
+      return sendError(res, "Provide 'maxReports' and/or 'windowSeconds'", 400);
+    }
+    const applied = await reporterConfig.setConfig({ maxReports, windowSeconds });
+    return sendResponse(res, { config: applied }, "Reporter config updated", 200);
+  } catch (error) {
+    console.error("setReporterConfig error:", error.message);
+    return sendError(res, "Internal server error", 500);
+  }
+}
+
 module.exports = {
   getModerationLogsController,
   getModerationStatsController,
   setUserBanController,
   getRacismModeController,
   setRacismModeController,
+  getReporterConfigController,
+  setReporterConfigController,
 };

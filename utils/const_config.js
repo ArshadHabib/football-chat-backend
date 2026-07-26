@@ -38,8 +38,11 @@ const REDIS_WEBSITE_COUNTS = "__website_counts__";
 const GEMINI_MODEL = "gemini-3.1-flash-lite"; // gemini-2.5-flash-lite 404s for new keys
 const AIMOD_CONFIDENCE_THRESHOLD = 0.85; // min confidence (0..1) to auto-ban
 const AIMOD_TIMEOUT_MS = 10000; // Gemini call timeout (10s) — on timeout: no ban (fail-safe)
-const AIMOD_MAX_REPORTS_PER_USER = 3; // reports allowed per reporter per window
-const AIMOD_REPORTER_WINDOW_SECONDS = 300; // that window (5 min) → "3 reports / 5 min"
+// Reporter limit — DEFAULTS only. The live values are cluster-synced and
+// admin-editable via utils/aimod_reporter_config.js (Redis + pub/sub); these
+// seed that config on first boot / when Redis has no stored value.
+const AIMOD_MAX_REPORTS_PER_USER = 3; // default reports allowed per reporter per window
+const AIMOD_REPORTER_WINDOW_SECONDS = 300; // default window (5 min) → "3 reports / 5 min"
 const AIMOD_GLOBAL_RPM = 12; // cluster Gemini calls/minute (free-tier 3.1-flash-lite = 15)
 const AIMOD_GLOBAL_RPD = 450; // cluster Gemini calls/day (free-tier 3.1-flash-lite = 500)
 

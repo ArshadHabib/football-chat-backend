@@ -66,7 +66,7 @@ The admin **shield icon** on the Matches dashboard opens the AI Moderation Logs 
   2. Browser B: reply to that message, type `@admin ban this guy`, send.
 - **Expected:**
   - B's `@admin` reply appears in chat as a normal message.
-  - ~1–3s later an **Admin** message (gold crown, red "Admin" name) appears, quoting A's message: **`🚫 User "fanboy" has been banned from chat due to racism.`** (manual admin ban text + 🚫 prefix + brief category reason; full reason/confidence only in the audit log).
+  - ~1–3s later an **Admin** message (gold crown, red "Admin" name) appears, quoting A's message: **`🚫 User "fanboy" has been banned from chat for racism (NN%): <reason> (reported by "<reporter>")`** (§22 wording — icon + category + confidence + AI reason + reporter).
   - Browser A: composer locks, shows **"You are banned from chatting."**
 - **Verify:**
   - `redis-cli SMEMBERS __banned_users__` includes `fanboy`.
@@ -96,7 +96,7 @@ The admin **shield icon** on the Matches dashboard opens the AI Moderation Logs 
 
 ### TC-5 — Offensive username, clean message → banned
 - **Steps:** Browser A: register `muhammadpdf`, send a clean message `what a goal`. Browser B: reply `@admin`.
-- **Expected:** Banned — announcement **`🚫 User "muhammadpdf" has been banned from chat due to religious hatred.`**; the **audit log** row shows `category: religious_hatred` and a `reason` mentioning the **username**.
+- **Expected:** Banned — announcement **`🚫 User "muhammadpdf" has been banned from chat for religious hatred (NN%): <reason> (reported by "<reporter>")`** (§22 wording); the **audit log** row shows `category: religious_hatred` and a `reason` mentioning the **username**.
 - **Verify:** `moderationlogs` newest → BANNED; reason references the username.
 - Actual: ___  | Pass/Fail: ___
 
@@ -408,6 +408,72 @@ Open the **AI Moderation Logs** dialog → the **Racism strictness** radio (defa
 
 ---
 
+## 17. Report-outcome announcements — see AI_MODERATION_PLAN.md §22
+
+> Every report outcome now posts a public "Admin" room message (same mechanism/styling as the ban), replying to the reported message except reporter-limit and not-found. Requires `aimod` **ON**. `<reporter>` = the reporting user's name.
+
+### TC-49 — BANNED message has a real reason
+- **Steps:** Report a clearly racist message.
+- **Expected:** public Admin message `🚫 User "<target>" has been banned from chat for racism (NN%): <reason> (reported by "<reporter>")`, quoting the offending message. Not just the category tag — it includes confidence % and the AI's one-line reason.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-50 — DISMISSED (no violation)
+- **Steps:** Report a harmless message ("great goal!").
+- **Expected:** `✅ Above chat was reviewed — no violation found, no action taken. (reported by "<reporter>")`, quoting it. No ban.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-51 — NEEDS_REVIEW (low confidence)
+- **Steps:** Report an ambiguous/borderline message.
+- **Expected:** `🔍 Above chat has been flagged for admin review. (reported by "<reporter>")` + the existing admin-panel alert still fires.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-52 — SELF_REPORT
+- **Steps:** Reply `@admin` to your OWN message.
+- **Expected:** `💬 User "<reporter>" can't report their own message.` No ban, no AI call.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-53 — TARGET_ADMIN
+- **Steps:** Reply `@admin` to an Admin/announcement message.
+- **Expected:** `💬 Admin messages can't be reported. (reported by "<reporter>")`.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-54 — ALREADY_BANNED
+- **Steps:** Report a message from a user who is already banned.
+- **Expected:** `💬 This user is already banned — no further action. (reported by "<reporter>")`.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-55 — DISMISSED (cached, repeat report <24h)
+- **Steps:** Report the same message twice within 24h.
+- **Expected:** 2nd time → `💬 Above chat was already reviewed recently — no further action. (reported by "<reporter>")`; no 2nd Gemini call.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-56 — REPORTER_LIMIT (no reply quote)
+- **Steps:** Exceed the reporter limit (e.g. set 2/300, fire a 3rd report).
+- **Expected:** `⏳ User "<reporter>" report limit reached (2 per 5 minutes).` — **no** reply quote. Window text is humanized.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-57 — NOT_FOUND (no reply quote)
+- **Steps:** Reply `@admin` to a very old message no longer in cache/DB (or a forged messageId).
+- **Expected:** `⚠️ Reported message could not be found. (reported by "<reporter>")` — **no** reply quote.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-58 — GLOBAL_BUDGET (conceptual / forced)
+- **Steps:** Exhaust the global RPM/RPD budget (or lower it temporarily), then report.
+- **Expected:** `⏳ Above chat couldn't be reviewed right now — moderation is busy, try again shortly. (reported by "<reporter>")`; no ban; retryable later.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-59 — ERROR (AI call failed, conceptual)
+- **Steps:** Force a Gemini error (bad key / network). Report.
+- **Expected:** `⚠️ Above chat couldn't be reviewed due to an error — no action taken. (reported by "<reporter>")`; fail-safe (no ban).
+- Actual: ___  | Pass/Fail: ___
+
+### TC-60 — Silent when feature OFF / lock lost
+- **Steps:** With `aimod` OFF, reply `@admin`. (Lock-lost is conceptual — concurrent duplicate reports across instances.)
+- **Expected:** **No** Admin message at all — the `@admin` reply is just a normal chat message. Lock-lost: only one instance posts, no duplicate.
+- Actual: ___  | Pass/Fail: ___
+
+---
+
 ## Summary sheet
 
 | # | Case | Pass/Fail | Notes |
@@ -460,3 +526,15 @@ Open the **AI Moderation Logs** dialog → the **Racism strictness** radio (defa
 | TC-46 | Reporter limit cluster-synced + persists | | |
 | TC-47 | windowSeconds fixed-window (TTL kept) | | |
 | TC-48 | Graceful reporter-config load failure | | |
+| TC-49 | BANNED message has real reason | | |
+| TC-50 | DISMISSED (no violation) message | | |
+| TC-51 | NEEDS_REVIEW message | | |
+| TC-52 | SELF_REPORT message | | |
+| TC-53 | TARGET_ADMIN message | | |
+| TC-54 | ALREADY_BANNED message | | |
+| TC-55 | DISMISSED cached message | | |
+| TC-56 | REPORTER_LIMIT (no quote) | | |
+| TC-57 | NOT_FOUND (no quote) | | |
+| TC-58 | GLOBAL_BUDGET message | | |
+| TC-59 | ERROR (AI failed) message | | |
+| TC-60 | Silent when OFF / lock lost | | |

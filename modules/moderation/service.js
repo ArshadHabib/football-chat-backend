@@ -36,6 +36,7 @@ const MessageModel = require("@project/modules/chat/messageModel");
 const { OBJECT_ID_REGEX } = require("@project/utils/messageValidation");
 const racismPolicy = require("@project/utils/racism_policy");
 const reporterConfig = require("@project/utils/aimod_reporter_config");
+const { OUTCOME, QUOTED, reportReplyTo } = require("./utils");
 const ModerationLog = require("./model");
 const aiModerator = require("./aiModerator");
 
@@ -64,16 +65,6 @@ const REPORT_REGEX = /(?:^|[^\w.@-])@admin\b/i;
 
 const MAX_CONTEXT_MESSAGES = 5;
 
-// Human-readable phrase per violation category, appended to the public ban
-// announcement ("...banned from chat due to <phrase>."). Deliberately the
-// category, not verdict.reason — brief, consistent, and never echoes the
-// offending content back into the room.
-const REASON_PHRASE = {
-  racism: "racism",
-  religious_hatred: "religious hatred",
-  hate_speech: "hate speech",
-  harassment: "harassment",
-};
 
 // ---------------------------------------------------------------------------
 // Detection — called inline in the room_message handler; must stay trivial.
@@ -174,18 +165,23 @@ function emitAdminMessage(io, roomId, messageContent, replyTo) {
   }).catch((err) => console.error("aimod announce save error:", err.message));
 }
 
-function announceBan(io, roomId, original, verdict) {
-  const replyTo = {
-    messageId: String(original._id),
-    senderName: String(original.senderName || "").slice(0, 50),
-    contentSnippet: String(original.messageContent || "").slice(0, 140),
-    isAdmin: false,
-  };
-  // Manual admin ban text (chat-user-name.tsx) + the 🚫 icon + a brief
-  // category reason.
-  const phrase = REASON_PHRASE[verdict?.category] || "hate speech";
-  const messageContent = `🚫 User "${original.senderName}" has been banned from chat due to ${phrase}.`;
-  emitAdminMessage(io, roomId, messageContent, replyTo);
+// ---------------------------------------------------------------------------
+// Report-outcome announcements (plan §22). EVERY report outcome posts a public
+// "Admin" room message through the SAME emitAdminMessage path as the ban — no
+// new event, sender, or transport. The wording table (OUTCOME), the QUOTED set,
+// and the pure formatters live in ./utils (presentation only); this file keeps
+// just the side-effecting glue below.
+// ---------------------------------------------------------------------------
+// Build the outcome text and post it via the shared admin-message path. Attaches
+// the reply-quote only for QUOTED outcomes that actually have the message.
+// Reuses emitAdminMessage, so it inherits the null-io/room guard and the
+// fire-and-forget persist — no new failure path on the report pipeline.
+function announceOutcome(io, roomId, outcome, ctx) {
+  const build = OUTCOME[outcome];
+  if (!build) return;
+  const replyTo =
+    QUOTED.has(outcome) && ctx.original ? reportReplyTo(ctx.original) : undefined;
+  emitAdminMessage(io, roomId, build(ctx), replyTo);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,23 +212,27 @@ function notifyAdminsNeedsReview(io, roomId, original, verdict) {
 // ban itself failed (transient Mongo/Redis error): we don't want to serve a
 // cached "violation" for 24h while the offender is actually still unbanned.
 async function actOnVerdict({ io, roomId, original, verdict, logBase }) {
+  const reporterName = logBase.reporterName;
   if (verdict.violation && verdict.confidence >= CONFIDENCE_THRESHOLD) {
     try {
       await banUserEverywhere(original.senderName);
     } catch (err) {
       console.error("aimod ban error:", err.message);
+      announceOutcome(io, roomId, "ERROR_BAN", { reporterName, original });
       logModeration({ ...logBase, verdict, action: "ERROR", error: `ban_failed: ${err.message}` });
       return false; // ban failed → do NOT cache → next report retries
     }
-    announceBan(io, roomId, original, verdict);
+    announceOutcome(io, roomId, "BANNED", { reporterName, original, verdict });
     logModeration({ ...logBase, verdict, action: "BANNED" });
     return true;
   }
   if (verdict.violation) {
     notifyAdminsNeedsReview(io, roomId, original, verdict);
+    announceOutcome(io, roomId, "NEEDS_REVIEW", { reporterName, original });
     logModeration({ ...logBase, verdict, action: "NEEDS_REVIEW" });
     return true;
   }
+  announceOutcome(io, roomId, "DISMISSED", { reporterName, original });
   logModeration({ ...logBase, verdict, action: "DISMISSED" });
   return true;
 }
@@ -281,6 +281,11 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
     .expire(reporterKey, windowSeconds, "NX")
     .exec();
   if (reportCount > maxReports) {
+    announceOutcome(io, roomId, "REPORTER_LIMIT", {
+      reporterName,
+      maxReports,
+      windowSeconds,
+    });
     logModeration({ ...logBase, action: "SKIPPED_REPORTER_LIMIT" });
     return;
   }
@@ -291,6 +296,7 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
   // display-only and never used as evidence (plan §6 case 7).
   const { original, cacheMessages } = await fetchOriginalMessage(roomId, messageId);
   if (!original) {
+    announceOutcome(io, roomId, "NOT_FOUND", { reporterName });
     logModeration({ ...logBase, action: "SKIPPED_NOT_FOUND" });
     return;
   }
@@ -302,18 +308,24 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
   // and JSON.stringify drops undefined fields) — treat a nameless target as
   // unactionable rather than letting undefined reach sIsMember/findUserByName.
   if (!original.senderName || typeof original.senderName !== "string") {
+    // original exists but has no usable sender — treated as not-found; NOT_FOUND
+    // is not a QUOTED outcome, so we deliberately don't pass `original` (no quote).
+    announceOutcome(io, roomId, "NOT_FOUND", { reporterName });
     logModeration({ ...logBase, action: "SKIPPED_NOT_FOUND" });
     return;
   }
   if (original.isAdmin || original.senderName === "Admin") {
+    announceOutcome(io, roomId, "TARGET_ADMIN", { reporterName, original });
     logModeration({ ...logBase, action: "SKIPPED_TARGET_ADMIN" });
     return;
   }
   if (original.senderName === reporterName) {
+    announceOutcome(io, roomId, "SELF_REPORT", { reporterName, original });
     logModeration({ ...logBase, action: "SKIPPED_SELF_REPORT" });
     return;
   }
   if (await redis.sIsMember(BANNED_USERS_KEY, original.senderName)) {
+    announceOutcome(io, roomId, "ALREADY_BANNED", { reporterName, original });
     logModeration({ ...logBase, action: "SKIPPED_ALREADY_BANNED" });
     return;
   }
@@ -325,6 +337,7 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
   // re-fire on every repeat report.
   const cachedRaw = await redis.get(verdictKey);
   if (cachedRaw) {
+    announceOutcome(io, roomId, "DISMISSED_CACHED", { reporterName, original });
     logModeration({ ...logBase, action: "DISMISSED", fromCache: true });
     return;
   }
@@ -354,6 +367,7 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
     const rpm = budget[0];
     const rpd = budget[2];
     if (rpm > GLOBAL_RPM || rpd > GLOBAL_RPD) {
+      announceOutcome(io, roomId, "GLOBAL_BUDGET", { reporterName, original });
       logModeration({ ...logBase, action: "SKIPPED_GLOBAL_BUDGET" });
       return; // lock released in finally → retryable when budget frees
     }
@@ -383,6 +397,7 @@ async function handleReport({ io, roomId, reporterName, reporterIp, replyTo }) {
     if (!result.ok) {
       // Fail-safe: no verdict → no ban, ever. No verdict cached → a later
       // report retries once the API recovers (lock released in finally).
+      announceOutcome(io, roomId, "ERROR_AI", { reporterName, original });
       logModeration({ ...logBase, action: "ERROR", error: result.error, latencyMs });
       return;
     }

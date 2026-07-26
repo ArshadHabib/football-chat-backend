@@ -21,7 +21,7 @@ Live match chats are being polluted by users posting **racist remarks and anti-r
 1. Any user **replies** to an offensive message (reply feature already shipped — see `MESSAGE_REPLY_PLAN.md`) and mentions **`@admin`** in the reply text.
 2. The backend detects `@admin` + `replyTo` on that message, fetches the **original reported message** server-side, and sends it to **Google Gemini** for classification (racist / anti-religious / hate speech — yes or no).
 3. If Gemini confirms a violation with high confidence, the backend **auto-bans** the offender using our existing ban machinery (Redis ban set + Mongo + `user_updated` broadcast).
-4. The backend then posts a message in the room **on behalf of Admin** (crown + red name, exactly like `admin_room_message` today): *`🚫 User "USER123" has been banned from chat due to hate speech.`* — the manual admin ban message + the 🚫 icon + a brief category reason (`racism` / `religious hatred` / `hate speech` / `harassment`).
+4. The backend then posts a message in the room **on behalf of Admin** (crown + red name, exactly like `admin_room_message` today): *`🚫 User "USER123" has been banned from chat for hate speech (95%): <reason> (reported by "<reporter>")`*. **(§22 — the ban line now carries confidence + the AI reason + reporter, and EVERY report outcome, not just a ban, posts an Admin message.)**
 5. Every decision is written to a **moderation audit log** so a human admin can review, and unban if the AI got it wrong.
 
 The chat becomes self-moderating: the crowd flags, the AI judges, our tools execute — 24/7, with a human paper trail.
@@ -180,6 +180,8 @@ Changing a tuning constant is a code edit + redeploy (no more per-instance `.env
      + saveChatMessageService(...)   ← persists exactly like admin messages
 ```
 
+> **⚠️ §22 update (2026-07-26):** the `announceBan(...)` step above is the original single-outcome sketch. It's now `announceOutcome(...)` and **every** report outcome posts an Admin message — see §22 for the current wording of all 12 outcomes (the ban line now carries confidence + reason + reporter).
+
 Why hook **after** broadcast? The hot path measured in `PERF_REPORT.md` stays byte-identical — zero added latency or Redis round-trips for the 99.9% of messages that are not reports. The report reply itself still appears in chat (transparency: everyone sees moderation was summoned).
 
 ---
@@ -191,9 +193,10 @@ Why hook **after** broadcast? The hot path measured in `PERF_REPORT.md` stays by
 ```
 modules/moderation/
 ├── index.js         REST router (moderation logs for admin panel)
-├── controller.js    getModerationLogsController, getModerationStatsController (+ setUserBan, get/setRacismMode — §14, §18)
-├── service.js       handleReport(), autoBanUser(), announceBan(), guards
+├── controller.js    getModerationLogsController, getModerationStatsController (+ setUserBan, get/setRacismMode — §14, §18; get/setReporterConfig — §21)
+├── service.js       handleReport(), guards, emitAdminMessage(), announceOutcome() (§22; ban via shared banUserEverywhere — §16.3), applyAdminBan()
 ├── aiModerator.js   Gemini client wrapper: classify(text, context) → verdict
+├── utils.js         §22 presentation: OUTCOME/QUOTED table + formatters (pure, no I/O)
 └── model.js         ModerationLog mongoose model
 ```
 
@@ -396,6 +399,8 @@ function notifyAdminsNeedsReview(io, roomId, original, verdict) {
 3. `redis.sAdd(BANNED_USERS_KEY, [name, ...siblingNames])` — instantly enforced at next `room_message` / `add_reaction` on every instance (existing pipeline check).
 4. `broadcastBanToAllRooms(bannedNames)` (existing, `roomManager.js`) → emits `user_updated {name, isBanned:true, updatedBy:"admin"}` globally per name — **clients already handle this event** (lock composer, persist `localStorage.isBanned`). Zero frontend work.
 5. If the user record has no `ipAddress` (registered from localhost/unknown), the ban is name-only — same behavior as the manual flow.
+
+> **⚠️ Superseded by §22 (2026-07-26).** `announceBan` no longer exists — it was replaced by `announceOutcome`, and EVERY report outcome (not just a ban) now posts an Admin message. The presentation code lives in `modules/moderation/utils.js`. The current ban wording is `🚫 User "<name>" has been banned from chat for <category> (<conf>%): <reason> (reported by "<reporter>")`. The pseudocode below is retained as the original design record.
 
 **`announceBan(io, roomId, original, verdict)`** — the "Admin says" message. The text is the **manual admin ban message** (`chat-user-name.tsx`: `User "<name>" has been banned from chat.`) + the 🚫 icon + a **brief category reason** (`...due to <racism|religious hatred|hate speech|harassment>.`). The category — not the AI's full `reason` sentence — keeps it short and never echoes the offending content back into the room (full `reason` + confidence live in the audit log):
 ```js
@@ -647,7 +652,7 @@ Data: `GET /get-moderation-logs` + `/get-moderation-stats`; toggle uses existing
 
 | # | Question | Decision |
 |---|---|---|
-| 1 | Announcement wording | ✅ Manual admin ban message + 🚫 icon + brief category reason: `🚫 User "<name>" has been banned from chat due to <racism\|religious hatred\|hate speech\|harassment>.` — the category only (not the AI's full reason sentence); full reason + confidence recorded in the audit log. Updated 2026-07-18 per request |
+| 1 | Announcement wording | ✅ Manual admin ban message + 🚫 icon + brief category reason (2026-07-18). **⚠️ Superseded by §22 (2026-07-26):** the ban line now reads `🚫 User "<name>" has been banned from chat for <category> (<conf>%): <reason> (reported by "<reporter>")`, and **every** report outcome — not just a ban — posts an Admin message. See §22 for the current wording of all 12 outcomes. |
 | 2 | Report visibility | ✅ **Visible** — the `@admin` reply stays in chat as a normal message (no hot-path interception) |
 | 3 | Ban plan + feature flag | ✅ AI bans execute the full existing ban plan — **name AND IP banned together, always** (cascade via `banAllUsersByIp` + `BANNED_IPS_KEY`, identical to manual admin ban in `IP_BAN.md`). No separate IP toggle. The only flag is **`aimod` ("AI Ban")** — default **OFF**, following the existing `feature_flags.js` architecture (Redis-persisted `feature:aimod`, `__feature_change__` pub/sub synced across all 5 instances, boot + reconnect hydration, toggled via existing `set-feature-flag`) so changes persist exactly like other flags |
 | 4 | NEEDS_REVIEW admin heads-up | ✅ **Yes** — emit `admin_custom_event {eventType:"system_alert", alertType:"aimod_needs_review", …}` to the `__admins__` room (see `notifyAdminsNeedsReview` in §5.3) |
@@ -665,7 +670,8 @@ Data: `GET /get-moderation-logs` + `/get-moderation-stats`; toggle uses existing
 | File | Purpose |
 |---|---|
 | `modules/moderation/aiModerator.js` | Gemini wrapper — `classify()` with structured JSON output, BLOCK_NONE safety settings (+ automatic BLOCK_ONLY_HIGH retry if free tier rejects), temperature 0, `httpOptions.timeout`, never throws |
-| `modules/moderation/service.js` | Full pipeline — `detectAdminReport()` (Option B regex `/(?:^|[^\w.@-])@admin\b/i` + ObjectId-validated `replyTo`), `handleReport()` guard chain, the ban via shared `banUserEverywhere()` (name + IP cascade — see §16.3; originally an in-module `autoBanUser`), `emitAdminMessage()`/`announceBan()` (admin-styled room message with quote), `notifyAdminsNeedsReview()` (`__admins__` room alert), `applyAdminBan()` (real-time admin ban/unban), audit logging |
+| `modules/moderation/service.js` | Full pipeline — `detectAdminReport()` (Option B regex `/(?:^|[^\w.@-])@admin\b/i` + ObjectId-validated `replyTo`), `handleReport()` guard chain, the ban via shared `banUserEverywhere()` (name + IP cascade — see §16.3; originally an in-module `autoBanUser`), `emitAdminMessage()` + `announceOutcome()` (admin-styled room message per outcome, with quote — §22; replaced the old `announceBan`), `notifyAdminsNeedsReview()` (`__admins__` room alert), `applyAdminBan()` (real-time admin ban/unban), audit logging |
+| `modules/moderation/utils.js` | Pure presentation for §22 — `OUTCOME` (12 message builders), `QUOTED` set, `REASON_PHRASE`, formatters `by`/`pct`/`humanizeWindow`/`reportReplyTo`. No I/O; imported by service.js |
 | `modules/moderation/model.js` | `ModerationLog` mongoose model (collection `moderationlogs`), indexes on roomId / reportedMessageId / reportedUser / action / createdAt |
 | `modules/moderation/controller.js` | `GET /get-moderation-logs` (filters: action, roomId, reportedUser, limit ≤500) + `GET /get-moderation-stats` (24h/7d action counts) |
 | `modules/moderation/index.js` | Router — both endpoints behind `isUserLoggedIn` + `isAdmin` (same as `/get-users-per-room`) |
@@ -709,7 +715,7 @@ Data: `GET /get-moderation-logs` + `/get-moderation-stats`; toggle uses existing
 Requirement added after review: offensive **usernames** (`nigge5s`, `muhammadpdf`, `kill_all_jews`, …) are common even when the message text is clean, so Gemini now evaluates **both the reported message AND the offender's username** — a violation in *either* triggers the identical ban + announcement flow (nothing else changed).
 
 - The username was already passed to `classify()` (as `original.senderName`); the change is prompt-only — it's now presented as a distinct `USERNAME` field the classifier must judge, with explicit guidance to normalize digit/underscore evasion in names and to spare ordinary religious/personal names (`muhammad_fan`, `cristiano7`) from false positives.
-- `announceBan` / ban plan / audit log unchanged — a username-triggered ban reads *`🚫 User "muhammadpdf" has been banned from chat due to religious hatred.`* (public message shows the brief category; the confidence and full `reason` stating whether the message, username, or both triggered it are recorded in the audit log).
+- Ban plan / audit log unchanged — a username-triggered ban is announced like any other (wording per §22: `🚫 User "muhammadpdf" has been banned from chat for religious hatred (NN%): <reason> (reported by "<reporter>")`; the confidence and full `reason` stating whether the message, username, or both triggered it are also recorded in the audit log).
 - **Live-verified 5/5:** `nigge5s`+clean-msg → racism 1.00; `muhammadpdf`+clean-msg → religious_hatred 0.95; `kill_all_jews` → hate_speech 1.00; `muhammad_fan` → not banned; `cristiano7` → not banned.
 
 ## 13.6 Addendum — Homophobia policy: threats-only (2026-07-19)
@@ -903,7 +909,7 @@ Removed the 3 duplications found in the DRY/conventions review; behavior preserv
 Was declared identically in `utils/messageValidation.js` **and** `modules/moderation/service.js`. Now **exported** from `messageValidation.js` and **imported** by `service.js` (`detectAdminReport`). Single source; if the ObjectId shape check ever changes, both the reply-quote validation and the report trigger stay in sync.
 
 ### 16.2 `emitAdminMessage()` — one admin-announcement builder
-`announceBan` (AI ban) and `announceAdminAction` (manual admin ban/unban) each hand-built the same "Admin" `room_message` (emit + `saveChatMessageService`). Extracted a shared **`emitAdminMessage(io, roomId, messageContent, replyTo?)`** in `service.js`; both now delegate to it (`announceBan` passes a `replyTo` quote, `announceAdminAction` doesn't). Identical broadcast/persist shape guaranteed for both.
+`announceBan` (AI ban) and `announceAdminAction` (manual admin ban/unban) each hand-built the same "Admin" `room_message` (emit + `saveChatMessageService`). Extracted a shared **`emitAdminMessage(io, roomId, messageContent, replyTo?)`** in `service.js`; both delegate to it. *(Later, §22 replaced `announceBan` with `announceOutcome`, which still delegates to `emitAdminMessage` — so this shared builder remains the single admin-announcement path.)* Identical broadcast/persist shape guaranteed for all callers.
 
 ### 16.3 `banUserEverywhere()` — one ban orchestration
 The name + IP-cascade + Redis-ban-sets + real-time broadcast sequence existed in **two** places: `modules/user/controller.js` `updateUser` (manual) and `modules/moderation/service.js` `autoBanUser` (AI). Extracted into a new **`modules/user/banService.js`** — kept separate from the pure-data `service.js` so the data layer stays broadcast-free (matches the data/orchestration split). Both the manual controller and the moderation service (`actOnVerdict`, `applyAdminBan`) now call `banUserEverywhere(name)`; `autoBanUser` is deleted.
@@ -1061,3 +1067,51 @@ Doc-drift fixed: §11 Q5 RPD 800→450; §12.1 bench sample count generalized. R
 - Found + fixed during testing: `setConfig` returning a stale value under the self-publish race (now returns `{...next}`).
 
 **Files touched:** `utils/aimod_reporter_config.js` (new), `config/redis.js`, `server.js`, `modules/moderation/service.js`, `modules/moderation/controller.js`, `modules/moderation/index.js`, `utils/const_config.js` (comments), `football-admin/src/utils/axios.ts`, `football-admin/src/sections/matches/ai-moderation-logs.tsx`. No new npm deps.
+
+---
+
+## 22. Report-outcome announcements (🚀 DEPLOYED — owner, 2026-07-26)
+
+**Goal.** Today only a **ban** posts a public message; every other outcome is silent to the room. Extend it so **every** report outcome posts a public **"Admin" room message** — same mechanism and styling as the ban announcement (`emitAdminMessage`: broadcast + persist + optional reply-quote). No new event, no new sender, nothing private. The ban line also gains a proper reason (category + confidence + `verdict.reason`) instead of just the category tag.
+
+**Backend-only.** Reuses the existing `emitAdminMessage`; the frontend already renders these `room_message`s (red "Admin" name + crown + optional quote). Touch-points: a new `announceOutcome()` + the `OUTCOME`/`QUOTED` table (in `utils.js`) called on each outcome branch in `service.js`; the old `announceBan` was deleted and the ban routed through `announceOutcome`. No admin/frontend change.
+
+**Messages (all public "Admin" room messages):**
+
+| # | Outcome | Message | Reply-quote |
+|---|---|---|---|
+| 1 | BANNED | `🚫 User "<target>" has been banned from chat for <cat> (<conf>%): <verdict.reason> (reported by "<reporter>")` | ✅ |
+| 2 | NEEDS_REVIEW | `🔍 Above chat has been flagged for admin review. (reported by "<reporter>")` | ✅ |
+| 3 | DISMISSED (no violation) | `✅ Above chat was reviewed — no violation found, no action taken. (reported by "<reporter>")` | ✅ |
+| 4 | DISMISSED (already reviewed <24h, `fromCache`) | `💬 Above chat was already reviewed recently — no further action. (reported by "<reporter>")` | ✅ |
+| 5 | SKIPPED_ALREADY_BANNED | `💬 This user is already banned — no further action. (reported by "<reporter>")` | ✅ |
+| 6 | SKIPPED_SELF_REPORT | `💬 User "<reporter>" can't report their own message.` (falls back to "A user…" when no reporter name) | ✅ |
+| 7 | SKIPPED_TARGET_ADMIN | `💬 Admin messages can't be reported. (reported by "<reporter>")` | ✅ |
+| 8 | SKIPPED_GLOBAL_BUDGET | `⏳ Above chat couldn't be reviewed right now — moderation is busy, try again shortly. (reported by "<reporter>")` | ✅ |
+| 9 | ERROR (AI call failed) | `⚠️ Above chat couldn't be reviewed due to an error — no action taken. (reported by "<reporter>")` | ✅ |
+| 10 | ERROR (ban failed after confirm) | `⚠️ Above chat: violation confirmed but the ban couldn't be completed — an admin will follow up. (reported by "<reporter>")` | ✅ |
+| 11 | SKIPPED_REPORTER_LIMIT | `⏳ User "<reporter>" report limit reached (<maxReports> per <window>).` | ❌ |
+| 12 | SKIPPED_NOT_FOUND | `⚠️ Reported message could not be found. (reported by "<reporter>")` | ❌ |
+
+**Reply-quote rule.** Rows **1–10** post as a reply to the reported message (the quote shows the offender + content — that's why the text drops the target name, except the ban which names it explicitly). Rows **11–12** have **no** quote: the reporter-limit check runs *before* the server fetch, and "not found" means there is nothing to resolve.
+
+**Silent by design (no message).** Feature flag OFF (dormant) and cluster-lock-lost (another instance already posts it — avoids a duplicate).
+
+**Dynamic placeholders.** `<target>` reported user · `<reporter>` reporter name · `<cat>` humanized category (racism / religious hatred / hate speech / harassment) · `<conf>` `Math.round(confidence*100)` · `<verdict.reason>` the AI's one-sentence rationale (already capped 300 chars) · `<maxReports>`/`<window>` the live reporter-limit config (window humanized, e.g. "5 minutes").
+
+**Notes / cautions.**
+- `verdict.reason` is AI-generated and *could* occasionally quote the offending word; accepted for now since it's a one-line rationale, not the raw message. If undesirable, fall back to category+confidence only on the ban line.
+- Every outcome now persists one extra "Admin" message per report; volume is bounded by the reporter limit (default 3 / 5 min) and reports are already ~4–5 orders rarer than messages (§15), so the added persist/broadcast is negligible.
+- Empty-guard behavior: if `reporterName`/`verdict.reason` are empty, the `(reported by "…")` / `: <reason>` fragments are omitted rather than rendered blank.
+
+**Implementation (2026-07-26).** Split across two files in `modules/moderation/`:
+- **`utils.js` (new)** — pure presentation only: the `OUTCOME` wording table, the `QUOTED` set, `REASON_PHRASE`, and the formatters `by`/`pct`/`humanizeWindow`/`reportReplyTo`. No I/O, no side effects — isolated so wording tweaks never touch the pipeline and the table is unit-testable on its own.
+- **`service.js`** — keeps the side-effecting glue: `emitAdminMessage` (shared with the manual admin ban/unban) and `announceOutcome()` (looks up `OUTCOME`/`QUOTED` from `./utils` and posts via `emitAdminMessage`). The old `announceBan` was deleted and the ban routed through `announceOutcome`. One `announceOutcome()` call sits next to `logModeration()` in each of the 12 outcome branches (`handleReport` + `actOnVerdict`).
+
+Reuses `emitAdminMessage` (broadcast + persist), so no new event/sender/transport and no schema change. Silent paths (flag OFF, lock-lost) untouched. Empty-name hardening: `SELF_REPORT`/`REPORTER_LIMIT` fall back to "A user"/"Report limit…" when `reporterName` is falsy (mirrors how `by()` drops the attribution elsewhere).
+
+**Icons (final).** 🚫 BANNED · 🔍 NEEDS_REVIEW · ✅ DISMISSED · 💬 DISMISSED_CACHED / ALREADY_BANNED / SELF_REPORT / TARGET_ADMIN · ⏳ GLOBAL_BUDGET / REPORTER_LIMIT · ⚠️ ERROR_AI / ERROR_BAN / NOT_FOUND. The ban line carries no trailing period before `(reported by …)`.
+
+**Verification:** `node --check` + module-graph load clean; all 12 builders rendered and confirmed (incl. window-humanize edge cases 60→"1 minute", 90→"90 seconds", 300→"5 minutes", empty reason/reporter fragments dropped). Review agent run twice (post-implementation, then post-`utils.js` refactor + icon change) → both **GO, no blockers/majors/minors**: no new throw path on the report pipeline, silent cases stay silent, no double-post, ban still bans before announcing, reply-quote rule correct, `reporterName` resolves in both scopes.
+
+**Status:** 🚀 **DEPLOYED (owner, 2026-07-26)** — implemented, reviewed clean (×2), owner-tested in a live room, docs synced. Test cases TC-49…TC-60 below. Behavior only visible when `aimod` is ON.

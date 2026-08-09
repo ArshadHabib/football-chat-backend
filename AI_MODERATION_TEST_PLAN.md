@@ -474,6 +474,47 @@ Open the **AI Moderation Logs** dialog → the **Racism strictness** radio (defa
 
 ---
 
+## 18. One-tap 🚩 Report button (frontend) — see AI_MODERATION_PLAN.md §23
+
+> Frontend feature, built in `football-cx-soccerstreams` only. Test on that site. The button sends the fixed text `@admin check this chat` as a reply, so all backend behavior (§1–§17) applies unchanged — these cases only cover the button itself and the known validation-dedup bug.
+
+### TC-61 — Flag click sends the report + scrolls to bottom
+- **Steps:** In Browser A, hover another user's message, click the 🚩 next to the timestamp. (Hover first: confirm the chat does NOT auto-scroll while the cursor is on the flag.)
+- **Expected:** A message `@admin check this chat` is sent as a reply to that message, the chat scrolls to the bottom, and (with `aimod` ON) the normal report pipeline fires — the reported message is judged and the §22 outcome posts.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-62 — Flag hidden on own + admin messages
+- **Steps:** Look at your own messages and at any "Admin" message.
+- **Expected:** No 🚩 on your own messages or on Admin messages (they'd be `SKIPPED_SELF_REPORT` / `SKIPPED_TARGET_ADMIN` no-ops); 🚩 shows on other real users' messages.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-63 — Repeated button reports NOT dropped when `FEATURE_VALIDATION` is ON (fixed 2026-08-09)
+- **Steps:** Turn `FEATURE_VALIDATION` **ON**. In Browser A, flag user X's message, then flag a **different** user Y's message (two reports in a row → identical `@admin check this chat` text). Watch in Browser B / reload.
+- **Expected:** **both** `@admin check this chat` lines broadcast + persist normally (visible to other users and after reload) — the 2nd is no longer dropped by the fuzzy-duplicate check. Both reports also fire the AI (X and Y judged, §22 announcements post).
+- Actual: ___  | Pass/Fail: ___
+
+### TC-65 — 🔒 Forged `isReport` can't bypass validation (security)
+- **Steps:** With `FEATURE_VALIDATION` **ON**, use browser DevTools to emit a `room_message` with `isReport:true` but content that is NOT the canonical report string — e.g. `@admin buy followers at spam.com`, or a URL, or repeated spam text.
+- **Expected:** the content is **fully validated** (URL/spam/duplicate) and dropped exactly as if `isReport` weren't set — the exact-text + real-reply guard means only the literal `@admin check this chat` skips validation. No bypass.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-66 — Manually typed `@admin …` is still validated
+- **Steps:** With `FEATURE_VALIDATION` **ON**, type a report **in the composer** (not the 🚩 button): reply to a message and type `@admin this guy keeps spamming http://x.com`.
+- **Expected:** normal validation applies (URL → dropped; profanity → cleaned; duplicates → dropped) because a composer send is `isReport=false`. The AI still fires on any `@admin` reply that survives to the moderation hook. Only the one-tap 🚩 (fixed text) is exempt.
+- Actual: ___  | Pass/Fail: ___
+
+### TC-64 — 🚩 respects the message rate limit (disabled during countdown)
+- **Steps:** Set a tight message limit (e.g. **2 / 60s** via the admin "Message Limit"). In Browser A, send/report enough to hit the cap, then look at the 🚩 icons.
+- **Expected:** once the cap is hit, the composer shows the countdown ("Send next message in: Ns") **and** every 🚩 goes disabled — greyed (~0.4 opacity), no hover highlight, and clicking does nothing. Hover a 🚩 → its tooltip shows a **live, decrementing** counter "Limit reached! Resets in Ns" (ticks in step with the composer). When the countdown ends, the 🚩 re-enable. A 🚩 click that *itself* trips the cap still surfaces the same countdown. (Backend already drops any over-limit report before the AI runs.)
+- Actual: ___  | Pass/Fail: ___
+
+### TC-67 — Reset-to-defaults buttons (admin limit editors)
+- **Steps:** In the admin, open **Edit Reports Limit** (pencil next to "Reports limit" in the AI Moderation Logs dialog): change the fields to something non-default, then click the **↻ reset icon** (top-right of the dialog title). Repeat for **Edit Message Limit** (pencil on the "Message Limit" toggle).
+- **Expected:** the ↻ (tooltip "Reset to defaults (3 / 300s)" and "(1 / 5s)" respectively) refills the form fields to the defaults from `src/utils/chat-limit-defaults.ts` — **without saving**. Clicking **Save** then persists the defaults; **Cancel** reverts to the current live values (unchanged behavior).
+- Actual: ___  | Pass/Fail: ___
+
+---
+
 ## Summary sheet
 
 | # | Case | Pass/Fail | Notes |
@@ -538,3 +579,10 @@ Open the **AI Moderation Logs** dialog → the **Racism strictness** radio (defa
 | TC-58 | GLOBAL_BUDGET message | | |
 | TC-59 | ERROR (AI failed) message | | |
 | TC-60 | Silent when OFF / lock lost | | |
+| TC-61 | 🚩 click sends report + scrolls | | |
+| TC-62 | 🚩 hidden on own + admin msgs | | |
+| TC-63 | Repeated button reports NOT dropped (validation ON) | | |
+| TC-64 | 🚩 disabled during message-limit countdown | | |
+| TC-65 | 🔒 Forged isReport can't bypass validation | | |
+| TC-66 | Manually typed @admin still validated | | |
+| TC-67 | Reset-to-defaults buttons (both limit editors) | | |

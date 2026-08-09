@@ -45,6 +45,13 @@ const AIMOD_MAX_REPORTS_PER_USER = 3; // default reports allowed per reporter pe
 const AIMOD_REPORTER_WINDOW_SECONDS = 300; // default window (5 min) → "3 reports / 5 min"
 const AIMOD_GLOBAL_RPM = 12; // cluster Gemini calls/minute (free-tier 3.1-flash-lite = 15)
 const AIMOD_GLOBAL_RPD = 450; // cluster Gemini calls/day (free-tier 3.1-flash-lite = 500)
+// Canonical text the one-tap 🚩 report button sends (must match the frontend's
+// REPORT_MESSAGE_TEXT in chatBox.tsx). Used to recognize a BUTTON report so the
+// room_message handler can skip the spam/duplicate validation for it — safe
+// because the string is fixed + developer-controlled. Any OTHER content
+// (incl. a manually typed "@admin …") is validated normally, so the skip can't
+// be abused to smuggle spam/URLs past validation. See AI_MODERATION_PLAN.md §23.
+const AIMOD_REPORT_TEXT = "@admin check this chat";
 
 module.exports = {
   ADMIN_KEY,
@@ -72,4 +79,5 @@ module.exports = {
   AIMOD_REPORTER_WINDOW_SECONDS,
   AIMOD_GLOBAL_RPM,
   AIMOD_GLOBAL_RPD,
+  AIMOD_REPORT_TEXT,
 };

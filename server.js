@@ -159,9 +159,7 @@ app.get("/", (req, res) => {
       // Re-hydrate AI racism mode, same pattern.
       racismPolicy
         .loadFromRedis()
-        .catch((err) =>
-          console.error("Racism mode re-hydrate failed:", err),
-        );
+        .catch((err) => console.error("Racism mode re-hydrate failed:", err));
       // Re-hydrate AI reporter-limit config, same pattern.
       reporterConfig
         .loadFromRedis()

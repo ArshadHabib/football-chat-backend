@@ -4,7 +4,7 @@
 **Status:** 🚀 **DEPLOYED (owner, 2026-07-19)** — backend + admin live, reviewed clean (§19), including racism strictness modes (§18), homophobia policy (§13.6), the strictness audit column, and the failed-ban-retry fix. **The feature is DORMANT in production: `aimod` flag defaults OFF and racism mode defaults `strict` (= prior behavior), so deploying changed nothing user-facing.** Decisions locked in §11; cluster-safety/persistence audited clean (§14.1).
 > **§21 (2026-07-19) — Admin-editable Reporter Limit: 🚀 DEPLOYED (owner, 2026-07-26).** Reviewed clean (backend + admin, ×3 passes), cluster-sync + persistence verified live (two-process test). Default 3/300 unchanged; verdict "chat cannot break".
 **⚠️ Before enabling `aimod` in production:** ship the `socket.senderName` binding fix (§13.4 #1) and rotate the API key. Then enable on one low-traffic site and watch the logs.
-**Scope:** `football-chat-backend` (primary) + `football-admin` (AI Ban toggle + moderation logs + racism-strictness radio) + optional user-chat one-tap report button (`chatBox.tsx`, v2 — not built)
+**Scope:** `football-chat-backend` (primary) + `football-admin` (AI Ban toggle + moderation logs + racism-strictness radio) + optional user-chat one-tap report button (`chatBox.tsx`, v2 — **built in `football-cx-soccerstreams`, see §23**; other frontends pending, and a known backend dedup bug tracked there)
 
 ---
 
@@ -587,6 +587,8 @@ message hover / long-press actions:            after reporting:
 ```
 Purely sugar — backend contract identical (`reply + "@admin"`).
 
+> **→ Built 2026-07-26 in `football-cx-soccerstreams` (§23).** Inline 🚩 next to the timestamp; one click sends `@admin check this chat` as a reply. Ships with a known backend validation-dedup bug (repeat reports dropped when `FEATURE_VALIDATION` is ON) — backend fix deferred, see §23.
+
 ### 7.4 Admin panel — AI Moderation tab (v1.5, `football-admin`)
 
 ```
@@ -1027,7 +1029,7 @@ Doc-drift fixed: §11 Q5 RPD 800→450; §12.1 bench sample count generalized. R
 - **Live state:** `feature:aimod` = OFF (default), `__aimod_racism_mode__` = `strict` (default), `__aimod_reporter_config__` = `{3,300}` (default). Feature is dormant — no reports are judged and no bans occur until an admin turns AI Ban ON.
 - **Reviews:** base feature, DRY refactor, config move, racism-mode (backend + admin), existing-chat regression (×2), and a final holistic pass (§19) — all passed, no blockers/regressions.
 - **Enable-gates (must clear before flipping `aimod` ON in prod):** (1) `socket.senderName` binding fix (§13.4 #1); (2) rotate the API key (shared in plaintext). Then enable on one low-traffic site, watch `moderationlogs` + `aimod:global_rpd`, tune, widen.
-- **Not built (deferred):** v2 one-tap "🚩 Report to admin" button in the user chat (`chatBox.tsx`) — reporting works today via reply + `@admin`.
+- **Partially built:** v2 one-tap "🚩 Report to admin" button — now shipped in `football-cx-soccerstreams` (§23), pending in the other frontends. Carries a known validation-dedup bug tracked in §23 (backend fix deferred). Reporting also still works via reply + `@admin`.
 
 ---
 
@@ -1054,7 +1056,7 @@ Doc-drift fixed: §11 Q5 RPD 800→450; §12.1 bench sample count generalized. R
 
 **Endpoints** (admin-JWT, `modules/moderation`): `GET /get-reporter-config` → `{config, bounds}`; `POST /set-reporter-config {maxReports?, windowSeconds?}` → clamped `{config}`.
 
-**Admin UI** (`ai-moderation-logs.tsx`). In the logs dialog, next to the strictness radios: a read-only chip `Reports limit: 3 per user / 300s` + a **pencil** icon → **"Edit Reports Limit"** `ConfirmDialog` with two Yup-validated number fields (**"Reports allowed per user"**, **"Per window (seconds)"**) and a caption clarifying the limit is per a single reporter (by IP, username fallback) — a 1:1 mirror of "Edit Message Limit". Submit-then-confirm (not optimistic): posts both fields, adopts the server's clamped response, snackbar + close. Pencil is gated on `loaded` so it can't open before current values arrive; failed load degrades to a disabled pencil + `…` chip (no crash).
+**Admin UI** (`ai-moderation-logs.tsx`). In the logs dialog, next to the strictness radios: a read-only chip `Reports limit: 3 per user / 300s` + a **pencil** icon → **"Edit Reports Limit"** `ConfirmDialog` with two Yup-validated number fields (**"Reports allowed per user"**, **"Per window (seconds)"**) and a caption clarifying the limit is per a single reporter (by IP, username fallback) — a 1:1 mirror of "Edit Message Limit". The dialog title carries a **reset-to-defaults** icon button (top-right, tooltip shows the default `3 / 300s`) that refills the form fields with the defaults from `src/utils/chat-limit-defaults.ts` (`REPORTER_LIMIT_DEFAULTS`, mirroring the backend seed); it only fills the fields — the admin still clicks Save to persist. The same reset button was added to the "Edit Message Limit" dialog (`MESSAGE_LIMIT_DEFAULTS = 1 / 5s`). Submit-then-confirm (not optimistic): posts both fields, adopts the server's clamped response, snackbar + close. Pencil is gated on `loaded` so it can't open before current values arrive; failed load degrades to a disabled pencil + `…` chip (no crash).
 
 **Performance / blast radius.** Zero hot-path cost. The value is read via `getConfig()` — a pure in-memory object read **measured at ~14 ns/call** (5M-call microbench) — **once per report, not per message**. Reports run ~4–5 orders of magnitude rarer than messages (§15) and each already costs ~6 Redis RTTs + a 0.5–2 s Gemini call, so the config read is a rounding-error fraction (~10⁻⁸) of a report. No new **per-message** work and no new **per-report** Redis op (the reporter-cooldown INCR+EXPIRE pipeline already existed; only the `windowSeconds` value feeding `EXPIRE` changed from a constant to a variable — same op count). Boot adds one Redis `GET` + one subscriber connection (a `pubClient.duplicate()`), one-time. Memory: one ~2-number object per worker. A config change costs 1 `SET` + 1 `PUBLISH` on the admin action only (never on user traffic), fanned to workers in **~125 ms** (measured, two-process test). Review verdict: **"CHAT CANNOT BREAK FROM THIS CHANGE"** — moderation is flag-gated, `try/catch`-wrapped, and fire-and-forget; the config read can't throw; behavior is identical to the old constants when left at 3/300.
 
@@ -1116,3 +1118,35 @@ Reuses `emitAdminMessage` (broadcast + persist), so no new event/sender/transpor
 **Verification:** `node --check` + module-graph load clean; all 12 builders rendered and confirmed (incl. window-humanize edge cases 60→"1 minute", 90→"90 seconds", 300→"5 minutes", empty reason/reporter fragments dropped). Review agent run twice (post-implementation, then post-`utils.js` refactor + icon change) → both **GO, no blockers/majors/minors**: no new throw path on the report pipeline, silent cases stay silent, no double-post, ban still bans before announcing, reply-quote rule correct, `reporterName` resolves in both scopes.
 
 **Status:** 🚀 **DEPLOYED (owner, 2026-07-26)** — implemented, reviewed clean (×2), owner-tested in a live room, docs synced. Test cases TC-49…TC-60 below. Behavior only visible when `aimod` is ON.
+
+---
+
+## 23. One-tap 🚩 Report button — frontend build, rate-limit + validation integration (2026-07-26 → 2026-08-09)
+
+**Status:** ✅ **BUILT in `football-cx-soccerstreams`** (`src/components/chatBox/chatBox.tsx`) · ⏳ not yet ported to the other frontends · ✅ **validation-dedup bug FIXED (2026-08-09)** · ✅ rate-limit integrated on both sides. Reviewed clean.
+
+**What shipped (frontend `chatBox.tsx`).** A small filled flag (🚩) icon sits **inline next to each message's timestamp** (`name … 05:01 PM 🚩`), styled to match the existing reply icon (paper background, border, tooltip). It's hidden on the user's own messages and on Admin messages (both are no-ops server-side: `SKIPPED_SELF_REPORT` / `SKIPPED_TARGET_ADMIN`) and on not-yet-persisted optimistic messages (no `_id` to report). Hovering it holds chat auto-scroll (the same `isPopoverOpenRef` lock the reply icon uses); clicking it sends the fixed text **`@admin check this chat`** as a reply to that message and scrolls to the bottom like a normal send. This is the §7.3 sketch, now real.
+
+**Message rate-limit — report obeys it on both sides (2026-08-09).** A report is just another message send, so the dynamic, admin-controlled message limit (`utils/rate_limit_config.js`) applies to it end-to-end with **no** report-specific work:
+- **Backend (already):** the report `room_message` passes through the same per-IP rate-limit gate (`socketHandler.js` [:341-384]). Over the cap → the message is dropped at `if (count > rl.max) return` **before** the moderation hook, so an over-limit report doesn't even reach Gemini; at the cap → it emits `server_rate_limit { retryAfter }`, which the client mirrors into `rateLimitExceeded`/`remainingSeconds` — the same state the composer countdown uses.
+- **Frontend (already):** `onReportClick → handleSendMessage` runs `checkRateLimit()` like any send, so hitting the limit via the 🚩 shows the **same** composer countdown ("Send next message in: Ns").
+- **Frontend (added 2026-08-09):** the 🚩 control is now **disabled while `rateLimitExceeded`** (mirrors the composer's Send button) — greyed to 0.4 opacity, `cursor:default`, no hover, click is a no-op. Its tooltip shows a **live countdown** "Limit reached! Resets in {n}s". Perf detail: the boolean `rateLimitExceeded` is a `MessageItem` prop (rare toggle), but the ticking `remainingSeconds` is delivered via a React **context** (`RateLimitRemainingContext`) consumed by a tiny title component that MUI mounts only when a tooltip is **open** — so the per-second tick re-renders **only the one open tooltip**, never the memoized message rows. (Context flows through MUI's portalled popper.) `tsc --noEmit` clean.
+
+**Validation-dedup — the button report was being dropped, now FIXED (2026-08-09).**
+
+The report text is a FIXED string (`@admin check this chat`), so with `FEATURE_VALIDATION` ON the per-sender fuzzy-duplicate heuristic (`utils/messageValidation.js` → `checkFuzzyDuplicate`, jaccard > 0.8 against `socket.recentMessages`) matched the **2nd+** report against the first and the `room_message` handler dropped it at `if (!verdict.ok) return;`. The AI itself was never affected (the moderation hook runs *before* validation), but the reporter's own `@admin check this chat` line was dropped from broadcast/persist on repeats. It only bit when an admin turned `FEATURE_VALIDATION` ON (default OFF).
+
+**The fix — split button vs manual reports; skip validation only for the button's fixed text.** A `@admin` report has two flavors that must be treated differently:
+- **Button report** — fixed, developer-controlled text → **safe**, so skip the spam/duplicate validation (nothing to validate; the only effect was the false-drop).
+- **Manually typed `@admin …`** — user free text → could contain spam/URLs/profanity → **must stay fully validated** (no bypass).
+
+Implementation (both sides):
+- **Shared constant** `AIMOD_REPORT_TEXT = "@admin check this chat"` in `utils/const_config.js`, kept byte-for-byte in sync with the frontend's `REPORT_MESSAGE_TEXT`.
+- **Frontend** (`chatBox.tsx`): the button's `room_message` emit now carries `isReport: true`. (It already skipped the client's own non-essential validation for `isReport` and kept the fixed text out of its recent-messages buffer; the composer's manual sends pass `isReport=false` → full client validation.)
+- **Backend** (`socket/socketHandler.js`): compute `isSafeReport = data.isReport === true && replyTo?.messageId is a string && messageContent.trim().toLowerCase() === AIMOD_REPORT_TEXT`. When `validationOn && isSafeReport` → run `cleanString` (profanity, no-op here) but **skip** `validateMessage` and the `recentMessages` push. Everything else takes the normal validation path.
+- **No bypass loophole:** the exact-text + real-reply guard means a client that forges `isReport:true` on *any other* content — including a manually typed `@admin buy at spam.com` — fails the guard and gets full validation (URL block, profanity, spam heuristics, duplicate). Rate-limiting is unchanged and still applies to reports. Reviewed clean (GO, no findings).
+- **Residual (accepted):** a direct-socket client can repeat the exact canonical line without the duplicate check firing — but it's the fixed harmless report string, bounded by the message rate limit + the per-reporter cooldown. No spam/URL content can ride it.
+
+**Performance (validation exemption).** The only new per-message backend work is the `isSafeReport` computation in the `room_message` handler, and it's **effectively free on the hot path**: `data.isReport === true && …` short-circuits on the very first term for every normal message (`isReport` is absent → one property read + comparison, then stop). The `trim()`/`toLowerCase()`/string-compare only runs for an actual button report (rare — bounded by the rate limit + per-reporter cooldown), and there it *replaces* the heavier `validateMessage` (leetspeak normalize + ~7 regex/heuristic checks + jaccard over the recent-messages buffer) with a single equality check plus one `cleanString` — i.e. **less** work than before for a report, and zero measurable change for the 99.9% non-report path. No new Redis ops, no new allocations on the normal path, no new dependency.
+
+**Remaining:** port the 🚩 button (+ the rate-limit disable + `isReport` emit) to the other 5 frontends — self-contained `chatBox.tsx` changes; they also want the scroll-shift fix that shipped alongside it in `football-cx-soccerstreams`.

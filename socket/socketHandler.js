@@ -25,9 +25,11 @@ const { findUserByName } = require("@project/modules/user/service");
 const {
   BANNED_USERS_KEY,
   REDIS_ROOMS_SET,
+  AIMOD_REPORT_TEXT,
 } = require("@project/utils/const_config");
 const {
   validateMessage,
+  cleanString,
   sanitizeReplyTo,
 } = require("@project/utils/messageValidation");
 const {
@@ -433,9 +435,26 @@ function setupSocketHandlers(io) {
       // Default OFF (see utils/feature_flags.js DEFAULTS). Drops are
       // silent — no error emit, gives bots no feedback to tune against.
       // Strike counter / auto-ban deferred to Phase 2.3.
+      // One-tap report exemption: a BUTTON report (client sends isReport:true)
+      // whose text is EXACTLY the canonical report string is skipped from the
+      // spam/duplicate heuristics — the string is fixed + developer-controlled,
+      // so the only thing validation could do is false-drop the 2nd identical
+      // report (the fuzzy-duplicate check). We STILL clean it (a no-op here) and
+      // deliberately do NOT push it into recentMessages (so it can't poison the
+      // buffer the user's real messages are checked against). The content match
+      // is the guard: a client that lies isReport:true on ANY other text —
+      // including a manually typed "@admin …" — gets full validation, so this
+      // can't be abused to smuggle spam/URLs. See AI_MODERATION_PLAN.md §23.
+      const isSafeReport =
+        data.isReport === true &&
+        !!replyTo &&
+        typeof replyTo.messageId === "string" &&
+        typeof messageContent === "string" &&
+        messageContent.trim().toLowerCase() === AIMOD_REPORT_TEXT.toLowerCase();
+
       let outputContent;
       const validationOn = getFlag(FEATURE_VALIDATION);
-      if (validationOn) {
+      if (validationOn && !isSafeReport) {
         socket.recentMessages = socket.recentMessages || [];
         const verdict = validateMessage(messageContent, socket.recentMessages);
         if (!verdict.ok) return;
@@ -444,6 +463,10 @@ function setupSocketHandlers(io) {
           verdict.normalized,
         ];
         outputContent = verdict.cleaned;
+      } else if (validationOn && isSafeReport) {
+        // Safe report + validation on: clean profanity but skip the drop and
+        // the recentMessages push.
+        outputContent = cleanString(messageContent);
       } else {
         outputContent = messageContent;
       }

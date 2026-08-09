@@ -476,7 +476,7 @@ Open the **AI Moderation Logs** dialog → the **Racism strictness** radio (defa
 
 ## 18. One-tap 🚩 Report button (frontend) — see AI_MODERATION_PLAN.md §23
 
-> Frontend feature, built in `football-cx-soccerstreams` only. Test on that site. The button sends the fixed text `@admin check this chat` as a reply, so all backend behavior (§1–§17) applies unchanged — these cases only cover the button itself and the known validation-dedup bug.
+> Frontend feature, deployed on **all 7 frontends** (2026-08-09). Any site works for testing. The button sends the fixed text `@admin check this chat` as a reply, so all backend behavior (§1–§17) applies unchanged — these cases cover the button itself, its rate-limit disable, and the (now-fixed) validation exemption.
 
 ### TC-61 — Flag click sends the report + scrolls to bottom
 - **Steps:** In Browser A, hover another user's message, click the 🚩 next to the timestamp. (Hover first: confirm the chat does NOT auto-scroll while the cursor is on the flag.)

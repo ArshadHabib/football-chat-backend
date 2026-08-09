@@ -4,7 +4,7 @@
 **Status:** 🚀 **DEPLOYED (owner, 2026-07-19)** — backend + admin live, reviewed clean (§19), including racism strictness modes (§18), homophobia policy (§13.6), the strictness audit column, and the failed-ban-retry fix. **The feature is DORMANT in production: `aimod` flag defaults OFF and racism mode defaults `strict` (= prior behavior), so deploying changed nothing user-facing.** Decisions locked in §11; cluster-safety/persistence audited clean (§14.1).
 > **§21 (2026-07-19) — Admin-editable Reporter Limit: 🚀 DEPLOYED (owner, 2026-07-26).** Reviewed clean (backend + admin, ×3 passes), cluster-sync + persistence verified live (two-process test). Default 3/300 unchanged; verdict "chat cannot break".
 **⚠️ Before enabling `aimod` in production:** ship the `socket.senderName` binding fix (§13.4 #1) and rotate the API key. Then enable on one low-traffic site and watch the logs.
-**Scope:** `football-chat-backend` (primary) + `football-admin` (AI Ban toggle + moderation logs + racism-strictness radio) + optional user-chat one-tap report button (`chatBox.tsx`, v2 — **built in `football-cx-soccerstreams`, see §23**; other frontends pending, and a known backend dedup bug tracked there)
+**Scope:** `football-chat-backend` (primary) + `football-admin` (AI Ban toggle + moderation logs + racism-strictness radio + reporter-limit editor) + user-chat one-tap report button (`chatBox.tsx`, §23 — **deployed on all 7 frontends 2026-08-09**, with rate-limit disable + live countdown tooltip; the validation-dedup issue is fixed)
 
 ---
 
@@ -1026,10 +1026,16 @@ Doc-drift fixed: §11 Q5 RPD 800→450; §12.1 bench sample count generalized. R
 - **Deploy (2026-07-19, owner):** chat backend + admin, shipping everything since: DRY refactor (§16), real-time admin ban/unban (§14.3), homophobia policy (§13.6), config moved to `const_config.js`, cluster-synced racism strictness modes + audit column + richer tooltip (§18), and the failed-ban-retry fix (§19). No new npm deps; only `GEMINI_API_KEY` in the server `.env`.
 - **Deploy (2026-07-26, owner):** admin-editable reporter limit (§21) — chat backend + admin. New Redis key `__aimod_reporter_config__` (default 3/300, dormant behavior identical to the prior constants). Reviewed clean ×3; cluster-sync + persistence verified live. No new npm deps.
 - **Deploy (2026-07-26, owner):** report-outcome announcements (§22) — chat backend only. Every report outcome now posts an Admin room message (was ban-only), via the reused `emitAdminMessage`; presentation split into `modules/moderation/utils.js`. Reviewed clean ×2, owner-tested live. No new Redis keys, no schema change, no new npm deps. Only visible when `aimod` is ON.
+- **Deploy (2026-08-09, owner):** full rollout across chat backend + admin + all 7 user frontends —
+  - one-tap 🚩 report button (§23) on **all 7 frontends** (verified: `isReport` emit + canonical text present on each);
+  - report **rate-limit** integration: over-limit reports dropped before the AI (backend, already), and the 🚩 **disabled during the countdown with a live "Resets in Ns" tooltip** (frontend);
+  - report **validation exemption** (§23): button reports (fixed text + `isReport` + real reply) skip the spam/duplicate validation via the new `AIMOD_REPORT_TEXT` guard; manual `@admin` and any other content stay fully validated — no bypass;
+  - admin **reset-to-defaults** buttons on the Reports-limit and Message-limit editors (`src/utils/chat-limit-defaults.ts`).
+  Reviewed clean; no new Redis keys, no schema change, no new npm deps.
 - **Live state:** `feature:aimod` = OFF (default), `__aimod_racism_mode__` = `strict` (default), `__aimod_reporter_config__` = `{3,300}` (default). Feature is dormant — no reports are judged and no bans occur until an admin turns AI Ban ON.
 - **Reviews:** base feature, DRY refactor, config move, racism-mode (backend + admin), existing-chat regression (×2), and a final holistic pass (§19) — all passed, no blockers/regressions.
 - **Enable-gates (must clear before flipping `aimod` ON in prod):** (1) `socket.senderName` binding fix (§13.4 #1); (2) rotate the API key (shared in plaintext). Then enable on one low-traffic site, watch `moderationlogs` + `aimod:global_rpd`, tune, widen.
-- **Partially built:** v2 one-tap "🚩 Report to admin" button — now shipped in `football-cx-soccerstreams` (§23), pending in the other frontends. Carries a known validation-dedup bug tracked in §23 (backend fix deferred). Reporting also still works via reply + `@admin`.
+- **Shipped (2026-08-09):** v2 one-tap "🚩 Report to admin" button on **all 7 frontends** (§23), with the rate-limit disable + live countdown tooltip; the validation-dedup issue is fixed (button vs manual split, §23). Reporting also still works via reply + `@admin`.
 
 ---
 
@@ -1123,7 +1129,7 @@ Reuses `emitAdminMessage` (broadcast + persist), so no new event/sender/transpor
 
 ## 23. One-tap 🚩 Report button — frontend build, rate-limit + validation integration (2026-07-26 → 2026-08-09)
 
-**Status:** ✅ **BUILT in `football-cx-soccerstreams`** (`src/components/chatBox/chatBox.tsx`) · ⏳ not yet ported to the other frontends · ✅ **validation-dedup bug FIXED (2026-08-09)** · ✅ rate-limit integrated on both sides. Reviewed clean.
+**Status:** 🚀 **DEPLOYED on all 7 frontends (2026-08-09)** (`src/components/chatBox/chatBox.tsx`) · ✅ validation-dedup bug FIXED · ✅ rate-limit integrated on both sides (disable + live countdown tooltip). Reviewed clean; all 7 frontend copies verified to carry the `isReport` emit + canonical report text.
 
 **What shipped (frontend `chatBox.tsx`).** A small filled flag (🚩) icon sits **inline next to each message's timestamp** (`name … 05:01 PM 🚩`), styled to match the existing reply icon (paper background, border, tooltip). It's hidden on the user's own messages and on Admin messages (both are no-ops server-side: `SKIPPED_SELF_REPORT` / `SKIPPED_TARGET_ADMIN`) and on not-yet-persisted optimistic messages (no `_id` to report). Hovering it holds chat auto-scroll (the same `isPopoverOpenRef` lock the reply icon uses); clicking it sends the fixed text **`@admin check this chat`** as a reply to that message and scrolls to the bottom like a normal send. This is the §7.3 sketch, now real.
 
@@ -1149,4 +1155,4 @@ Implementation (both sides):
 
 **Performance (validation exemption).** The only new per-message backend work is the `isSafeReport` computation in the `room_message` handler, and it's **effectively free on the hot path**: `data.isReport === true && …` short-circuits on the very first term for every normal message (`isReport` is absent → one property read + comparison, then stop). The `trim()`/`toLowerCase()`/string-compare only runs for an actual button report (rare — bounded by the rate limit + per-reporter cooldown), and there it *replaces* the heavier `validateMessage` (leetspeak normalize + ~7 regex/heuristic checks + jaccard over the recent-messages buffer) with a single equality check plus one `cleanString` — i.e. **less** work than before for a report, and zero measurable change for the 99.9% non-report path. No new Redis ops, no new allocations on the normal path, no new dependency.
 
-**Remaining:** port the 🚩 button (+ the rate-limit disable + `isReport` emit) to the other 5 frontends — self-contained `chatBox.tsx` changes; they also want the scroll-shift fix that shipped alongside it in `football-cx-soccerstreams`.
+**Done (2026-08-09):** the 🚩 button (+ rate-limit disable + live tooltip + `isReport` emit) is now on **all 7 frontends** — `football-buffstreams`, `football-co-com-score808`, `football-cx-soccerstreams`, `football-net-halastreams`, `football-org-streampk`, `football-pk-dingdongsports`, `football-st-halastream`. All verified to carry the `isReport` emit + canonical report text (so the §23 dedup fix holds on every site). Deployed.

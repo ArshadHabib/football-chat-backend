@@ -265,6 +265,21 @@ async function joinRoom(roomId, socket, senderName, websiteName) {
   return {
     success: true,
     roomId,
+    // Explicit visibility flag. The client cannot infer it from the presence
+    // or absence of usersCount, and its own server-rendered showViews prop is
+    // read once at mount and never re-synced. A socket that is NOT in the room
+    // when the admin toggles — a dropped mobile connection, a backgrounded tab
+    // — misses the update_views_visibility broadcast entirely. Without this
+    // field it reconnects still holding the stale setting and renders
+    // "0 viewers": join_result withholds usersCount, and scheduleUserCountUpdate
+    // stops broadcasting room_user_count_update once views are off, so the zero
+    // never corrects itself short of a full page reload. Sending the flag makes
+    // every join and reconnect self-healing.
+    // Costs nothing: showViewsValue is already in hand from the hGet in the
+    // Step 1 Promise.all above — no extra Redis command or round trip. The count
+    // itself is still withheld when views are off (SHOW_VIEWS_AND_BROADCAST.md
+    // Fix 2), so this carries the setting, never the number.
+    showViews,
     ...(showViews && { usersCount: count }),
   };
 }

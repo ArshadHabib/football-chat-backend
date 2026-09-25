@@ -26,11 +26,26 @@ const { pubClient, featuresSubClient } = require("@project/config/redis");
 const FEATURE_REGISTRATION = "registration";
 const FEATURE_VALIDATION = "validation";
 // AI auto-moderation master switch ("AI Ban") — gates the whole @admin
-// reply-report → Gemini → auto-ban pipeline (AI_MODERATION_PLAN.md).
+// reply-report → Gemini → auto-ban pipeline (AI_MODERATION_PLAN.md). Also
+// mirrored to chat clients (join_result.aimod + aimod_changed) so the 🚩
+// report button is only offered when the pipeline behind it is actually live.
 const FEATURE_AIMOD = "aimod";
+// Viewer-count master switch. ON = each room's own __room_show_views__ setting
+// decides, exactly as before. OFF = no room shows a count under any condition,
+// overriding every per-room setting. Gates both the join_result payload and the
+// room_user_count_update broadcasts (see socket/roomManager.js).
+const FEATURE_USERS_COUNT = "usersCount";
 
 const KEY_PREFIX = "feature:";
 const CHANNEL = "__feature_change__";
+// Monotonic counter stamping each toggle with an id. Listeners whose reaction
+// has a CLUSTER-WIDE side effect (the viewer-count resync) use it to elect a
+// single executor per toggle: every dispatch of the same toggle carries the
+// same seq, and a different toggle — including an immediate flip back — always
+// gets a different one. A time-window lock cannot do both jobs at once (too
+// short and the cluster double-broadcasts, too long and rapid flipping
+// silently skips a resync).
+const SEQ_KEY = "__feature_change_seq__";
 
 // Defaults applied when Redis has no value for a flag (first boot of a fresh
 // cluster). Once written to Redis these are never consulted again.
@@ -38,6 +53,8 @@ const DEFAULTS = Object.freeze({
   [FEATURE_REGISTRATION]: true,
   [FEATURE_VALIDATION]: false,
   [FEATURE_AIMOD]: false,
+  // true preserves the pre-flag behaviour: per-room showViews stays in charge.
+  [FEATURE_USERS_COUNT]: true,
 });
 
 // Hot in-memory cache. Populated by loadFromRedis() at startup and updated
@@ -45,9 +62,11 @@ const DEFAULTS = Object.freeze({
 const flags = { ...DEFAULTS };
 
 // Listeners notified on every flag change, regardless of which instance
-// triggered the change. The socket layer registers a listener here to
-// broadcast validation flips to its connected sockets via io.local.emit.
-// Kept module-local so feature_flags.js doesn't import socket.io directly.
+// triggered the change. The socket layer registers one listener here and
+// reacts per flag: `validation` and `aimod` fan out to this instance's own
+// sockets via io.local.emit, while `usersCount` triggers a cluster-wide
+// room re-broadcast behind a single-executor election. Kept module-local so
+// feature_flags.js doesn't import socket.io directly.
 const listeners = new Set();
 
 function onFlagChange(handler) {
@@ -55,10 +74,10 @@ function onFlagChange(handler) {
   return () => listeners.delete(handler);
 }
 
-function notifyListeners(name, value) {
+function notifyListeners(name, value, seq) {
   listeners.forEach((fn) => {
     try {
-      fn(name, value);
+      fn(name, value, seq);
     } catch (err) {
       console.error("Feature flag listener error:", err);
     }
@@ -113,9 +132,23 @@ async function setFlag(name, value) {
   }
   const normalized = !!value;
   applyFlag(name, normalized);
-  notifyListeners(name, normalized);
+  // Stamp the toggle so the synchronous notify below and the pub/sub echo that
+  // follows it carry the SAME id and are deduped downstream. Applied AFTER the
+  // cache update and tolerant of failure: the token is only a dedupe hint, and
+  // letting a Redis hiccup here abort the whole flag change would be a far
+  // worse outcome than falling back to the coarser direction-keyed lock that
+  // an absent seq already selects.
+  const seq = await pubClient.incr(SEQ_KEY).catch(() => undefined);
+  // Notified synchronously as well as via the publish. The duplicate is
+  // deliberate and harmless (client-side handlers are idempotent setters, and
+  // the resync dedupes on seq): it keeps this instance's own sockets correct
+  // even if the publish below fails outright.
+  notifyListeners(name, normalized, seq);
   await pubClient.set(`${KEY_PREFIX}${name}`, normalized ? "true" : "false");
-  await pubClient.publish(CHANNEL, JSON.stringify({ name, value: normalized }));
+  await pubClient.publish(
+    CHANNEL,
+    JSON.stringify({ name, value: normalized, seq }),
+  );
 }
 
 // Wire up the cross-instance subscription. Idempotent — safe to call once at
@@ -124,9 +157,9 @@ async function setFlag(name, value) {
 async function subscribeToChanges() {
   await featuresSubClient.subscribe(CHANNEL, (message) => {
     try {
-      const { name, value } = JSON.parse(message);
+      const { name, value, seq } = JSON.parse(message);
       applyFlag(name, value);
-      notifyListeners(name, !!value);
+      notifyListeners(name, !!value, seq);
     } catch (err) {
       console.error("Feature flag pub/sub message error:", err, message);
     }
@@ -137,6 +170,7 @@ module.exports = {
   FEATURE_REGISTRATION,
   FEATURE_VALIDATION,
   FEATURE_AIMOD,
+  FEATURE_USERS_COUNT,
   loadFromRedis,
   subscribeToChanges,
   getFlag,

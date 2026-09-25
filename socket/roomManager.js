@@ -8,6 +8,10 @@ const {
 } = require("@project/utils/perfomance_config");
 const { pubClient: redis } = require("@project/config/redis");
 const {
+  getFlag,
+  FEATURE_USERS_COUNT,
+} = require("@project/utils/feature_flags");
+const {
   REDIS_ROOM_MSG_COUNTS,
   REDIS_ROOM_LAST_ACTIVITY,
   REDIS_ROOM_MSG_COUNTS_DRAIN,
@@ -29,6 +33,14 @@ const REDIS_ROOM_COUNTS = "__room_counts__";
 const REDIS_SOCKET_WEBSITE = "__socket_website__";
 const REDIS_ROOM_SHOW_VIEWS = "__room_show_views__";
 const REDIS_ROOM_LAST_BROADCAST = "__room_last_broadcast__";
+// Cluster-wide single-shot lock for the viewer-count master-switch resync.
+const USERS_COUNT_RESYNC_LOCK = "__users_count_resync__";
+// Pause before the resync broadcast, letting the flag change reach every
+// instance first. See broadcastUsersCountMaster for why this is required.
+// Sized to absorb event-loop scheduling on an instance mid-fanout, including a
+// GC pause or a burst of large-room writes — it is fire-and-forget, so a longer
+// wait costs nothing user-visible and buys a lot of tail coverage.
+const RESYNC_PROPAGATION_DELAY_MS = 500;
 
 // Cache
 let cachedRoomData = null;
@@ -261,25 +273,23 @@ async function joinRoom(roomId, socket, senderName, websiteName) {
 
   scheduleAdminRoomUpdate();
 
-  const showViews = showViewsValue !== "false";
+  // EFFECTIVE visibility: this room's own setting AND the cluster-wide
+  // viewer-count master switch. Handing the client the already-combined answer
+  // is what lets join_result be self-sufficient: it learns the final visibility
+  // in the same payload that releases its loading state, so nothing has to
+  // correct it afterwards. update_views_visibility stays what its name says —
+  // a CHANGE notification for rooms a client is already in.
+  const showViews =
+    showViewsValue !== "false" && !!getFlag(FEATURE_USERS_COUNT);
   return {
     success: true,
     roomId,
-    // Explicit visibility flag. The client cannot infer it from the presence
-    // or absence of usersCount, and its own server-rendered showViews prop is
-    // read once at mount and never re-synced. A socket that is NOT in the room
-    // when the admin toggles — a dropped mobile connection, a backgrounded tab
-    // — misses the update_views_visibility broadcast entirely. Without this
-    // field it reconnects still holding the stale setting and renders
-    // "0 viewers": join_result withholds usersCount, and scheduleUserCountUpdate
-    // stops broadcasting room_user_count_update once views are off, so the zero
-    // never corrects itself short of a full page reload. Sending the flag makes
-    // every join and reconnect self-healing.
-    // Costs nothing: showViewsValue is already in hand from the hGet in the
-    // Step 1 Promise.all above — no extra Redis command or round trip. The count
-    // itself is still withheld when views are off (SHOW_VIEWS_AND_BROADCAST.md
-    // Fix 2), so this carries the setting, never the number.
     showViews,
+    // Costs nothing: showViewsValue is already in hand from the hGet in the
+    // Step 1 Promise.all above, and the flag is an in-memory read — no extra
+    // Redis command or round trip. The count is withheld whenever the counter
+    // is hidden (SHOW_VIEWS_AND_BROADCAST.md Fix 2), so this carries the
+    // setting, never the number.
     ...(showViews && { usersCount: count }),
   };
 }
@@ -357,15 +367,33 @@ async function roomExists(roomId) {
 }
 
 async function updateViewsVisibility(data) {
-  await redis.hSet(
-    REDIS_ROOM_SHOW_VIEWS,
-    data?.roomId,
-    data?.data?.showViews ? "true" : "false",
-  );
+  const roomId = data?.roomId;
+  const showViews = !!data?.data?.showViews;
+
+  await redis.hSet(REDIS_ROOM_SHOW_VIEWS, roomId, showViews ? "true" : "false");
+
   const io = getIO();
-  if (io) {
-    io.to(data?.roomId).emit("update_views_visibility", data?.data);
+  if (!io) return;
+
+  // EFFECTIVE visibility: this room's setting AND the viewer-count master
+  // switch. update_views_visibility is the one channel every client already
+  // obeys, so expressing the master switch through it means the switch applies
+  // to whatever build is deployed, with no client change at all.
+  const effective = showViews && !!getFlag(FEATURE_USERS_COUNT);
+
+  if (effective) {
+    // Count BEFORE visibility. The client may be holding no count at all (none
+    // is sent while either gate is shut), and scheduleUserCountUpdate's debounce
+    // would leave a 0 sitting under a freshly revealed counter for a full
+    // second. Reading it here costs one hGet on an admin-only path.
+    const count = parseInt(await redis.hGet(REDIS_ROOM_COUNTS, roomId)) || 0;
+    io.to(roomId).emit("room_user_count_update", { roomId, usersCount: count });
+    // Re-seed the dedupe hash to match what was just sent, so the next
+    // scheduleUserCountUpdate doesn't repeat it.
+    await redis.hSet(REDIS_ROOM_LAST_BROADCAST, roomId, count.toString());
   }
+
+  io.to(roomId).emit("update_views_visibility", { roomId, showViews: effective });
 }
 
 // Admin management
@@ -478,6 +506,13 @@ function emitToAdmin(socketId, eventName, data) {
 }
 
 async function scheduleUserCountUpdate(roomId) {
+  // Master switch off → no room renders a count, so the whole debounce +
+  // broadcast path is dead weight. Checked FIRST, before the Redis NX set, so
+  // a disabled counter costs zero Redis ops and zero broadcasts per join and
+  // leave — the in-memory flag read is free. __room_last_broadcast__ is left
+  // untouched while off; broadcastUsersCountMaster() re-seeds it on flip-on.
+  if (!getFlag(FEATURE_USERS_COUNT)) return;
+
   const debounceMs =
     getCurrentPerformanceMode().settings.userCountUpdateDebounce;
   const debounceKey = `__user_count_debounce__:${roomId}`;
@@ -499,6 +534,10 @@ async function scheduleUserCountUpdate(roomId) {
     checkPipeline.hGet(REDIS_ROOM_LAST_BROADCAST, roomId);  // [3]
     const [exists, showViewsValue, countRaw, lastBroadcastRaw] = await checkPipeline.exec();
 
+    // Re-check at fire time: this timer may have been armed just before the
+    // master switch was turned off, and the schedule-time guard above cannot
+    // see a flip that happened during the debounce window.
+    if (!getFlag(FEATURE_USERS_COUNT)) return;
     if (!exists) {
       rooms.delete(roomId);
       return;
@@ -511,6 +550,104 @@ async function scheduleUserCountUpdate(roomId) {
     io.to(roomId).emit("room_user_count_update", { roomId, usersCount: count });
     await redis.hSet(REDIS_ROOM_LAST_BROADCAST, roomId, count.toString());
   }, debounceMs);
+}
+
+// Re-sync every room after the viewer-count master switch is toggled, in BOTH
+// directions. This is what actually makes the switch take effect on connected
+// viewers: it drives the same update_views_visibility event the per-room Views
+// checkbox uses, which every deployed client already honours.
+//
+// Per room the count is emitted BEFORE the visibility, so a client never sees
+// the counter revealed while still holding the number from before the switch
+// was turned off. On the OFF direction no count is sent — the counter is being
+// hidden, and the server stops feeding the room until it comes back.
+//
+// io.to(roomId) fans out to every PM2 instance through the Redis adapter and
+// onFlagChange fires on ALL instances (twice on the originating one), so an
+// unguarded call would emit up to N+1 copies per room. The lock is keyed on the
+// toggle's own seq rather than on a time window: every dispatch of the SAME
+// toggle competes for one key, while a different toggle — including an
+// immediate flip back — always gets its own, so rapid flipping can never skip a
+// resync. "on" is the fallback key for a publish from an instance still running
+// a build without seq (rolling deploy).
+async function broadcastUsersCountMaster(enabled, seq) {
+  const io = getIO();
+  if (!io) return;
+
+  // Pause BEFORE electing, not after. setFlag notifies its own instance
+  // synchronously, ahead of the publish that reaches the others, so the worker
+  // that served the admin request would otherwise always win the election and
+  // then hold the key for the whole pause — if it died or was PM2-reloaded in
+  // that window, every other instance had already returned and no resync would
+  // ever run. Pausing first means a dead worker simply never takes the key and
+  // another instance does. The pause is uniform, so the election race is
+  // unchanged. It also lets the flag reach every instance before any broadcast
+  // goes out, so no client is answered from a stale join_room in between.
+  await new Promise((resolve) =>
+    setTimeout(resolve, RESYNC_PROPAGATION_DELAY_MS),
+  );
+
+  // One executor per toggle, cluster-wide: onFlagChange fires on every instance
+  // (twice on the originator) and io.to(roomId) fans out through the Redis
+  // adapter, so an unguarded call would emit N+1 copies per room. Keyed on the
+  // toggle's own seq, so every dispatch of the SAME toggle competes for one key
+  // while a different toggle — including an immediate flip back — always gets
+  // its own and can never be skipped. A seq-less publish (an instance still
+  // running a build without it) falls back to an "on"/"off" direction key on a
+  // short TTL; that fallback CAN swallow a second same-direction toggle inside
+  // its window, which is why it exists only for the rolling-deploy case.
+  const lockKey = `${USERS_COUNT_RESYNC_LOCK}:${seq ?? (enabled ? "on" : "off")}`;
+  const won = await redis.set(lockKey, "1", {
+    NX: true,
+    PX: seq === undefined ? 2000 : 30000,
+  });
+  if (!won) return;
+
+  try {
+    // Re-read the flag rather than trusting the `enabled` argument, which was
+    // captured before the pause. If a second toggle landed during it, the room
+    // state read below is the NEW state, and pairing it with the OLD value
+    // would broadcast a mismatched combination. Reading it here makes a late
+    // resync converge on the truth instead; `enabled` survives only as part of
+    // the lock key, which must stay tied to the toggle that scheduled this.
+    const on = !!getFlag(FEATURE_USERS_COUNT);
+
+    // Reads are bounded by room count (tens), not socket count, and this runs
+    // once per admin toggle — never on the join or message path.
+    const [roomIds, showViewsMap, counts] = await Promise.all([
+      redis.sMembers(REDIS_ROOMS_SET),
+      redis.hGetAll(REDIS_ROOM_SHOW_VIEWS),
+      on ? redis.hGetAll(REDIS_ROOM_COUNTS) : Promise.resolve({}),
+    ]);
+
+    const lastBroadcast = {};
+    for (const roomId of roomIds) {
+      // A room that opted out individually stays hidden when the master switch
+      // comes back on — the master gate can only ever subtract visibility.
+      const effective = on && showViewsMap?.[roomId] !== "false";
+      if (effective) {
+        // Count first, so the counter is never revealed showing a stale number.
+        const count = parseInt(counts?.[roomId]) || 0;
+        io.to(roomId).emit("room_user_count_update", {
+          roomId,
+          usersCount: count,
+        });
+        lastBroadcast[roomId] = count.toString();
+      }
+      io.to(roomId).emit("update_views_visibility", { roomId, showViews: effective });
+    }
+
+    // Re-seed the dedupe hash so the next scheduleUserCountUpdate compares
+    // against what clients actually just received.
+    if (Object.keys(lastBroadcast).length > 0) {
+      await redis.hSet(REDIS_ROOM_LAST_BROADCAST, lastBroadcast);
+    }
+  } catch (err) {
+    // Release the key so this toggle is not permanently marked as handled —
+    // a half-finished resync must not be the cluster's final word on it.
+    await redis.del(lockKey).catch(() => {});
+    throw err;
+  }
 }
 
 async function broadcastBanToAllRooms(userNames) {
@@ -654,9 +791,12 @@ async function validateCounts(incomingObject = {}) {
   }
 }
 
-// Run validation every 2 minutes — commented out for now, startup sweep in
-// server.js handles the common case (instance crash/restart). Uncomment to
-// re-enable as a safety net for mid-session drift.
+// Runs on EVERY instance every 2 minutes (this is live, despite what an older
+// comment here claimed). Each pass costs an io.allSockets() plus one
+// io.in(room).allSockets() per room across the adapter, so at N instances it is
+// N× that every cycle. The startup sweep in server.js already covers the common
+// case (instance crash/restart); this only catches mid-session drift. Worth
+// electing a single instance for it, or dropping it, if adapter load matters.
 setInterval(async () => {
   await validateCounts();
 }, 120000);
@@ -684,4 +824,5 @@ module.exports = {
   scheduleUserCountUpdate,
   validateCounts,
   broadcastBanToAllRooms,
+  broadcastUsersCountMaster,
 };

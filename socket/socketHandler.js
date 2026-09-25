@@ -18,6 +18,7 @@ const {
   notifyAdminRoomUpdate,
   setIO,
   scheduleUserCountUpdate,
+  broadcastUsersCountMaster,
 } = require("./roomManager");
 const { authenticateToken } = require("@project/middleware");
 const { pubClient: redis } = require("@project/config/redis");
@@ -36,6 +37,7 @@ const {
   getFlag,
   FEATURE_VALIDATION,
   FEATURE_AIMOD,
+  FEATURE_USERS_COUNT,
   onFlagChange,
 } = require("@project/utils/feature_flags");
 const {
@@ -66,16 +68,42 @@ function clearTypingUser(io, roomId, socketId) {
 function setupSocketHandlers(io) {
   setIO(io);
 
-  // Forward validation-flag changes to connected sockets. Each PM2 instance
-  // already receives the __feature_change__ Redis pub/sub message
-  // independently (via featuresSubClient in feature_flags.js), so io.emit()
-  // would fan out cluster-wide via the socket.io Redis adapter and produce
-  // N×N broadcasts. io.local.emit restricts to this instance's sockets —
-  // 1:N per instance, N×1 total. Only the validation flag is exposed to
-  // clients; registration stays server-internal.
-  onFlagChange((name, value) => {
-    if (name !== FEATURE_VALIDATION) return;
-    io.local.emit("validation_changed", { value: !!value });
+  // React to flag changes. Every PM2 instance receives the __feature_change__
+  // Redis pub/sub message independently (via featuresSubClient in
+  // feature_flags.js), so this callback runs on all of them — and twice on the
+  // instance that served the admin request, which also notifies synchronously.
+  //
+  // That shapes how each flag reacts. `validation` and `aimod` go out with
+  // io.local.emit: the instance tells its OWN sockets, 1:N per instance and N×1
+  // overall, where io.emit would fan out through the adapter and produce N×N.
+  // `usersCount` cannot work that way — it re-broadcasts per ROOM, which is
+  // inherently cluster-wide — so it elects a single executor instead.
+  // `registration` is never exposed; it gates an HTTP route, not a socket.
+  onFlagChange((name, value, seq) => {
+    if (name === FEATURE_VALIDATION) {
+      io.local.emit("validation_changed", { value: !!value });
+      return;
+    }
+    // Viewer-count master switch. There is no dedicated client event: the
+    // switch is applied by re-broadcasting each room's EFFECTIVE visibility
+    // (its own setting ANDed with the switch) over update_views_visibility —
+    // the same event the per-room Views checkbox uses. The AND happens
+    // server-side, so a client never has to know the switch exists, and
+    // turning the switch back on restores each room to its own setting rather
+    // than forcing every room visible. Fires in both directions; one instance
+    // is elected cluster-wide inside the helper, so each room gets one copy.
+    if (name === FEATURE_USERS_COUNT) {
+      broadcastUsersCountMaster(!!value, seq).catch((err) =>
+        console.error("Users-count resync failed:", err),
+      );
+      return;
+    }
+    // AI Ban master switch. Mirrored so the client can hide the 🚩 report
+    // button when the pipeline behind it is off — a visible report control
+    // that the server silently ignores is worse than no control at all.
+    if (name === FEATURE_AIMOD) {
+      io.local.emit("aimod_changed", { value: !!value });
+    }
   });
 
   // Forward message rate-limit config changes to connected sockets. Same
@@ -319,6 +347,13 @@ function setupSocketHandlers(io) {
         // Surface the current message rate-limit config so the client mirrors
         // it (enable/disable + the two numbers). Old clients ignore this field.
         result.rateLimit = getRateLimitConfig(); // { enabled, max, windowSeconds }
+        // AI Ban master switch — drives whether the 🚩 report button renders.
+        result.aimod = !!getFlag(FEATURE_AIMOD);
+        // Everything the client needs on join is in this one payload:
+        // result.showViews is already the effective visibility (the room's own
+        // setting ANDed with the viewer-count master switch), so there is
+        // nothing to correct afterwards. update_views_visibility stays what its
+        // name says — a CHANGE notification for rooms you are already in.
         socket.emit("join_result", result);
         scheduleUserCountUpdate(roomId);
         // socket.to(roomId).emit("user_joined", {

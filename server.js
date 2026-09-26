@@ -21,6 +21,7 @@ const {
   pubClient,
   subClient,
   perfSubClient,
+  featuresSubClient,
   connectRedis,
 } = require("@project/config/redis");
 const { setPerformanceMode } = require("@project/utils/perfomance_config");
@@ -146,7 +147,10 @@ app.get("/", (req, res) => {
           if (m) setPerformanceMode(m);
         })
         .catch((err) => console.error("Perf mode re-hydrate failed:", err));
-      // Re-hydrate feature flags too, mirroring the same pattern.
+      // Re-hydrate feature flags too, mirroring the same pattern. loadFromRedis
+      // notifies listeners for any flag that actually moved, so this also
+      // repairs the sockets of an instance that missed a publish, not just its
+      // cache.
       featureFlags
         .loadFromRedis()
         .catch((err) => console.error("Feature flags re-hydrate failed:", err));
@@ -165,6 +169,18 @@ app.get("/", (req, res) => {
         .loadFromRedis()
         .catch((err) =>
           console.error("Reporter-limit config re-hydrate failed:", err),
+        );
+    });
+
+    // Feature flags arrive on featuresSubClient, a separate connection from
+    // pubClient. If only that one drops, it resubscribes on reconnect but every
+    // publish sent during the gap is gone — and pubClient never fired "ready",
+    // so the re-hydrate above never ran. Hook it here as well.
+    featuresSubClient.on("ready", () => {
+      featureFlags
+        .loadFromRedis()
+        .catch((err) =>
+          console.error("Feature flags re-hydrate (sub) failed:", err),
         );
     });
 

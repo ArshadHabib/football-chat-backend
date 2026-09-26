@@ -18,6 +18,7 @@ const {
   notifyAdminRoomUpdate,
   setIO,
   scheduleUserCountUpdate,
+  broadcastUsersCountToLocalSockets,
 } = require("./roomManager");
 const { authenticateToken } = require("@project/middleware");
 const { pubClient: redis } = require("@project/config/redis");
@@ -36,6 +37,7 @@ const {
   getFlag,
   FEATURE_VALIDATION,
   FEATURE_AIMOD,
+  FEATURE_USERS_COUNT,
   onFlagChange,
 } = require("@project/utils/feature_flags");
 const {
@@ -66,16 +68,60 @@ function clearTypingUser(io, roomId, socketId) {
 function setupSocketHandlers(io) {
   setIO(io);
 
-  // Forward validation-flag changes to connected sockets. Each PM2 instance
-  // already receives the __feature_change__ Redis pub/sub message
-  // independently (via featuresSubClient in feature_flags.js), so io.emit()
-  // would fan out cluster-wide via the socket.io Redis adapter and produce
-  // N×N broadcasts. io.local.emit restricts to this instance's sockets —
-  // 1:N per instance, N×1 total. Only the validation flag is exposed to
-  // clients; registration stays server-internal.
+  // React to flag changes. Every PM2 instance receives the __feature_change__
+  // Redis pub/sub message independently (via featuresSubClient in
+  // feature_flags.js), so this callback runs on all of them — and twice on the
+  // instance that served the admin request, since setFlag also notifies
+  // synchronously (same convention as rate_limit_config.js). It also runs when a
+  // Redis re-hydrate finds a flag moved (feature_flags.loadFromRedis).
+  //
+  // The second pass on the originator re-emits the same values, so it is
+  // normally harmless — though under two toggles in quick succession the echo
+  // of the first can briefly re-apply the older value before the second lands.
+  // What the synchronous notify buys: if the publish fails, the originator's
+  // own sockets still hear about validation and aimod. That is not guaranteed
+  // for usersCount, whose sync makes its own Redis reads on the same connection
+  // and can fail with it. And "hear about" means the originator then disagrees
+  // with the rest of the cluster until its next re-hydrate reverts it.
+  //
+  // Every branch below therefore speaks only for THIS instance's sockets:
+  // `validation` and `aimod` via io.local.emit, `usersCount` via a per-room
+  // io.local.to(room) re-broadcast. That is 1:N per instance and N×1 overall,
+  // where io.emit or io.to(room) would fan out through the adapter and have
+  // each instance hit every socket, N×N. It also means no instance has to
+  // coordinate with any other, and none of them can broadcast a flag value it
+  // has not itself applied. `registration` is never exposed to sockets at all;
+  // it gates an HTTP route.
   onFlagChange((name, value) => {
-    if (name !== FEATURE_VALIDATION) return;
-    io.local.emit("validation_changed", { value: !!value });
+    if (name === FEATURE_VALIDATION) {
+      io.local.emit("validation_changed", { value: !!value });
+      return;
+    }
+    // Viewer-count master switch. There is no dedicated client event: the
+    // switch is applied by re-broadcasting each room's EFFECTIVE visibility
+    // (its own setting ANDed with the switch) over update_views_visibility —
+    // the same event the per-room Views checkbox uses. The AND happens
+    // server-side, so a client never has to know the switch exists, and
+    // turning the switch back on restores each room to its own setting rather
+    // than forcing every room visible. Fires in both directions, and like the
+    // two branches around it touches only this instance's own sockets.
+    // `value` is not passed: the helper reads the flag itself, synchronously,
+    // before its first await — which is the same value this callback received.
+    // What must not change is that ordering: the helper only fetches counts when
+    // the flag was on at that first read, so moving the read after an await
+    // would let it emit counts it never fetched.
+    if (name === FEATURE_USERS_COUNT) {
+      broadcastUsersCountToLocalSockets().catch((err) =>
+        console.error("Users-count sync failed:", err),
+      );
+      return;
+    }
+    // AI Ban master switch. Mirrored so the client can hide the 🚩 report
+    // button when the pipeline behind it is off — a visible report control
+    // that the server silently ignores is worse than no control at all.
+    if (name === FEATURE_AIMOD) {
+      io.local.emit("aimod_changed", { value: !!value });
+    }
   });
 
   // Forward message rate-limit config changes to connected sockets. Same
@@ -319,6 +365,13 @@ function setupSocketHandlers(io) {
         // Surface the current message rate-limit config so the client mirrors
         // it (enable/disable + the two numbers). Old clients ignore this field.
         result.rateLimit = getRateLimitConfig(); // { enabled, max, windowSeconds }
+        // AI Ban master switch — drives whether the 🚩 report button renders.
+        result.aimod = !!getFlag(FEATURE_AIMOD);
+        // Everything the client needs on join is in this one payload:
+        // result.showViews is already the effective visibility (the room's own
+        // setting ANDed with the viewer-count master switch), so there is
+        // nothing to correct afterwards. update_views_visibility stays what its
+        // name says — a CHANGE notification for rooms you are already in.
         socket.emit("join_result", result);
         scheduleUserCountUpdate(roomId);
         // socket.to(roomId).emit("user_joined", {

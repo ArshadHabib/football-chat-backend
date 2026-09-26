@@ -26,8 +26,15 @@ const { pubClient, featuresSubClient } = require("@project/config/redis");
 const FEATURE_REGISTRATION = "registration";
 const FEATURE_VALIDATION = "validation";
 // AI auto-moderation master switch ("AI Ban") — gates the whole @admin
-// reply-report → Gemini → auto-ban pipeline (AI_MODERATION_PLAN.md).
+// reply-report → Gemini → auto-ban pipeline (AI_MODERATION_PLAN.md). Also
+// mirrored to chat clients (join_result.aimod + aimod_changed) so the 🚩
+// report button is only offered when the pipeline behind it is actually live.
 const FEATURE_AIMOD = "aimod";
+// Viewer-count master switch. ON = each room's own __room_show_views__ setting
+// decides, exactly as before. OFF = no room shows a count under any condition,
+// overriding every per-room setting. Gates both the join_result payload and the
+// room_user_count_update broadcasts (see socket/roomManager.js).
+const FEATURE_USERS_COUNT = "usersCount";
 
 const KEY_PREFIX = "feature:";
 const CHANNEL = "__feature_change__";
@@ -38,6 +45,8 @@ const DEFAULTS = Object.freeze({
   [FEATURE_REGISTRATION]: true,
   [FEATURE_VALIDATION]: false,
   [FEATURE_AIMOD]: false,
+  // true preserves the pre-flag behaviour: per-room showViews stays in charge.
+  [FEATURE_USERS_COUNT]: true,
 });
 
 // Hot in-memory cache. Populated by loadFromRedis() at startup and updated
@@ -45,8 +54,9 @@ const DEFAULTS = Object.freeze({
 const flags = { ...DEFAULTS };
 
 // Listeners notified on every flag change, regardless of which instance
-// triggered the change. The socket layer registers a listener here to
-// broadcast validation flips to its connected sockets via io.local.emit.
+// triggered the change. The socket layer registers one listener here and
+// reacts per flag, always against its OWN sockets: `validation` and `aimod`
+// via io.local.emit, `usersCount` via a per-room io.local.to(room) re-broadcast.
 // Kept module-local so feature_flags.js doesn't import socket.io directly.
 const listeners = new Set();
 
@@ -78,6 +88,15 @@ function getAllFlags() {
   return { ...flags };
 }
 
+// Whether the boot-time load has completed. The first call happens at boot,
+// before the server starts listening: no socket exists yet, so there is nothing
+// to repair — but the listeners ARE already registered (setupSocketHandlers runs
+// first), so notifying would run their side effects for nothing. For usersCount
+// that means a full sync pass on every instance boot: Redis reads plus clearing
+// every room's __room_last_broadcast__ entry. Every call after the first is a
+// re-hydrate following a Redis reconnect, and that is where notifying matters.
+let hydrated = false;
+
 // Read every known flag from Redis. If a key is absent, seed it with the
 // default value so subsequent reads are deterministic and the admin UI sees
 // a complete state on first load.
@@ -87,7 +106,9 @@ async function loadFromRedis() {
   const values = await pubClient.mGet(keys);
   const seedPipeline = pubClient.multi();
   let needsSeed = false;
+  const changed = [];
   names.forEach((name, i) => {
+    const previous = flags[name];
     const raw = values[i];
     if (raw === null || raw === undefined) {
       flags[name] = DEFAULTS[name];
@@ -99,7 +120,21 @@ async function loadFromRedis() {
     } else {
       flags[name] = raw === "true";
     }
+    if (flags[name] !== previous) changed.push(name);
   });
+  // On a re-hydrate, notify for anything that actually moved: an instance that
+  // missed a publish while its subscriber was down would otherwise converge its
+  // cache silently while its share of the sockets stayed on the old value
+  // forever, with nothing periodically reconciling them. Skipped on the boot
+  // load — see `hydrated` above.
+  //
+  // Done BEFORE the seed write below, not after it. The cache has already moved
+  // by this point; if the seed write then threw, a notify placed after it would
+  // never run, and every later re-hydrate would compare Redis against the
+  // already-updated cache, see no change, and never notify either — leaving
+  // this instance's sockets stale for good.
+  if (hydrated) changed.forEach((name) => notifyListeners(name, flags[name]));
+  hydrated = true;
   if (needsSeed) await seedPipeline.exec();
   console.log("✅ Feature flags loaded:", flags);
 }
@@ -137,6 +172,7 @@ module.exports = {
   FEATURE_REGISTRATION,
   FEATURE_VALIDATION,
   FEATURE_AIMOD,
+  FEATURE_USERS_COUNT,
   loadFromRedis,
   subscribeToChanges,
   getFlag,

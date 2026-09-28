@@ -13,7 +13,10 @@ const {
 } = require("./service");
 const { sendResponse, sendError } = require("@project/utils");
 const { createSocketRoomsForMatchService } = require("./socket_service");
-const { sendLatestMatches } = require("@project/socket/adminEventService");
+const {
+  sendLatestMatches,
+  sendScraperUpdate,
+} = require("@project/socket/adminEventService");
 const {
   setPerformanceMode,
   getCurrentPerformanceMode,
@@ -111,6 +114,30 @@ async function sendLatestUpdatesToAdminController(req, res) {
     return sendError(
       res,
       error?.message || "Error in sending latest matches to admin: ",
+      500
+    );
+  }
+}
+
+// football-backend posts the Scraper settings snapshot here; only `data` is
+// forwarded to the admins (never the adminKey).
+async function sendScraperUpdateToAdminController(req, res) {
+  const { data } = req.body;
+  if (!data || typeof data !== "object" || !Array.isArray(data.scrapers)) {
+    return sendError(res, "A scraper snapshot is required", 400);
+  }
+  try {
+    sendScraperUpdate(data);
+    return sendResponse(
+      res,
+      null,
+      "Scraper update sent to Admin successfully!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in sending scraper update to admin: ",
       500
     );
   }
@@ -273,6 +300,7 @@ module.exports = {
   deleteSingleSocketRoomController,
   createSingleSocketRoomController,
   sendLatestUpdatesToAdminController,
+  sendScraperUpdateToAdminController,
   updateShowViewsVisibilityToUsersController,
   changeServerModeController,
   getServerModeController,

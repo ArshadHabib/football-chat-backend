@@ -1,5 +1,5 @@
 // socket/adminEventService.js
-const { emitToAdmins, emitToAdmin } = require("./roomManager");
+const { emitToAdmins, emitToAdmin, getIO } = require("./roomManager");
 const {
   BATCH_PROCESSING_INTERVAL,
   getCurrentPerformanceMode,
@@ -55,6 +55,23 @@ const sendLatestMatches = (matchesData, lastUpdatedAdminId) => {
     count: matchesData?.length || 0,
     priority: "high",
   });
+};
+
+// The live Scraper settings snapshot from football-backend (scrapers, the run
+// lock, versioned). Every admin gets it, including the one who made the change.
+// Its own socket event, not admin_custom_event: admin tabs still running an
+// older build treat every admin_custom_event as a matches list and would empty
+// their matches table. io.to("__admins__") reaches admins on all processes via
+// the Redis adapter.
+const sendScraperUpdate = (scraperState) => {
+  const io = getIO();
+  if (!io) return 0;
+  io.to("__admins__").emit("admin_scraper_update", {
+    eventType: "scraper_update",
+    data: scraperState,
+    timestamp: new Date().toISOString(),
+  });
+  return 1;
 };
 
 // Send system alerts to all admins
@@ -171,6 +188,7 @@ const composeMatchNotification = (match, eventType) => {
 
 module.exports = {
   sendLatestMatches,
+  sendScraperUpdate,
   sendSystemAlert,
   sendUserStats,
   sendNotification,

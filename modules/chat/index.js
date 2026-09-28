@@ -12,6 +12,7 @@ const {
   deleteSingleSocketRoomController,
   createSingleSocketRoomController,
   sendLatestUpdatesToAdminController,
+  sendScraperUpdateToAdminController,
   updateShowViewsVisibilityToUsersController,
   changeServerModeController,
   getServerModeController,
@@ -48,6 +49,11 @@ router.post(
   "/send-latest-matches-to-admin",
   isAdminKeyCorrect,
   sendLatestUpdatesToAdminController
+);
+router.post(
+  "/send-scraper-update-to-admin",
+  isAdminKeyCorrect,
+  sendScraperUpdateToAdminController
 );
 router.post(
   "/update-show-views-visibility-to-users",

@@ -16,6 +16,7 @@ const { createSocketRoomsForMatchService } = require("./socket_service");
 const {
   sendLatestMatches,
   sendScraperUpdate,
+  sendEndTimesUpdate,
 } = require("@project/socket/adminEventService");
 const {
   setPerformanceMode,
@@ -138,6 +139,33 @@ async function sendScraperUpdateToAdminController(req, res) {
     return sendError(
       res,
       error?.message || "Error in sending scraper update to admin: ",
+      500
+    );
+  }
+}
+
+async function sendEndTimesToAdminController(req, res) {
+  const { data } = req.body;
+  if (
+    !data ||
+    typeof data !== "object" ||
+    !Array.isArray(data.neverEnding) ||
+    !Array.isArray(data.endAfter)
+  ) {
+    return sendError(res, "The end times are required", 400);
+  }
+  try {
+    sendEndTimesUpdate(data);
+    return sendResponse(
+      res,
+      null,
+      "End times sent to Admin successfully!",
+      200
+    );
+  } catch (error) {
+    return sendError(
+      res,
+      error?.message || "Error in sending end times to admin: ",
       500
     );
   }
@@ -301,6 +329,7 @@ module.exports = {
   createSingleSocketRoomController,
   sendLatestUpdatesToAdminController,
   sendScraperUpdateToAdminController,
+  sendEndTimesToAdminController,
   updateShowViewsVisibilityToUsersController,
   changeServerModeController,
   getServerModeController,

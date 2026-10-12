@@ -74,6 +74,18 @@ const sendScraperUpdate = (scraperState) => {
   return 1;
 };
 
+// The match end times from football-backend (the never-ending categories and
+// each end time's categories), after an admin saves them, so every admin's
+// matches table and open End times dialog follow. A new eventType on
+// admin_custom_event: the matches page routes that event by eventType and only
+// latest_matches may replace its matches.
+const sendEndTimesUpdate = (endTimes) => {
+  return emitToAdmins("end_times_update", {
+    title: "Match end times",
+    data: endTimes,
+  });
+};
+
 // Send system alerts to all admins
 const sendSystemAlert = (alertData) => {
   return emitToAdmins("system_alert", {
@@ -189,6 +201,7 @@ const composeMatchNotification = (match, eventType) => {
 module.exports = {
   sendLatestMatches,
   sendScraperUpdate,
+  sendEndTimesUpdate,
   sendSystemAlert,
   sendUserStats,
   sendNotification,

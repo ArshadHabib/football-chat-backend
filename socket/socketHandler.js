@@ -23,6 +23,7 @@ const {
 const { authenticateToken } = require("@project/middleware");
 const { pubClient: redis } = require("@project/config/redis");
 const { findUserByName } = require("@project/modules/user/service");
+const { asPayload, isNonEmptyString } = require("@project/utils");
 const {
   BANNED_USERS_KEY,
   REDIS_ROOMS_SET,
@@ -207,7 +208,11 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
-      const { roomId } = data;
+      const { roomId } = asPayload(data);
+      if (!isNonEmptyString(roomId)) {
+        socket.emit("error", { message: "Invalid room" });
+        return;
+      }
       socket.join(roomId);
       const perRoom = await getUsersPerRoom();
       socket.emit("admin_room_joined", {
@@ -219,7 +224,8 @@ function setupSocketHandlers(io) {
 
     socket.on("admin_leave_room", (data) => {
       if (!socket.isAdmin) return;
-      const { roomId } = data;
+      const { roomId } = asPayload(data);
+      if (!isNonEmptyString(roomId)) return;
       socket.leave(roomId);
       socket.emit("admin_room_left", { roomId });
     });
@@ -229,7 +235,11 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
-      const { roomId, messageContent, isPinned, replyTo } = data;
+      const { roomId, messageContent, isPinned, replyTo } = asPayload(data);
+      if (!isNonEmptyString(roomId)) {
+        socket.emit("error", { message: "Invalid room" });
+        return;
+      }
       if (!socket.rooms.has(roomId)) {
         socket.emit("error", {
           message: "You must join the room first before sending messages",
@@ -274,9 +284,9 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
-      const { roomId, userData } = data;
+      const { roomId, userData } = asPayload(data);
       // Validate required fields
-      if (!roomId || !userData || typeof userData !== "object") {
+      if (!isNonEmptyString(roomId) || !userData || typeof userData !== "object") {
         socket.emit("error", {
           message:
             "Missing or invalid parameters: roomId and userData are required",
@@ -318,7 +328,12 @@ function setupSocketHandlers(io) {
 
     // User joining room - websiteName still needed for analytics
     socket.on("join_room", async (data) => {
-      const { senderName, roomId, websiteName } = data;
+      const { senderName, roomId, websiteName } = asPayload(data);
+      // Same answer as an unknown room, so clients handle it the same way.
+      if (!isNonEmptyString(roomId)) {
+        socket.emit("join_result", { success: false, message: "Room does not exist" });
+        return;
+      }
 
       // inComingClientIp override removed — client-supplied value (ipify.org)
       // can be spoofed by a scripted client to bypass per-IP rate limit,
@@ -356,7 +371,14 @@ function setupSocketHandlers(io) {
       // room_message pipeline check and remove the fallback.
       // socket.senderName = senderName;
 
-      const result = await joinRoom(roomId, socket, senderName, websiteName);
+      // Any website name is accepted (a new site counts as soon as it joins); a
+      // non-string one is treated as absent rather than written to Redis.
+      const result = await joinRoom(
+        roomId,
+        socket,
+        senderName,
+        isNonEmptyString(websiteName) ? websiteName : undefined,
+      );
 
       if (result.success) {
         // Surface current validation flag so the client can mirror it as its
@@ -386,7 +408,9 @@ function setupSocketHandlers(io) {
 
     // Messages - senderName comes from frontend
     socket.on("room_message", async (data) => {
-      const { roomId, messageContent, senderName, replyTo } = data;
+      const { roomId, messageContent, senderName, replyTo } = asPayload(data);
+      // Both go into the Redis pipeline below; any string behaves as before.
+      if (typeof roomId !== "string" || typeof senderName !== "string") return;
       // Ban + room existence + rate limit — single pipeline round trip
       const ip = socket.clientIp;
       // Message rate-limit config is admin-controlled + cluster-synced
@@ -556,8 +580,8 @@ function setupSocketHandlers(io) {
     });
 
     socket.on("typing_start", (data) => {
-      const { roomId, username } = data;
-      if (!roomId || !username) return;
+      const { roomId, username } = asPayload(data);
+      if (!isNonEmptyString(roomId) || !isNonEmptyString(username)) return;
       if (!typingUsers.has(roomId)) typingUsers.set(roomId, new Map());
       const roomTyping = typingUsers.get(roomId);
       const existing = roomTyping.get(socket.id);
@@ -574,14 +598,20 @@ function setupSocketHandlers(io) {
     });
 
     socket.on("typing_stop", (data) => {
-      const { roomId } = data;
-      if (!roomId) return;
+      const { roomId } = asPayload(data);
+      if (!isNonEmptyString(roomId)) return;
       clearTypingUser(io, roomId, socket.id);
     });
 
     socket.on("add_reaction", async (data) => {
-      const { roomId, messageId, emoji, username } = data;
-      if (!roomId || !messageId || !emoji || !username) return;
+      const { roomId, messageId, emoji, username } = asPayload(data);
+      if (
+        !isNonEmptyString(roomId) ||
+        !isNonEmptyString(messageId) ||
+        !emoji ||
+        !isNonEmptyString(username)
+      )
+        return;
       if (!ALLOWED_REACTIONS.includes(emoji)) return;
 
       const isBanned = await redis.sIsMember(BANNED_USERS_KEY, username);
@@ -660,7 +690,8 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
-      const { roomId, showViews } = data;
+      const { roomId, showViews } = asPayload(data);
+      if (!isNonEmptyString(roomId)) return;
       if (await roomExists(roomId)) {
         io.to(roomId).emit("update_views_visibility", { showViews });
       }
@@ -692,7 +723,7 @@ function setupSocketHandlers(io) {
         socket.emit("error", { message: "Admin access required" });
         return;
       }
-      const { dataType, parameters } = data;
+      const { dataType, parameters } = asPayload(data);
       switch (dataType) {
         case "latest_matches":
           socket.emit("admin_custom_event", {

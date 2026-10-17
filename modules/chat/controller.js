@@ -11,7 +11,7 @@ const {
   retrieveRoomMessagesService,
   deleteAllDBChatRoomService,
 } = require("./service");
-const { sendResponse, sendError } = require("@project/utils");
+const { sendResponse, sendError, isNonEmptyString } = require("@project/utils");
 const { createSocketRoomsForMatchService } = require("./socket_service");
 const {
   sendLatestMatches,
@@ -82,7 +82,10 @@ async function deleteAllSocketRoomsController(req, res) {
 }
 
 async function deleteSingleSocketRoomController(req, res) {
-  const { roomId } = req.body;
+  const { roomId } = req.body || {};
+  if (!isNonEmptyString(roomId)) {
+    return sendError(res, "roomId (a string) is required", 400);
+  }
   try {
     await deleteRoom(roomId);
     return sendResponse(res, null, "Socket Room deleted successfully!", 200);
@@ -92,7 +95,10 @@ async function deleteSingleSocketRoomController(req, res) {
 }
 
 async function createSingleSocketRoomController(req, res) {
-  const { roomId, showViews } = req.body;
+  const { roomId, showViews } = req.body || {};
+  if (!isNonEmptyString(roomId)) {
+    return sendError(res, "roomId (a string) is required", 400);
+  }
   try {
     await createRoom(roomId, showViews);
     return sendResponse(res, null, "Socket Room created successfully!", 200);
@@ -172,7 +178,10 @@ async function sendEndTimesToAdminController(req, res) {
 }
 
 async function updateShowViewsVisibilityToUsersController(req, res) {
-  const { streamId, showViews } = req.body;
+  const { streamId, showViews } = req.body || {};
+  if (!isNonEmptyString(streamId)) {
+    return sendError(res, "streamId (a string) is required", 400);
+  }
   try {
     await updateViewsVisibility({ roomId: streamId, data: { showViews } });
     return sendResponse(res, null, "Success in sending Views Visibility!", 200);

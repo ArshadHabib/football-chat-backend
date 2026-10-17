@@ -62,9 +62,23 @@ function handleMatchStatus({ isLive, isEnded, matchDate }) {
   };
 }
 
+// Client-supplied room ids, names and keys go straight into Redis commands,
+// and node-redis rejects any argument that isn't a string (or Buffer). Socket
+// handlers don't catch that, and Node exits on an unhandled rejection, so one
+// bad payload would stop the whole server. Socket handlers and routes check
+// their input with these first.
+const isNonEmptyString = (value) =>
+  typeof value === "string" && value.length > 0;
+
+// A socket event's payload, or {} when the client sent none (or not an
+// object), so destructuring it can't throw.
+const asPayload = (data) => (data && typeof data === "object" ? data : {});
+
 module.exports = {
   ROLES,
   sendResponse,
   sendError,
   handleMatchStatus,
+  isNonEmptyString,
+  asPayload,
 };

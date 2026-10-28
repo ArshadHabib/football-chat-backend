@@ -46,12 +46,13 @@ function queueEvent(event, data) {
   }
 }
 
-// Send latest matches to all admins
-const sendLatestMatches = (matchesData, lastUpdatedAdminId) => {
+// Send latest matches to all admins; sourceClientId: the admin page that made
+// the change (it skips this one), null when none did.
+const sendLatestMatches = (matchesData, sourceClientId = null) => {
   return emitToAdmins("latest_matches", {
     title: "Latest Matches Update",
     data: matchesData,
-    lastUpdatedAdminId,
+    sourceClientId,
     count: matchesData?.length || 0,
     priority: "high",
   });

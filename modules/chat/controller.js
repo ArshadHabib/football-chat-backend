@@ -107,10 +107,16 @@ async function createSingleSocketRoomController(req, res) {
   }
 }
 
+// The admin page whose change this is (football-backend's sourceClientId):
+// only that page skips the update. null: no page made it, every page follows.
+const CLIENT_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const readSourceClientId = (value) =>
+  typeof value === "string" && CLIENT_ID.test(value) ? value : null;
+
 async function sendLatestUpdatesToAdminController(req, res) {
-  const { matches, lastUpdatedAdminId } = req.body;
+  const { matches, sourceClientId } = req.body;
   try {
-    sendLatestMatches(matches, lastUpdatedAdminId);
+    sendLatestMatches(matches, readSourceClientId(sourceClientId));
     return sendResponse(
       res,
       null,

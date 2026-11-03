@@ -85,6 +85,11 @@ app.get("/", (req, res) => {
 
 (async () => {
   try {
+    // The backend's calls (rooms, admin pushes, settings) are refused with 401
+    // until CHAT_ADMIN_KEY is set. Say so at start instead of failing quietly.
+    if (!String(process.env.CHAT_ADMIN_KEY || "").trim()) {
+      console.error("❌ CHAT_ADMIN_KEY is not set: every call from the backend will be refused");
+    }
     await connectDB();
     await connectRedis();
     io.adapter(createAdapter(pubClient, subClient));

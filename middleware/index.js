@@ -1,7 +1,7 @@
 const axios = require("axios");
 const { ROLES, sendError } = require("@project/utils");
 const { ENDPOINTS } = require("@project/utils/endpoints");
-const { ADMIN_KEY } = require("@project/utils/const_config");
+const { keyMatches } = require("@project/utils/keys");
 
 // Common authentication logic
 const authenticateToken = async (token) => {
@@ -57,7 +57,7 @@ const isUserLoggedIn = async (req, res, next) => {
 const isAdminKeyCorrect = async (req, res, next) => {
   try {
     const { adminKey } = req.body;
-    if (adminKey !== ADMIN_KEY) {
+    if (!keyMatches(adminKey, process.env.CHAT_ADMIN_KEY)) {
       return sendError(res, "Admin Key is incorrect", 401);
     }
     next();

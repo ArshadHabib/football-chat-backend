@@ -1,4 +1,3 @@
-const ADMIN_KEY = "admin_arshad_habib"; // minutes before match to scrap
 const MINUTES_BEFORE_MATCH_TO_SCRAP = 40;
 
 /** Max messages returned when noLimit=true to avoid huge loads */
@@ -54,7 +53,6 @@ const AIMOD_GLOBAL_RPD = 450; // cluster Gemini calls/day (free-tier 3.1-flash-l
 const AIMOD_REPORT_TEXT = "@admin check this chat";
 
 module.exports = {
-  ADMIN_KEY,
   MINUTES_BEFORE_MATCH_TO_SCRAP,
   MAX_ROOM_MESSAGES_LIMIT,
   REG_RATE_LIMIT_PREFIX,
